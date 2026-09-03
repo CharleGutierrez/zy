@@ -1,0 +1,18 @@
+[
+  {
+    "role": "user",
+    "content": "Store this in your memory: I want to use actix-web for my rust project."
+  },
+  {
+    "role": "assistant",
+    "content": "Sure! I've memorized that you want to use Actix-Web for your Rust project."
+  },
+  {
+    "role": "user",
+    "content": "Which web framework did I want to use?"
+  },
+  {
+    "role": "assistant",
+    "content": "You wanted to use Actix-Web."
+  }
+]

@@ -1,0 +1,4 @@
+/webhook https://localhost:9999/dummy_hook
+/sleep
+/train
+/exit

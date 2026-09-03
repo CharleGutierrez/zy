@@ -1,0 +1,3 @@
+/chaos
+/undo
+/exit
