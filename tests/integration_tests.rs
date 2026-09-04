@@ -2206,3 +2206,598 @@ pub fn function_beta() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+// ============================================================================
+// SYSTEM 1: GIT WORKTREE TASK ISOLATION TESTS
+// ============================================================================
+
+#[test]
+fn test_git_worktree_task_isolation_lifecycle() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_wt_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Create a dummy file in the workspace
+    let dummy_file = temp_dir.join("main.rs");
+    std::fs::write(&dummy_file, "fn main() { println!(\"base workspace\"); }").unwrap();
+
+    // 2. Create task worktree
+    let handle = create_task_worktree(&temp_dir, "auth-oauth2", Some("feat/auth-oauth2")).expect("Failed to create task worktree");
+    assert_eq!(handle.task_id, "auth-oauth2");
+    assert_eq!(handle.branch_name, "feat/auth-oauth2");
+    assert!(handle.worktree_path.exists());
+    assert!(handle.worktree_path.join("main.rs").exists());
+
+    // 3. Execute command in worktree
+    let exec_res = handle.execute("echo worktree_isolated_execution").expect("Execution failed");
+    assert_eq!(exec_res.task_id, "auth-oauth2");
+    assert!(exec_res.stdout.contains("worktree_isolated_execution") || exec_res.success);
+
+    // 4. Modify file inside worktree
+    let wt_main = handle.worktree_path.join("main.rs");
+    std::fs::write(&wt_main, "fn main() { println!(\"updated in worktree\"); }").unwrap();
+
+    // 5. List task worktrees
+    let list = list_task_worktrees(&temp_dir).expect("Failed to list task worktrees");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].task_id, "auth-oauth2");
+
+    // 6. Merge worktree back
+    let merge_res = handle.merge_back(Some("feat(auth): complete oauth2 implementation")).expect("Merge back failed");
+    assert_eq!(merge_res.task_id, "auth-oauth2");
+    assert!(merge_res.success);
+
+    // Verify workspace has updated file
+    let ws_content = std::fs::read_to_string(&dummy_file).unwrap();
+    assert!(ws_content.contains("updated in worktree"));
+
+    // 7. Cleanup worktree
+    let cleanup_res = handle.cleanup(true).expect("Cleanup failed");
+    assert!(cleanup_res);
+    assert!(!handle.worktree_path.exists());
+
+    // 8. Terminal report formatting
+    let report_out = format_worktree_report_for_terminal(&handle);
+    assert!(report_out.contains("GIT WORKTREE TASK ISOLATION ACTIVE"));
+    assert!(report_out.contains("auth-oauth2"));
+
+    let list_out = format_worktree_list_for_terminal(&[handle]);
+    assert!(list_out.contains("ACTIVE GIT TASK WORKTREES"));
+
+    // 9. Verify isolate_task in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("isolate_task"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 2: DEEP SARIF SECURITY CODE REVIEW & AUDITOR TESTS
+// ============================================================================
+
+#[test]
+fn test_deep_sarif_security_code_review_and_auditor() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_review_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Create source file with security vulnerabilities and code smells
+    let vuln_code = r#"
+use std::sync::Mutex;
+
+static mut GLOBAL_INSECURE_COUNTER: u64 = 0;
+
+pub async fn process_user_action(user_input: &str, user_path: &str, input_id: &str, password: &str) {
+    let api_key = "sk_live_TEST_DUMMY_KEY_NON_FUNCTIONAL_12345";
+    let cmd = format!("rm -rf {}", user_input);
+    let _ = std::process::Command::new("sh").arg("-c").arg(cmd).output();
+    let query = format!("SELECT * FROM users WHERE id = {}", input_id);
+    let _ = std::fs::read(user_path);
+    let hash = md5::compute(password);
+
+    let m = Mutex::new(42);
+    let guard = m.lock().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    drop(guard);
+
+    let mut buffer = Vec::new();
+    loop {
+        buffer.push("leak");
+        break;
+    }
+
+    let items = vec![1, 2, 3];
+    let other = vec![2, 3, 4];
+    for x in &items {
+        if other.contains(x) {
+            println!("found");
+        }
+    }
+
+    let mut s = String::new();
+    for chunk in &["a", "b", "c"] {
+        s += chunk;
+    }
+}
+"#;
+
+    let vuln_file = temp_dir.join("vuln.rs");
+    std::fs::write(&vuln_file, vuln_code).unwrap();
+
+    // 2. Perform code review
+    let report = perform_code_review(&temp_dir, None).expect("Code review failed");
+    assert!(report.files_scanned >= 1);
+    assert!(report.findings.len() >= 6);
+    assert!(report.critical_count >= 2); // Hardcoded secret, Command injection, Lock across await
+
+    // 3. Verify specific findings
+    let has_secret = report.findings.iter().any(|f| f.rule_id == "zy/security/hardcoded-secret");
+    let has_cmd_inj = report.findings.iter().any(|f| f.rule_id == "zy/security/command-injection");
+    let has_sql_inj = report.findings.iter().any(|f| f.rule_id == "zy/security/sql-injection");
+    let has_path_trav = report.findings.iter().any(|f| f.rule_id == "zy/security/path-traversal");
+    let has_broken_crypto = report.findings.iter().any(|f| f.rule_id == "zy/security/broken-cryptography");
+    let has_lock_await = report.findings.iter().any(|f| f.rule_id == "zy/concurrency/lock-across-await");
+    let has_static_mut = report.findings.iter().any(|f| f.rule_id == "zy/concurrency/mutable-static");
+    let has_perf_o_n2 = report.findings.iter().any(|f| f.rule_id == "zy/performance/o-n2-nested-search");
+
+    assert!(has_secret);
+    assert!(has_cmd_inj);
+    assert!(has_sql_inj);
+    assert!(has_path_trav);
+    assert!(has_broken_crypto);
+    assert!(has_lock_await);
+    assert!(has_static_mut);
+    assert!(has_perf_o_n2);
+
+    // 4. Validate SARIF v2.1.0 JSON format
+    let sarif = report.to_sarif_json();
+    assert_eq!(sarif["version"], "2.1.0");
+    assert!(sarif["$schema"].as_str().unwrap().contains("sarif-schema-2.1.0.json"));
+    assert_eq!(sarif["runs"][0]["tool"]["driver"]["name"], "zy-deep-sarif-auditor");
+    assert!(sarif["runs"][0]["results"].as_array().unwrap().len() >= 6);
+
+    let first_result = &sarif["runs"][0]["results"][0];
+    assert!(first_result["ruleId"].as_str().unwrap().starts_with("zy/"));
+    assert!(first_result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"].is_string());
+    assert!(first_result["fixes"].is_array());
+
+    // 5. Test terminal report formatting
+    let terminal_out = format_code_review_for_terminal(&report);
+    assert!(terminal_out.contains("DEEP SARIF SECURITY CODE REVIEW & AUDITOR REPORT"));
+    assert!(terminal_out.contains("Critical"));
+    assert!(terminal_out.contains("Remediation:"));
+
+    // 6. Test direct diff review mode
+    let diff_snippet = r#"
++ let api_key = "sk_live_TEST_DUMMY_TOKEN_NON_FUNCTIONAL_999";
++ let cmd = format!("sh -c {}", user_param);
++ let _ = os.system(cmd);
+"#;
+    let diff_report = perform_code_review(&temp_dir, Some(diff_snippet)).unwrap();
+    assert!(diff_report.findings.len() >= 2);
+
+    // 7. Verify code_review in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("code_review"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 3: SEMANTIC 3-WAY MERGE CONFLICT RESOLVER TESTS
+// ============================================================================
+
+#[test]
+fn test_semantic_3way_merge_conflict_resolver() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_conflict_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Test Import Union & Deduplication Strategy
+    let import_conflict = r#"
+// Header
+<<<<<<< HEAD
+use std::collections::HashMap;
+use std::fs;
+=======
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::path::Path;
+>>>>>>> incoming
+// Rest of file
+fn test() {}
+"#;
+    let import_res = resolve_merge_conflict_content(import_conflict, "imports.rs");
+    assert_eq!(import_res.conflicts_found, 1);
+    assert_eq!(import_res.conflicts_resolved, 1);
+    assert!(import_res.verified_syntax);
+    assert!(!import_res.resolved_file_content.contains("<<<<<<<"));
+    assert!(!import_res.resolved_file_content.contains("======="));
+    assert!(!import_res.resolved_file_content.contains(">>>>>>>"));
+    assert!(import_res.resolved_file_content.contains("use std::collections::BTreeMap;"));
+    assert!(import_res.resolved_file_content.contains("use std::collections::HashMap;"));
+    assert!(import_res.resolved_file_content.contains("use std::path::Path;"));
+    assert_eq!(import_res.blocks[0].strategy_used, "import_union_dedup");
+
+    // 2. Test Additive Function Merge Strategy
+    let func_conflict = r#"
+<<<<<<< HEAD
+pub fn calculate_tax(amount: f64) -> f64 {
+    amount * 0.15
+}
+=======
+pub fn calculate_discount(price: f64) -> f64 {
+    price * 0.90
+}
+>>>>>>> feature-discount
+"#;
+    let func_res = resolve_merge_conflict_content(func_conflict, "functions.rs");
+    assert_eq!(func_res.conflicts_found, 1);
+    assert!(func_res.resolved_file_content.contains("pub fn calculate_tax"));
+    assert!(func_res.resolved_file_content.contains("pub fn calculate_discount"));
+    assert!(func_res.verified_syntax);
+    assert_eq!(func_res.blocks[0].strategy_used, "additive_function_merge");
+
+    // 3. Test 3-Way Base-Aware (Diff3) Merge Strategy
+    let diff3_conflict = r#"
+<<<<<<< HEAD
+let config_path = "default.toml";
+||||||| base
+let config_path = "old.toml";
+=======
+let config_path = "production.toml";
+>>>>>>> feature-prod-config
+"#;
+    let diff3_res = resolve_merge_conflict_content(diff3_conflict, "config.rs");
+    assert_eq!(diff3_res.conflicts_found, 1);
+    assert!(diff3_res.resolved_file_content.contains("production.toml") || diff3_res.resolved_file_content.contains("default.toml"));
+    assert!(diff3_res.verified_syntax);
+
+    // 4. Test Config Key-Value Merge Strategy
+    let toml_conflict = r#"
+[server]
+<<<<<<< HEAD
+port = 8080
+timeout = 30
+=======
+port = 8080
+max_connections = 1000
+>>>>>>> incoming
+"#;
+    let toml_res = resolve_merge_conflict_content(toml_conflict, "settings.toml");
+    assert_eq!(toml_res.conflicts_found, 1);
+    assert!(toml_res.resolved_file_content.contains("port = 8080"));
+    assert!(toml_res.resolved_file_content.contains("timeout = 30"));
+    assert!(toml_res.resolved_file_content.contains("max_connections = 1000"));
+    assert_eq!(toml_res.blocks[0].strategy_used, "config_key_merge");
+
+    // 5. Test File Resolution on Disk
+    let disk_file = temp_dir.join("conflict.rs");
+    std::fs::write(&disk_file, import_conflict).unwrap();
+
+    let disk_conflicts = find_merge_conflicts(&temp_dir);
+    assert_eq!(disk_conflicts.len(), 1);
+
+    let disk_res = resolve_merge_conflict(&disk_file).expect("Failed to resolve merge conflict on disk");
+    assert!(disk_res.applied);
+    assert_eq!(disk_res.conflicts_resolved, 1);
+
+    let updated_disk_content = std::fs::read_to_string(&disk_file).unwrap();
+    assert!(!updated_disk_content.contains("<<<<<<<"));
+    assert!(updated_disk_content.contains("use std::collections::HashMap;"));
+
+    // 6. Test Terminal Formatting
+    let term_out = format_conflict_resolution_for_terminal(&disk_res);
+    assert!(term_out.contains("SEMANTIC 3-WAY MERGE CONFLICT RESOLVER"));
+    assert!(term_out.contains("VERIFIED CLEAN"));
+
+    // 7. Verify resolve_conflicts in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("resolve_conflicts"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 4: STRUCTURAL AST PATTERN SEARCH & REPLACE TESTS
+// ============================================================================
+
+#[test]
+fn test_structural_ast_pattern_search_and_replace() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_ast_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Test basic pattern matching with metavariables
+    let code_sample = r#"
+pub fn calculate_sum(a: i32, b: i32) -> i32 {
+    let result = a + b;
+    println!("result: {}", result);
+    result
+}
+
+pub fn calculate_product(x: i32, y: i32) -> i32 {
+    let total = x * y;
+    println!("total: {}", total);
+    total
+}
+"#;
+    let sample_file = temp_dir.join("math.rs");
+    std::fs::write(&sample_file, code_sample).unwrap();
+
+    // 2. Search with single and multi metavariables: fn $NAME($$$ARGS) -> $RET { $$$BODY }
+    let matches = match_structural_pattern("fn $NAME($$$ARGS) -> $RET { $$$BODY }", code_sample);
+    assert_eq!(matches.len(), 2);
+    assert_eq!(matches[0].3.get("$NAME").unwrap(), "calculate_sum");
+    assert_eq!(matches[0].3.get("$RET").unwrap(), "i32");
+    assert_eq!(matches[1].3.get("$NAME").unwrap(), "calculate_product");
+    assert_eq!(matches[1].3.get("$RET").unwrap(), "i32");
+
+    // 3. Search and Replace: println!($$$ARGS) -> tracing::info!($$$ARGS)
+    let search_res = execute_structural_search(
+        &temp_dir,
+        "println! ( $$$ARGS ) ;",
+        Some("tracing::info! ( $$$ARGS ) ;")
+    ).expect("Structural search failed");
+
+    assert_eq!(search_res.total_matches, 2);
+    assert_eq!(search_res.files_searched, 1);
+    assert!(search_res.diff_preview.is_some());
+    let diff = search_res.diff_preview.as_ref().unwrap();
+    assert!(diff.contains("tracing::info!"));
+
+    // 4. Test metavariable consistency: $X == $X
+    let dup_code = "if (a == a) { fix(); } if (a == b) { ok(); }";
+    let dup_matches = match_structural_pattern("$X == $X", dup_code);
+    assert_eq!(dup_matches.len(), 1);
+    assert_eq!(dup_matches[0].3.get("$X").unwrap(), "a");
+
+    // 5. Test Terminal report formatting
+    let term_out = format_structural_search_for_terminal(&search_res);
+    assert!(term_out.contains("STRUCTURAL AST PATTERN SEARCH & REPLACE"));
+    assert!(term_out.contains("Total Matches: 2"));
+
+    // 6. Verify structural_search in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("structural_search"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 5: AUTOMATED SEMVER BUMPER & RELEASE SYNTHESIZER TESTS
+// ============================================================================
+
+#[test]
+fn test_automated_semver_bumper_and_release_synthesizer() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_release_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Test SemVer struct parsing and bumping
+    let v1 = SemVer::parse("0.1.0").unwrap();
+    assert_eq!(v1.major, 0);
+    assert_eq!(v1.minor, 1);
+    assert_eq!(v1.patch, 0);
+    assert_eq!(v1.to_string(), "0.1.0");
+
+    assert_eq!(v1.bump(BumpType::Patch).to_string(), "0.1.1");
+    assert_eq!(v1.bump(BumpType::Minor).to_string(), "0.2.0");
+    assert_eq!(v1.bump(BumpType::Major).to_string(), "1.0.0");
+
+    let v_pre = SemVer::parse("v2.1.0-beta.1").unwrap();
+    assert_eq!(v_pre.major, 2);
+    assert_eq!(v_pre.minor, 1);
+    assert_eq!(v_pre.patch, 0);
+    assert_eq!(v_pre.pre_release, Some("beta.1".to_string()));
+
+    // 2. Test Commit message parser
+    let c1 = parse_commit_line("feat(auth)!: switch to asymmetric JWT verification");
+    assert!(c1.is_breaking);
+    assert_eq!(c1.commit_type, "feat");
+    assert_eq!(c1.scope, Some("auth".to_string()));
+
+    let c2 = parse_commit_line("feat(api): add GraphQL subscription endpoints");
+    assert!(!c2.is_breaking);
+    assert_eq!(c2.commit_type, "feat");
+    assert_eq!(c2.scope, Some("api".to_string()));
+
+    let c3 = parse_commit_line("fix: resolve race condition in database pool");
+    assert!(!c3.is_breaking);
+    assert_eq!(c3.commit_type, "fix");
+
+    // 3. Create dummy Cargo.toml and package.json in test workspace
+    let cargo_toml = temp_dir.join("Cargo.toml");
+    std::fs::write(&cargo_toml, "[package]\nname = \"test_pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+
+    let package_json = temp_dir.join("package.json");
+    std::fs::write(&package_json, "{\n  \"name\": \"test-app\",\n  \"version\": \"0.1.0\"\n}").unwrap();
+
+    // 4. Calculate next SemVer
+    let plan = calculate_next_semver(&temp_dir).expect("Failed to calculate next SemVer");
+    assert_eq!(plan.current_version, "0.1.0");
+    assert!(!plan.next_version.is_empty());
+    assert!(plan.changelog_entry.contains("## ["));
+
+    // 5. Execute release with file writing (override to Minor -> 0.2.0)
+    let executed_plan = execute_release(&temp_dir, Some(BumpType::Minor), false, true).expect("Failed to execute release");
+    assert_eq!(executed_plan.next_version, "0.2.0");
+    assert_eq!(executed_plan.tag_name, "v0.2.0");
+
+    // Verify Cargo.toml was updated
+    let updated_cargo = std::fs::read_to_string(&cargo_toml).unwrap();
+    assert!(updated_cargo.contains("version = \"0.2.0\""));
+
+    // Verify package.json was updated
+    let updated_pkg = std::fs::read_to_string(&package_json).unwrap();
+    assert!(updated_pkg.contains("\"version\": \"0.2.0\""));
+
+    // Verify CHANGELOG.md was created
+    let changelog_path = temp_dir.join("CHANGELOG.md");
+    assert!(changelog_path.exists());
+    let changelog_content = std::fs::read_to_string(&changelog_path).unwrap();
+    assert!(changelog_content.contains("## [0.2.0]"));
+
+    // 6. Test Terminal Formatting
+    let term_out = format_release_plan_for_terminal(&executed_plan);
+    assert!(term_out.contains("AUTOMATED SEMVER BUMPER & RELEASE SYNTHESIZER"));
+    assert!(term_out.contains("0.2.0"));
+
+    // 7. Verify bump_version in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("bump_version"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 6: REAL-TIME REMOTE PAIR-PROGRAMMING BRIDGE TESTS
+// ============================================================================
+
+#[tokio::test]
+async fn test_realtime_remote_pair_programming_bridge() {
+    let auth_token = "zy-secret-token-12345";
+    let handle = start_remote_pair_bridge(0, Some(auth_token)).await.expect("Failed to start remote bridge");
+
+    assert!(handle.is_running());
+    assert!(handle.port() > 0);
+    assert!(handle.base_url().starts_with("http://127.0.0.1:"));
+
+    let client = reqwest::Client::new();
+
+    // 1. Unauthenticated request should return 401
+    let unauth_res = client.get(format!("{}/status", handle.base_url()))
+        .send().await.expect("Request failed");
+    assert_eq!(unauth_res.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 2. Authenticated GET /status
+    let status_res = client.get(format!("{}/status", handle.base_url()))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .send().await.expect("Authenticated status request failed");
+    assert_eq!(status_res.status(), reqwest::StatusCode::OK);
+    let status_json: serde_json::Value = status_res.json().await.unwrap();
+    assert_eq!(status_json["status"], "active");
+    assert_eq!(status_json["authenticated"], true);
+
+    // 3. Authenticated POST /prompt
+    let prompt_res = client.post(format!("{}/prompt", handle.base_url()))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&serde_json::json!({ "prompt": "refactor src/main.rs to use error handling" }))
+        .send().await.expect("POST /prompt failed");
+    assert_eq!(prompt_res.status(), reqwest::StatusCode::OK);
+    let prompt_json: serde_json::Value = prompt_res.json().await.unwrap();
+    assert_eq!(prompt_json["status"], "received");
+
+    // 4. Authenticated POST /approval
+    let approval_res = client.post(format!("{}/approval", handle.base_url()))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&serde_json::json!({ "approved": true, "tool_id": "call_9988" }))
+        .send().await.expect("POST /approval failed");
+    assert_eq!(approval_res.status(), reqwest::StatusCode::OK);
+    let approval_json: serde_json::Value = approval_res.json().await.unwrap();
+    assert_eq!(approval_json["status"], "approval_recorded");
+
+    // 5. Broadcast custom event and verify /history
+    handle.broadcast(BridgeEventType::ThoughtStream, serde_json::json!({ "thought": "Analyzing repository structure..." }));
+    let history_res = client.get(format!("{}/history", handle.base_url()))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .send().await.expect("GET /history failed");
+    assert_eq!(history_res.status(), reqwest::StatusCode::OK);
+    let history_json: serde_json::Value = history_res.json().await.unwrap();
+    assert!(history_json.as_array().unwrap().len() >= 3);
+
+    // 6. Test Active Bridge Registration & Global Broadcast
+    register_active_bridge(handle.clone());
+    let active_opt = get_active_bridge();
+    assert!(active_opt.is_some());
+    broadcast_to_active_bridge(BridgeEventType::ChatMessage, serde_json::json!({ "message": "Global agent ping" }));
+
+    // 7. Test Terminal Report Formatting
+    let term_out = format_remote_bridge_report_for_terminal(&handle);
+    assert!(term_out.contains("REAL-TIME REMOTE PAIR-PROGRAMMING BRIDGE ACTIVE"));
+    assert!(term_out.contains("Base URL:"));
+    assert!(term_out.contains("SSE Stream:"));
+
+    // 8. Shutdown bridge
+    stop_active_bridge();
+    handle.stop();
+    assert!(!handle.is_running());
+
+    // 9. Verify remote_bridge in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("remote_bridge"));
+}
+
+// ============================================================================
+// SYSTEM 7: BRUTAL EDGE CASES & RESILIENCE ACROSS ALL 6 SYSTEMS
+// ============================================================================
+
+#[test]
+fn test_brutal_edge_cases_across_6_advanced_systems() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_brutal_6sys_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Worktree on weird task ID with symbols and non-existent root
+    let weird_handle = create_task_worktree(&temp_dir, "task/sub:weird#99!", None).expect("Weird task ID failed");
+    assert_eq!(weird_handle.task_id, "task_sub_weird_99_");
+    let _ = weird_handle.cleanup(true);
+
+    // 2. Code review on totally empty file & non-existent file
+    let empty_file = temp_dir.join("empty.rs");
+    std::fs::write(&empty_file, "").unwrap();
+    let empty_report = perform_code_review(&temp_dir, Some(&empty_file.to_string_lossy())).unwrap();
+    assert_eq!(empty_report.findings.len(), 0);
+    assert_eq!(empty_report.critical_count, 0);
+
+    // 3. Conflict resolver on file with 0 conflicts and file with 3 consecutive conflicts
+    let no_conflicts = "fn clean() { println!(\"clean\"); }";
+    let clean_res = resolve_merge_conflict_content(no_conflicts, "clean.rs");
+    assert_eq!(clean_res.conflicts_found, 0);
+    assert_eq!(clean_res.conflicts_resolved, 0);
+    assert!(clean_res.verified_syntax);
+
+    let triple_conflict = r#"
+<<<<<<< HEAD
+use std::io;
+=======
+use std::fs;
+>>>>>>> inc1
+fn a() {}
+<<<<<<< HEAD
+fn b() { 1 }
+=======
+fn c() { 2 }
+>>>>>>> inc2
+fn d() {}
+<<<<<<< HEAD
+let x = 10;
+||||||| base
+let x = 5;
+=======
+let x = 20;
+>>>>>>> inc3
+"#;
+    let triple_res = resolve_merge_conflict_content(triple_conflict, "triple.rs");
+    assert_eq!(triple_res.conflicts_found, 3);
+    assert_eq!(triple_res.conflicts_resolved, 3);
+    assert!(!triple_res.resolved_file_content.contains("<<<<<<<"));
+
+    // 4. Structural AST matcher on empty pattern & non-matching pattern
+    let empty_matches = match_structural_pattern("", "let x = 1;");
+    assert_eq!(empty_matches.len(), 0);
+    let no_matches = match_structural_pattern("non_existent_symbol ( $$$ARGS )", "let x = 1;");
+    assert_eq!(no_matches.len(), 0);
+
+    // 5. SemVer parser on invalid versions fallback
+    assert!(SemVer::parse("invalid_not_a_semver").is_none());
+    assert_eq!(SemVer::parse("3").unwrap().to_string(), "3.0.0");
+    assert_eq!(SemVer::parse("1.2").unwrap().to_string(), "1.2.0");
+
+    let fallback_commit = parse_commit_line("arbitrary unformatted commit without type");
+    assert_eq!(fallback_commit.commit_type, "chore");
+    assert!(!fallback_commit.is_breaking);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+

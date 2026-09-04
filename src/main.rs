@@ -54,6 +54,109 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 single_prompt(&client, model_name, sys_prompt, file, &text, *agent, session.as_deref(), *rag, *markdown, &tuner, *force, executor.clone(), *strategist, scout_model, format_schema, map_flag, sandbox_flag).await?;
             }
         }
+        Some(Commands::Worktree { action, task_id, command }) => {
+            let id = task_id.as_deref().unwrap_or("default-task");
+            match action.to_lowercase().as_str() {
+                "create" => {
+                    let handle = create_task_worktree(std::path::Path::new("."), id, None)?;
+                    println!("{}", format_worktree_report_for_terminal(&handle));
+                }
+                "execute" => {
+                    if let Some(cmd) = command {
+                        let handle = WorktreeHandle {
+                            task_id: id.to_string(),
+                            branch_name: format!("zy-task-{}", id),
+                            worktree_path: std::path::Path::new(".").join(".zy").join("worktrees").join(id),
+                            workspace_root: std::path::PathBuf::from("."),
+                            created_at: "active".to_string(),
+                        };
+                        let res = execute_in_worktree(&handle, cmd)?;
+                        println!("STDOUT:\n{}\nSTDERR:\n{}", res.stdout, res.stderr);
+                    } else {
+                        eprintln!("Error: Missing command for execute");
+                    }
+                }
+                "merge" => {
+                    let handle = WorktreeHandle {
+                        task_id: id.to_string(),
+                        branch_name: format!("zy-task-{}", id),
+                        worktree_path: std::path::Path::new(".").join(".zy").join("worktrees").join(id),
+                        workspace_root: std::path::PathBuf::from("."),
+                        created_at: "active".to_string(),
+                    };
+                    let res = merge_worktree_back(&handle, None)?;
+                    println!("{}", res.summary);
+                }
+                "cleanup" => {
+                    let handle = WorktreeHandle {
+                        task_id: id.to_string(),
+                        branch_name: format!("zy-task-{}", id),
+                        worktree_path: std::path::Path::new(".").join(".zy").join("worktrees").join(id),
+                        workspace_root: std::path::PathBuf::from("."),
+                        created_at: "active".to_string(),
+                    };
+                    let cleaned = cleanup_worktree(&handle, true)?;
+                    println!("Worktree cleanup status: {}", cleaned);
+                }
+                _ => {
+                    let list = list_task_worktrees(std::path::Path::new("."))?;
+                    println!("{}", format_worktree_list_for_terminal(&list));
+                }
+            }
+        }
+        Some(Commands::Review { path }) => {
+            let report = perform_code_review(std::path::Path::new("."), Some(path.as_str()))?;
+            println!("{}", format_code_review_for_terminal(&report));
+        }
+        Some(Commands::Resolve { path }) => {
+            let p = std::path::Path::new(path);
+            if p.is_file() {
+                let res = resolve_merge_conflict(p)?;
+                println!("{}", format_conflict_resolution_for_terminal(&res));
+            } else {
+                let conflicts = find_merge_conflicts(p);
+                for cf in &conflicts {
+                    let res = resolve_merge_conflict(cf)?;
+                    println!("{}", format_conflict_resolution_for_terminal(&res));
+                }
+            }
+        }
+        Some(Commands::AstGrep { pattern, replacement, path }) => {
+            let res = execute_structural_search(std::path::Path::new(path), pattern, replacement.as_deref())?;
+            println!("{}", format_structural_search_for_terminal(&res));
+        }
+        Some(Commands::Release { bump, path }) => {
+            let bump_override = match bump.to_lowercase().as_str() {
+                "major" => Some(BumpType::Major),
+                "minor" => Some(BumpType::Minor),
+                "patch" => Some(BumpType::Patch),
+                _ => None,
+            };
+            let plan = execute_release(std::path::Path::new(path), bump_override, false, true)?;
+            println!("{}", format_release_plan_for_terminal(&plan));
+        }
+        Some(Commands::Remote { action, port, token }) => {
+            match action.to_lowercase().as_str() {
+                "start" => {
+                    let handle = start_remote_pair_bridge(*port, token.as_deref()).await?;
+                    println!("{}", format_remote_bridge_report_for_terminal(&handle));
+                    // Keep running until Ctrl+C
+                    tokio::signal::ctrl_c().await?;
+                    handle.stop();
+                }
+                "stop" => {
+                    stop_active_bridge();
+                    println!("Remote bridge stopped.");
+                }
+                _ => {
+                    if let Some(h) = get_active_bridge() {
+                        println!("{}", format_remote_bridge_report_for_terminal(&h));
+                    } else {
+                        println!("No remote bridge active.");
+                    }
+                }
+            }
+        }
         None => {
             if cli.tui {
                 let tuner = run_ai_tuner(0.1, true);
