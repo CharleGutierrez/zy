@@ -734,6 +734,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if cli.tui {
                 let tuner = run_ai_tuner(0.1, true);
                 run_tui_app(&client, &cli.model, cli.system.as_deref(), &[], false, false, &tuner, false).await?;
+            } else if cli.scrubber {
+                run_time_travel_scrubber().await?;
+            } else if let Some(file_line) = &cli.hover {
+                run_holographic_hover(file_line).await?;
+            } else if let Some(file) = &cli.minimap {
+                run_vertical_minimap(file).await?;
             } else if let Some(goal) = &cli.swarm {
                 let tuner = run_ai_tuner(0.1, true);
                 run_swarm_workflow(&client, &cli.model, None, goal, &tuner.opts, true, false, cli.sandbox).await?;

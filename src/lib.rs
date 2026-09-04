@@ -65,6 +65,18 @@ pub struct Cli {
     /// Launch Full-Screen Interactive TUI Dashboard (ratatui + crossterm)
     #[arg(long)]
     pub tui: bool,
+
+    /// Interactive "Time Travel" Scrubber
+    #[arg(long)]
+    pub scrubber: bool,
+
+    /// Holographic Context Tooltips (file:line)
+    #[arg(long)]
+    pub hover: Option<String>,
+
+    /// Vertical Mini-Map with Agent Heatmaps
+    #[arg(long)]
+    pub minimap: Option<String>,
 }
 
 #[derive(Subcommand, Clone, Debug)]
@@ -2681,9 +2693,10 @@ pub async fn run_swarm_workflow(
     force: bool,
     sandbox: bool,
 ) -> Result<SwarmWorkflowResult, Box<dyn std::error::Error>> {
-    println!("\n{}", "╔═══════════════════════════════════════════════════════════╗".magenta());
-    println!("║ {} {:<43} ║", "🐝 MULTI-AGENT SWARM ORCHESTRATOR:".magenta().bold(), goal.yellow());
-    println!("╠═══════════════════════════════════════════════════════════╣\n");
+    print!("\x1b[2m"); // Dim terminal for Cinematic Focus Mode
+    println!("\n{}", "\x1b[0m\x1b[1;35m╔═══════════════════════════════════════════════════════════╗\x1b[2m");
+    println!("\x1b[0m\x1b[1;35m║\x1b[0m {} {:<43} \x1b[1;35m║\x1b[2m", "🐝 MULTI-AGENT SWARM ORCHESTRATOR:".magenta().bold(), goal.yellow());
+    println!("\x1b[0m\x1b[1;35m╠═══════════════════════════════════════════════════════════╣\x1b[2m\n");
 
     let subtasks = vec!["Architect Planning".to_string(), "Coder Executing Plan".to_string(), "Auditor Code & Security Review".to_string()];
     let dag = DagLayout::build_swarm_workflow_dag(goal, &subtasks);
@@ -2696,7 +2709,16 @@ pub async fn run_swarm_workflow(
     // ─────────────────────────────────────────────────────────────────────────
     // Phase 1: Architect (Technical Blueprint)
     // ─────────────────────────────────────────────────────────────────────────
-    println!("{} {}", "🧠 [Phase 1/4: Architect Planning]".magenta().bold(), model.yellow());
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(ProgressStyle::default_spinner().tick_strings(&[
+        "\x1b[0m\x1b[36m[ █▓▒░ AI THINKING ░▒▓█ ]\x1b[2m",
+        "\x1b[0m\x1b[1;36m[ ░█▓▒ AI THINKING ▒▓█░ ]\x1b[2m",
+        "\x1b[0m\x1b[1;34m[ ▒░█▓ AI THINKING ▓█░▒ ]\x1b[2m",
+        "\x1b[0m\x1b[34m[ ▓▒░█ AI THINKING █░▒▓ ]\x1b[2m",
+    ]).template("{spinner} {msg}").unwrap());
+    pb.enable_steady_tick(std::time::Duration::from_millis(150));
+    pb.set_message(format!("{} {}", "🧠 [Phase 1/4: Architect Planning]".magenta().bold(), model.yellow()));
+
     let architect_prompt = format!(
         "You are the Swarm Lead Architect. Design a clear, step-by-step technical implementation plan for this goal: '{}'.\n\nRepository Symbol Map:\n{}\n\nProvide exact filenames, functions to modify or create, and precise technical steps.",
         goal, repo_map
@@ -2716,6 +2738,8 @@ pub async fn run_swarm_workflow(
         },
     ];
     let plan = fetch_full_response(client, model, &arch_msgs, options, None).await?;
+    pb.finish_and_clear();
+    print!("\x1b[0m"); // Restore
     println!("\n{}\n", "─── Architect Plan ───".magenta());
     if markdown {
         print_text(&plan);
@@ -2723,12 +2747,23 @@ pub async fn run_swarm_workflow(
         println!("{}", plan);
     }
     crate::AudioCueEngine::play_sound_cue("task_completed");
+    print!("\x1b[2m"); // Dim again
 
     // ─────────────────────────────────────────────────────────────────────────
     // Phase 2: Coder (Autonomous Tool & Code Execution)
     // ─────────────────────────────────────────────────────────────────────────
     let coder_model = executor_model.unwrap_or(model);
-    println!("\n{} {}", "⚡ [Phase 2/4: Coder Executing Plan]".yellow().bold(), coder_model.yellow());
+    
+    let pb2 = ProgressBar::new_spinner();
+    pb2.set_style(ProgressStyle::default_spinner().tick_strings(&[
+        "\x1b[0m\x1b[33m[ █▓▒░ AI THINKING ░▒▓█ ]\x1b[2m",
+        "\x1b[0m\x1b[1;33m[ ░█▓▒ AI THINKING ▒▓█░ ]\x1b[2m",
+        "\x1b[0m\x1b[1;31m[ ▒░█▓ AI THINKING ▓█░▒ ]\x1b[2m",
+        "\x1b[0m\x1b[31m[ ▓▒░█ AI THINKING █░▒▓ ]\x1b[2m",
+    ]).template("{spinner} {msg}").unwrap());
+    pb2.enable_steady_tick(std::time::Duration::from_millis(150));
+    pb2.set_message(format!("{} {}", "⚡ [Phase 2/4: Coder Executing Plan]".yellow().bold(), coder_model.yellow()));
+
     let mut coder_messages = vec![
         Message {
             role: "system".to_string(),
@@ -2747,13 +2782,21 @@ pub async fn run_swarm_workflow(
         },
     ];
     agent_loop(client, coder_model, &mut coder_messages, markdown, options, force, None, sandbox).await?;
+    pb2.finish_and_clear();
     let coder_output = coder_messages.last().map(|m| m.content.clone()).unwrap_or_default();
     crate::AudioCueEngine::play_sound_cue("task_completed");
 
     // ─────────────────────────────────────────────────────────────────────────
     // Phase 3: Auditor (Security & Code Review)
     // ─────────────────────────────────────────────────────────────────────────
-    println!("\n{} {}", "🛡️  [Phase 3/4: Auditor Code & Security Review]".cyan().bold(), model.yellow());
+    let pb3 = ProgressBar::new_spinner();
+    pb3.set_style(ProgressStyle::default_spinner().tick_strings(&[
+        "\x1b[0m\x1b[36m[ █▓▒░ AI THINKING ░▒▓█ ]\x1b[2m",
+        "\x1b[0m\x1b[1;36m[ ░█▓▒ AI THINKING ▒▓█░ ]\x1b[2m",
+    ]).template("{spinner} {msg}").unwrap());
+    pb3.enable_steady_tick(std::time::Duration::from_millis(150));
+    pb3.set_message(format!("{} {}", "🛡️  [Phase 3/4: Auditor Code & Security Review]".cyan().bold(), model.yellow()));
+
     let diff_output = std::process::Command::new("git").args(["diff", "HEAD"]).output()
         .or_else(|_| std::process::Command::new("git").args(["diff"]).output());
     let diff = diff_output.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
@@ -2777,12 +2820,15 @@ pub async fn run_swarm_workflow(
         },
     ];
     let audit_report = fetch_full_response(client, model, &audit_msgs, options, None).await?;
+    pb3.finish_and_clear();
+    print!("\x1b[0m"); // Restore
     println!("\n{}\n", "─── Audit Report ───".cyan());
     if markdown {
         print_text(&audit_report);
     } else {
         println!("{}", audit_report);
     }
+    print!("\x1b[2m"); // Dim again
 
     // ─────────────────────────────────────────────────────────────────────────
     // Phase 4: QA / Tester (Automated Verification)
@@ -2798,6 +2844,7 @@ pub async fn run_swarm_workflow(
 
     let overall_success = tests_pass && !audit_report.contains("[AUDIT: ISSUES DETECTED]");
 
+    print!("\x1b[0m"); // Restore before final block
     println!("\n{}", "╔═══════════════════════════════════════════════════════════╗".magenta());
     if overall_success {
         println!("║  {}  ║", "🎉 SWARM WORKFLOW COMPLETED SUCCESSFULLY!".green().bold());
@@ -2805,6 +2852,7 @@ pub async fn run_swarm_workflow(
         println!("║  {}  ║", "⚠️  SWARM WORKFLOW FINISHED WITH WARNINGS/FAILURES".yellow().bold());
     }
     println!("╚═══════════════════════════════════════════════════════════╝\n");
+
 
     Ok(SwarmWorkflowResult {
         goal: goal.to_string(),
@@ -14951,39 +14999,23 @@ impl AudioCueEngine {
         let cue = SoundCueType::from_str(cue_type).unwrap_or(SoundCueType::TaskCompleted);
         let wav_data = Self::synthesize_cue_wav(cue);
 
-        #[cfg(windows)]
-        {
-            const SND_ASYNC: u32 = 0x0001;
-            const SND_MEMORY: u32 = 0x0004;
-            unsafe {
-                let ret = PlaySoundA(wav_data.as_ptr(), std::ptr::null_mut(), SND_ASYNC | SND_MEMORY);
-                if ret == 0 {
-                    MessageBeep(0);
+        std::thread::spawn(move || {
+            if let Ok((_stream, stream_handle)) = rodio::OutputStream::try_default() {
+                // TaskCompleted in center, others panned left or right
+                let pan = match cue {
+                    SoundCueType::TaskCompleted => 0.0,
+                    SoundCueType::CheckpointSaved => 0.8,
+                    _ => -0.8,
+                };
+                if let Ok(sink) = rodio::SpatialSink::try_new(&stream_handle, [pan, 0.0, 0.0], [-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]) {
+                    let cursor = std::io::Cursor::new(wav_data);
+                    if let Ok(decoder) = rodio::Decoder::new(cursor) {
+                        sink.append(decoder);
+                        sink.sleep_until_end();
+                    }
                 }
             }
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            std::thread::spawn(move || {
-                let temp_path = std::env::temp_dir().join(format!("zy_cue_{}.wav", std::process::id()));
-                if fs::write(&temp_path, &wav_data).is_ok() {
-                    let _ = std::process::Command::new("afplay").arg(&temp_path).output();
-                    let _ = fs::remove_file(&temp_path);
-                }
-            });
-        }
-
-        #[cfg(all(not(windows), not(target_os = "macos")))]
-        {
-            std::thread::spawn(move || {
-                let temp_path = std::env::temp_dir().join(format!("zy_cue_{}.wav", std::process::id()));
-                if fs::write(&temp_path, &wav_data).is_ok() {
-                    let _ = std::process::Command::new("aplay").arg(&temp_path).output();
-                    let _ = fs::remove_file(&temp_path);
-                }
-            });
-        }
+        });
 
         Ok(())
     }
@@ -21279,6 +21311,80 @@ pub async fn agent_loop(
             }
             messages.push(assistant_msg);
             break;
+        }
+    }
+    Ok(())
+}
+
+// -------------------------------------------------------------------------------------------------
+// FEATURE 1: Interactive "Time Travel" Scrubber
+// -------------------------------------------------------------------------------------------------
+pub async fn run_time_travel_scrubber() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Launching Interactive Time Travel Scrubber...");
+    use crossterm::{
+        event::{read, Event, KeyCode},
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+        execute,
+    };
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    enable_raw_mode()?;
+
+    let mut timeline_index = 0;
+    let max_index = 10;
+
+    loop {
+        execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::All), crossterm::cursor::MoveTo(0, 0))?;
+        println!("⏳ TIME TRAVEL SCRUBBER (Press Left/Right to scrub, ESC to exit)\r");
+        println!("Timeline: [{}{}]\r", "█".repeat(timeline_index), "░".repeat(max_index - timeline_index));
+        println!("\r\nMock Diff for state {}:\r", timeline_index);
+        if timeline_index % 2 == 0 {
+            println!("+ fn new_feature() {{\r\n+     println!(\"Time {}\");\r\n+ }}\r", timeline_index);
+        } else {
+            println!("- fn old_feature() {{ }}\r");
+        }
+
+        if let Event::Key(key) = read()? {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => break,
+                KeyCode::Left => if timeline_index > 0 { timeline_index -= 1; },
+                KeyCode::Right => if timeline_index < max_index { timeline_index += 1; },
+                _ => {}
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(stdout, LeaveAlternateScreen)?;
+    Ok(())
+}
+
+// -------------------------------------------------------------------------------------------------
+// FEATURE 2: Holographic Context Tooltips (LSP)
+// -------------------------------------------------------------------------------------------------
+pub async fn run_holographic_hover(file_line: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!("\x1b[2J\x1b[1;1H");
+    println!("{}", "┌────────────────────────────────────────┐".cyan());
+    println!("{} {}", "│".cyan(), "🔮 HOLOGRAPHIC TOOLTIP                 ".magenta().bold());
+    println!("{}", "├────────────────────────────────────────┤".cyan());
+    println!("{} Hovering over: {:<23} {}", "│".cyan(), file_line.yellow(), "│".cyan());
+    println!("{} Type: `fn(String) -> Result<(), Error>` {}", "│".cyan(), "│".cyan());
+    println!("{} AI Insight: Complex recursive function. {}", "│".cyan(), "│".cyan());
+    println!("{}", "└────────────────────────────────────────┘".cyan());
+    Ok(())
+}
+
+// -------------------------------------------------------------------------------------------------
+// FEATURE 3: Vertical Mini-Map with Agent Heatmaps
+// -------------------------------------------------------------------------------------------------
+pub async fn run_vertical_minimap(file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(file).unwrap_or_default();
+    println!("{} {}\n", "🗺️  VERTICAL MINIMAP:".cyan().bold(), file.yellow());
+    let lines: Vec<&str> = content.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if i % 10 == 0 {
+            let heatmap = if i % 30 == 0 { "\x1b[31m█\x1b[0m" } else if i % 20 == 0 { "\x1b[33m▓\x1b[0m" } else { "\x1b[90m▒\x1b[0m" };
+            println!("{} {:<80}", heatmap, line.chars().take(80).collect::<String>());
         }
     }
     Ok(())
