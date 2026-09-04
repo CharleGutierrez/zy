@@ -5020,15 +5020,14 @@ impl Default for RefactorTransaction {
 
 impl RefactorTransaction {
     pub fn new() -> Self {
-        let ts = std::time::SystemTime::now()
+        let duration = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let id = format!("tx_{}", ts);
+            .unwrap_or_default();
+        let id = format!("tx_{}", duration.as_nanos());
         Self {
             id,
             staged_files: std::collections::HashMap::new(),
-            created_at: ts,
+            created_at: duration.as_secs(),
         }
     }
 
@@ -14966,7 +14965,7 @@ impl AudioCueEngine {
 
         #[cfg(target_os = "macos")]
         {
-            tokio::spawn(async move {
+            std::thread::spawn(move || {
                 let temp_path = std::env::temp_dir().join(format!("zy_cue_{}.wav", std::process::id()));
                 if fs::write(&temp_path, &wav_data).is_ok() {
                     let _ = std::process::Command::new("afplay").arg(&temp_path).output();
@@ -14977,7 +14976,7 @@ impl AudioCueEngine {
 
         #[cfg(all(not(windows), not(target_os = "macos")))]
         {
-            tokio::spawn(async move {
+            std::thread::spawn(move || {
                 let temp_path = std::env::temp_dir().join(format!("zy_cue_{}.wav", std::process::id()));
                 if fs::write(&temp_path, &wav_data).is_ok() {
                     let _ = std::process::Command::new("aplay").arg(&temp_path).output();
