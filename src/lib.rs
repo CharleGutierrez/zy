@@ -3,7 +3,7 @@
 use base64::Engine;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, SinkExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use inquire::{Confirm, Select, Text};
 use notify::{RecursiveMode, Watcher};
@@ -2685,6 +2685,12 @@ pub async fn run_swarm_workflow(
     println!("║ {} {:<43} ║", "🐝 MULTI-AGENT SWARM ORCHESTRATOR:".magenta().bold(), goal.yellow());
     println!("╠═══════════════════════════════════════════════════════════╣\n");
 
+    let subtasks = vec!["Architect Planning".to_string(), "Coder Executing Plan".to_string(), "Auditor Code & Security Review".to_string()];
+    let dag = DagLayout::build_swarm_workflow_dag(goal, &subtasks);
+    println!("\n{}", "🔀 SWARM TOPOLOGICAL DAG:".cyan().bold());
+    println!("{}\n", dag.to_mermaid().cyan());
+    crate::AudioCueEngine::play_sound_cue("task_completed");
+
     let repo_map = build_repo_map(std::path::Path::new("."), 2048);
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2716,6 +2722,7 @@ pub async fn run_swarm_workflow(
     } else {
         println!("{}", plan);
     }
+    crate::AudioCueEngine::play_sound_cue("task_completed");
 
     // ─────────────────────────────────────────────────────────────────────────
     // Phase 2: Coder (Autonomous Tool & Code Execution)
@@ -2741,6 +2748,7 @@ pub async fn run_swarm_workflow(
     ];
     agent_loop(client, coder_model, &mut coder_messages, markdown, options, force, None, sandbox).await?;
     let coder_output = coder_messages.last().map(|m| m.content.clone()).unwrap_or_default();
+    crate::AudioCueEngine::play_sound_cue("task_completed");
 
     // ─────────────────────────────────────────────────────────────────────────
     // Phase 3: Auditor (Security & Code Review)
@@ -13935,9 +13943,9 @@ const SWARM_STUDIO_HTML: &str = r##"<!DOCTYPE html>
     </section>
   </main>
 
-  <script>
-    const evt = new EventSource('/api/studio/events');
-    evt.onmessage = function(e) {
+    const ws_port = window.WS_PORT || 80;
+    const ws = new WebSocket(`ws://127.0.0.1:${ws_port}`);
+    ws.onmessage = function(e) {
       try {
         const d = JSON.parse(e.data);
         const ins = document.getElementById('inspector-content');
@@ -13950,7 +13958,9 @@ const SWARM_STUDIO_HTML: &str = r##"<!DOCTYPE html>
     };
 
     function selectNode(role) {
-      alert('Selected Swarm Agent: ' + role.toUpperCase());
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'select_node', role: role }));
+      }
     }
   </script>
 </body>
@@ -13962,9 +13972,47 @@ pub async fn start_swarm_studio_server(port: u16) -> Result<StudioServerHandle, 
     let actual_port = bound_addr.port();
     let base_url = format!("http://127.0.0.1:{}", actual_port);
 
+    let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let ws_port = ws_listener.local_addr()?.port();
+
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let (event_sender, _) = tokio::sync::broadcast::channel::<String>(512);
     let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let event_sender_clone = event_sender.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = ws_listener.accept().await {
+            let mut event_rx = event_sender_clone.subscribe();
+            tokio::spawn(async move {
+                if let Ok(mut ws_stream) = tokio_tungstenite::accept_async(stream).await {
+                    loop {
+                        tokio::select! {
+                            msg_res = ws_stream.next() => {
+                                match msg_res {
+                                    Some(Ok(msg)) => {
+                                        if let Ok(text) = msg.to_text() {
+                                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+                                                if val.get("action").and_then(|a| a.as_str()) == Some("select_node") {
+                                                    let role = val.get("role").and_then(|r| r.as_str()).unwrap_or("unknown");
+                                                    println!("\n{} {} {}", "⚡".yellow().bold(), "STUDIO COMMAND:".cyan().bold(), format!("Selected Swarm Node [{}] from Web UI!", role.to_uppercase()).white());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            evt_res = event_rx.recv() => {
+                                if let Ok(evt) = evt_res {
+                                    let _ = ws_stream.send(tungstenite::Message::Text(evt.into())).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
 
     let initial_nodes = vec![
         SwarmNode {
@@ -14044,6 +14092,7 @@ pub async fn start_swarm_studio_server(port: u16) -> Result<StudioServerHandle, 
                 accept_res = listener.accept() => {
                     if let Ok((mut socket, _)) = accept_res {
                         let conn_server = server_handle.clone();
+                        let html_body = SWARM_STUDIO_HTML.replace("window.WS_PORT || 80", &format!("{}", ws_port));
                         tokio::spawn(async move {
                             let mut buf = vec![0u8; 8192];
                             if let Ok(n) = socket.read(&mut buf).await {
@@ -14058,7 +14107,7 @@ pub async fn start_swarm_studio_server(port: u16) -> Result<StudioServerHandle, 
                                 if req_path == "/" || req_path == "/index.html" {
                                     let resp = format!(
                                         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                        SWARM_STUDIO_HTML.len(), SWARM_STUDIO_HTML
+                                        html_body.len(), html_body
                                     );
                                     let _ = socket.write_all(resp.as_bytes()).await;
                                     let _ = socket.flush().await;

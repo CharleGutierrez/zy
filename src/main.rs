@@ -343,8 +343,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 items
             };
-            let results = FuzzyCommandPalette::search_palette(query, &filtered);
-            println!("{}", format_palette_results_for_terminal(query, &results));
+            if query.is_empty() {
+                let options: Vec<String> = filtered.iter().map(|i| {
+                    format!("[{:?}] {} - {}", i.category, i.title, i.subtitle.as_deref().unwrap_or(""))
+                }).collect();
+                if let Ok(selection) = inquire::Select::new("🔍 FUZZY COMMAND PALETTE:", options)
+                    .with_page_size(10)
+                    .prompt() 
+                {
+                    println!("Executing: {}", selection);
+                }
+            } else {
+                let results = FuzzyCommandPalette::search_palette(query, &filtered);
+                println!("{}", format_palette_results_for_terminal(query, &results));
+            }
         }
         Some(Commands::Sound { action, cue }) => {
             match action.to_lowercase().as_str() {
@@ -401,13 +413,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 hunks = split_hunks;
             }
-            if *apply && std::path::Path::new(path).is_file() {
-                let orig = std::fs::read_to_string(path)?;
-                let staged = apply_selected_hunks(&orig, &hunks, &hunk_indices)?;
-                std::fs::write(path, staged)?;
-                println!("Applied {} staged hunk(s) to {}", hunk_indices.len(), path);
+            for hunk in &hunks {
+                println!("{}", format_hunk_staging_report_for_terminal(path, &vec![hunk.clone()], &[]));
+                if let Ok(ans) = inquire::Confirm::new("Apply this code change?").with_default(true).prompt() {
+                    if ans {
+                        let orig = std::fs::read_to_string(path).unwrap_or_default();
+                        if let Ok(staged) = apply_selected_hunks(&orig, &vec![hunk.clone()], &vec![hunk.index]) {
+                            let _ = std::fs::write(path, staged);
+                            println!("{}", "Applied hunk!".green());
+                        }
+                    }
+                }
             }
-            println!("{}", format_hunk_staging_report_for_terminal(path, &hunks, &hunk_indices));
         }
         Some(Commands::Heatmap { max_ctx, session }) => {
             let messages = load_session(session.as_deref());
