@@ -627,3 +627,507 @@ fn test_streaming_think_tag_and_tool_call_accumulator() {
     assert_eq!(val["arguments"]["cmd"], "ls -la");
 }
 
+#[test]
+fn test_hybrid_rag_bm25_lexical_scoring() {
+    // 1. Tokenizer tests
+    let text = "Hybrid RAG Engine with BM-25 & Vector Cosine!";
+    let tokens = tokenize_text(text);
+    assert_eq!(tokens, vec!["hybrid", "rag", "engine", "with", "bm", "25", "vector", "cosine"]);
+
+    // 2. BM25 scoring tests
+    let doc_tokens_1 = vec!["rust".to_string(), "async".to_string(), "tokio".to_string(), "rust".to_string()];
+    let doc_tokens_2 = vec!["python".to_string(), "django".to_string(), "web".to_string()];
+    let doc_tokens_3 = vec!["rust".to_string(), "systems".to_string(), "programming".to_string(), "performance".to_string()];
+
+    let avg_len = 3.67;
+    let doc_count = 3;
+    let doc_freq_rust = 2; // doc 1 and doc 3 have "rust"
+
+    // Term present in doc 1 (2 occurrences)
+    let score_doc1 = bm25_score("rust", &doc_tokens_1, avg_len, doc_count, doc_freq_rust);
+    assert!(score_doc1 > 0.0);
+
+    // Term present in doc 3 (1 occurrence)
+    let score_doc3 = bm25_score("rust", &doc_tokens_3, avg_len, doc_count, doc_freq_rust);
+    assert!(score_doc3 > 0.0);
+
+    // Higher frequency in doc 1 gives higher score than doc 3
+    assert!(score_doc1 > score_doc3);
+
+    // Term absent in doc 2
+    let score_doc2 = bm25_score("rust", &doc_tokens_2, avg_len, doc_count, doc_freq_rust);
+    assert_eq!(score_doc2, 0.0);
+
+    // Edge cases
+    assert_eq!(bm25_score("", &doc_tokens_1, avg_len, doc_count, doc_freq_rust), 0.0);
+    assert_eq!(bm25_score("rust", &[], avg_len, doc_count, doc_freq_rust), 0.0);
+    assert_eq!(bm25_score("rust", &doc_tokens_1, avg_len, 0, doc_freq_rust), 0.0);
+
+    // Multi-term scoring
+    let mut df_map = std::collections::HashMap::new();
+    df_map.insert("rust".to_string(), 2);
+    df_map.insert("tokio".to_string(), 1);
+    let query_tokens = vec!["rust".to_string(), "tokio".to_string()];
+    let score_multi = score_document_bm25(&query_tokens, &doc_tokens_1, avg_len, doc_count, &df_map);
+    assert!(score_multi > score_doc1);
+}
+
+#[test]
+fn test_hybrid_rag_cosine_similarity() {
+    let vec_a = vec![1.0, 0.0, 0.0];
+    let vec_b = vec![1.0, 0.0, 0.0];
+    let vec_c = vec![0.0, 1.0, 0.0];
+    let vec_d = vec![-1.0, 0.0, 0.0];
+
+    // Identical vectors
+    let sim_ab = cosine_similarity(&vec_a, &vec_b);
+    assert!((sim_ab - 1.0).abs() < 1e-5);
+
+    // Orthogonal vectors
+    let sim_ac = cosine_similarity(&vec_a, &vec_c);
+    assert!((sim_ac - 0.0).abs() < 1e-5);
+
+    // Opposite vectors
+    let sim_ad = cosine_similarity(&vec_a, &vec_d);
+    assert!((sim_ad - (-1.0)).abs() < 1e-5);
+
+    // Edge cases
+    assert_eq!(cosine_similarity(&[], &[]), 0.0);
+    assert_eq!(cosine_similarity(&[1.0], &[1.0, 2.0]), 0.0);
+}
+
+#[test]
+fn test_hybrid_rag_search_rrf_reranking() {
+    let chunks = vec![
+        RagChunk {
+            file: "chunk_bm25_only.rs".to_string(),
+            text: "Quicksort partition algorithm implementation and recursive pivot selection.".to_string(),
+            vector: vec![0.1, 0.0, 0.0], // Low semantic similarity
+        },
+        RagChunk {
+            file: "chunk_vector_only.rs".to_string(),
+            text: "Fast divide and conquer ordering method for arrays and collections.".to_string(),
+            vector: vec![0.95, 0.05, 0.0], // High semantic similarity
+        },
+        RagChunk {
+            file: "chunk_hybrid_best.rs".to_string(),
+            text: "Quicksort partition algorithm with optimal pivot and divide and conquer ordering.".to_string(),
+            vector: vec![0.90, 0.10, 0.0], // High in both semantic vector and BM25 keywords
+        },
+        RagChunk {
+            file: "chunk_irrelevant.rs".to_string(),
+            text: "Database connection pool management and connection timeouts.".to_string(),
+            vector: vec![0.0, 0.95, 0.0], // Irrelevant
+        },
+    ];
+
+    let query = "quicksort partition";
+    let query_vec = vec![0.92, 0.08, 0.0];
+
+    let results = hybrid_rag_search(&chunks, query, &query_vec, 3, 60);
+
+    assert_eq!(results.len(), 3);
+    // The chunk that ranks high in both vector similarity and lexical BM25 should win the #1 spot
+    assert_eq!(results[0].1.file, "chunk_hybrid_best.rs");
+    assert!(results[0].0 > results[1].0);
+    assert!(results[1].0 > results[2].0);
+}
+
+#[test]
+fn test_swarm_workflow_structures_and_verdicts() {
+    let test_rep = TestReport {
+        runner: "cargo test".to_string(),
+        success: true,
+        exit_code: Some(0),
+        passed_count: 10,
+        failed_count: 0,
+        failure_details: vec![],
+        stdout: "test result: ok. 10 passed".to_string(),
+        stderr: "".to_string(),
+        summary: "All tests passed".to_string(),
+    };
+
+    let swarm_res = SwarmWorkflowResult {
+        goal: "Implement authentication middleware".to_string(),
+        plan: "1. Create auth.rs\n2. Add JWT validation\n3. Register middleware".to_string(),
+        coder_output: "Successfully wrote auth.rs and patched router.".to_string(),
+        audit_report: "Security review completed. No vulnerabilities found. [AUDIT: PASS]".to_string(),
+        test_report: Some(test_rep),
+        success: true,
+    };
+
+    // Test serialization / deserialization roundtrip
+    let json_str = serde_json::to_string_pretty(&swarm_res).unwrap();
+    let deserialized: SwarmWorkflowResult = serde_json::from_str(&json_str).unwrap();
+    assert_eq!(deserialized.goal, "Implement authentication middleware");
+    assert!(deserialized.audit_report.contains("[AUDIT: PASS]"));
+    assert!(deserialized.success);
+}
+
+#[test]
+fn test_expand_context_mentions_file_git_and_symbol() {
+    let workspace = std::path::Path::new(".");
+
+    // 1. Direct file mention @Cargo.toml
+    let prompt1 = "Can you check @Cargo.toml for dependencies?";
+    let exp1 = expand_context_mentions(prompt1, workspace);
+    assert_eq!(exp1.mentions.len(), 1);
+    assert_eq!(exp1.mentions[0].mention_type, "file");
+    assert_eq!(exp1.mentions[0].target, "Cargo.toml");
+    assert!(exp1.mentions[0].content.contains("name = \"zy\""));
+    assert_eq!(exp1.context_messages.len(), 1);
+
+    // 2. Explicit @file:Cargo.toml mention
+    let prompt2 = "Inspect @file:Cargo.toml configuration.";
+    let exp2 = expand_context_mentions(prompt2, workspace);
+    assert_eq!(exp2.mentions.len(), 1);
+    assert_eq!(exp2.mentions[0].mention_type, "file");
+    assert_eq!(exp2.mentions[0].target, "Cargo.toml");
+
+    // 3. @git and @diff mentions
+    let prompt3 = "Compare my changes with @git.";
+    let exp3 = expand_context_mentions(prompt3, workspace);
+    assert_eq!(exp3.mentions.len(), 1);
+    assert_eq!(exp3.mentions[0].mention_type, "git");
+    assert!(exp3.mentions[0].content.contains("ACTIVE GIT REPOSITORY CONTEXT"));
+
+    // 4. @symbol:bm25_score mention
+    let prompt4 = "Optimize the calculation in @symbol:bm25_score.";
+    let exp4 = expand_context_mentions(prompt4, workspace);
+    assert_eq!(exp4.mentions.len(), 1);
+    assert_eq!(exp4.mentions[0].mention_type, "symbol");
+    assert_eq!(exp4.mentions[0].target, "bm25_score");
+    assert!(exp4.mentions[0].content.contains("bm25_score"));
+
+    // 5. Multiple mixed mentions in a single prompt
+    let prompt5 = "Please review @Cargo.toml and @symbol:hybrid_rag_search alongside @diff.";
+    let exp5 = expand_context_mentions(prompt5, workspace);
+    assert_eq!(exp5.mentions.len(), 3);
+    assert!(exp5.mentions.iter().any(|m| m.mention_type == "file"));
+    assert!(exp5.mentions.iter().any(|m| m.mention_type == "symbol"));
+    assert!(exp5.mentions.iter().any(|m| m.mention_type == "git"));
+    assert_eq!(exp5.context_messages.len(), 3);
+}
+
+#[test]
+fn test_web_search_html_parser_and_url_decoding() {
+    // 1. URL decoder test
+    assert_eq!(url_decode("https%3A%2F%2Fexample.com%2Fdocs%3Fquery%3Drust%2Blang"), "https://example.com/docs?query=rust+lang");
+    assert_eq!(url_decode("hello+world"), "hello world");
+
+    // 2. Extract DuckDuckGo redirect URL
+    let ddg_redirect = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.rs%2Ftokio%2Flatest%2Ftokio%2F&rut=123";
+    assert_eq!(extract_duckduckgo_url(ddg_redirect), "https://docs.rs/tokio/latest/tokio/");
+
+    // 3. Strip HTML tags & entities
+    let html_snippet = "<b>Rust</b> is a <i>systems</i> programming language &amp; framework &lt;safe&gt;.";
+    assert_eq!(strip_html_tags(html_snippet), "Rust is a systems programming language & framework <safe>.");
+
+    // 4. Parse DuckDuckGo HTML standard results fixture
+    let sample_ddg_html = r##"
+    <div class="result results_links">
+      <div class="result__body">
+        <h2 class="result__title">
+          <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.rust-lang.org%2F">Rust Programming Language</a>
+        </h2>
+        <a class="result__snippet" href="#">A language empowering everyone to build reliable and efficient software.</a>
+      </div>
+    </div>
+    <div class="result results_links">
+      <div class="result__body">
+        <h2 class="result__title">
+          <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fbook%2F">The Rust Programming Language Book</a>
+        </h2>
+        <a class="result__snippet" href="#">Affectionately referred to as the book, The Rust Programming Language gives you an overview...</a>
+      </div>
+    </div>
+    "##;
+
+    let parsed = parse_duckduckgo_html(sample_ddg_html);
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].title, "Rust Programming Language");
+    assert_eq!(parsed[0].url, "https://www.rust-lang.org/");
+    assert!(parsed[0].snippet.contains("reliable and efficient software"));
+    assert_eq!(parsed[1].title, "The Rust Programming Language Book");
+    assert_eq!(parsed[1].url, "https://doc.rust-lang.org/book/");
+
+    // 5. Parse DuckDuckGo Lite HTML fixture
+    let sample_lite_html = r##"
+    <table>
+      <tr>
+        <td>
+          <a class="result-link" href="https://crates.io/crates/tokio">tokio - crates.io: Rust Package Registry</a>
+        </td>
+      </tr>
+      <tr>
+        <td class="result-snippet">An event-driven, non-blocking I/O platform for writing asynchronous applications with the Rust programming language.</td>
+      </tr>
+    </table>
+    "##;
+    let parsed_lite = parse_duckduckgo_html(sample_lite_html);
+    assert_eq!(parsed_lite.len(), 1);
+    assert_eq!(parsed_lite[0].title, "tokio - crates.io: Rust Package Registry");
+    assert_eq!(parsed_lite[0].url, "https://crates.io/crates/tokio");
+    assert!(parsed_lite[0].snippet.contains("event-driven"));
+
+    // 6. Tools contains web_search
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("web_search"));
+}
+
+#[test]
+fn test_time_travel_debugger_timeline_and_rewind() {
+    let mut messages = vec![
+        Message { role: "system".to_string(), content: "Base system prompt".to_string(), tool_calls: None, images: None },
+        Message { role: "user".to_string(), content: "Turn 1: Explain BM25".to_string(), tool_calls: None, images: None },
+        Message { role: "assistant".to_string(), content: "BM25 is a ranking function used in information retrieval.".to_string(), tool_calls: None, images: None },
+        Message { role: "user".to_string(), content: "Turn 2: Run tests now".to_string(), tool_calls: None, images: None },
+        Message {
+            role: "assistant".to_string(),
+            content: "Running test suite...".to_string(),
+            tool_calls: Some(vec![ToolCall {
+                function: ToolCallFunction {
+                    name: "run_tests".to_string(),
+                    arguments: serde_json::json!({}),
+                }
+            }]),
+            images: None,
+        },
+        Message { role: "tool".to_string(), content: "All tests passed".to_string(), tool_calls: None, images: None },
+        Message { role: "assistant".to_string(), content: "Tests are green.".to_string(), tool_calls: None, images: None },
+        Message { role: "user".to_string(), content: "Turn 3: Deploy to production".to_string(), tool_calls: None, images: None },
+        Message { role: "assistant".to_string(), content: "Deployment initiated.".to_string(), tool_calls: None, images: None },
+    ];
+
+    // 1. Extract timeline turns
+    let turns = extract_timeline_turns(&messages);
+    assert_eq!(turns.len(), 3);
+    assert_eq!(turns[0].turn_index, 1);
+    assert!(turns[0].user_preview.contains("Turn 1"));
+    assert_eq!(turns[1].turn_index, 2);
+    assert!(turns[1].tool_calls_count >= 1);
+    assert_eq!(turns[2].turn_index, 3);
+    assert!(turns[2].user_preview.contains("Turn 3"));
+
+    // 2. Format timeline
+    let timeline_formatted = format_timeline(&messages);
+    assert!(timeline_formatted.contains("CONVERSATION SESSION TIMELINE"));
+    assert!(timeline_formatted.contains("Turn #1"));
+    assert!(timeline_formatted.contains("Turn #2"));
+    assert!(timeline_formatted.contains("Turn #3"));
+    assert!(timeline_formatted.contains("Tools:"));
+
+    // 3. Rewind 1 turn
+    let rewound_1 = rewind_messages(&mut messages, 1);
+    assert_eq!(rewound_1, 1);
+    let turns_after_1 = extract_timeline_turns(&messages);
+    assert_eq!(turns_after_1.len(), 2);
+    assert_eq!(messages.last().unwrap().content, "Tests are green.");
+
+    // 4. Rewind 2 turns (removes remaining turns)
+    let rewound_2 = rewind_messages(&mut messages, 2);
+    assert_eq!(rewound_2, 2);
+    let turns_after_2 = extract_timeline_turns(&messages);
+    assert_eq!(turns_after_2.len(), 0);
+
+    // System prompt preserved!
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, "system");
+    assert_eq!(messages[0].content, "Base system prompt");
+}
+
+#[test]
+fn test_conventional_commit_and_pr_generator() {
+    // 1. Parse commit message from markdown code fences
+    let fenced_commit = "```\nfeat(rag): implement hybrid BM25 and vector cosine search\n```";
+    assert_eq!(parse_conventional_commit(fenced_commit), "feat(rag): implement hybrid BM25 and vector cosine search");
+
+    let quoted_commit = "\"fix(agent): handle DuckDuckGo lite HTML results gracefully\"";
+    assert_eq!(parse_conventional_commit(quoted_commit), "fix(agent): handle DuckDuckGo lite HTML results gracefully");
+
+    // 2. Fallback commit message generation by diff inspection
+    let diff_cargo = "diff --git a/Cargo.toml b/Cargo.toml\n+reqwest = '0.11'";
+    assert!(generate_fallback_commit_message(diff_cargo).starts_with("chore(deps):"));
+
+    let diff_tests = "diff --git a/tests/integration_tests.rs b/tests/integration_tests.rs\n+#[test]";
+    assert!(generate_fallback_commit_message(diff_tests).starts_with("test(core):"));
+
+    let diff_docs = "diff --git a/README.md b/README.md\n+# zy Agent Documentation";
+    assert!(generate_fallback_commit_message(diff_docs).starts_with("docs(readme):"));
+
+    let diff_fix = "diff --git a/src/lib.rs b/src/lib.rs\n-let err = unwrap();\n+let err = match...";
+    assert!(generate_fallback_commit_message(diff_fix).starts_with("fix(core):"));
+
+    let diff_feat = "diff --git a/src/swarm.rs b/src/swarm.rs\n+pub struct SwarmOrchestrator";
+    assert!(generate_fallback_commit_message(diff_feat).starts_with("feat(core):"));
+}
+
+#[test]
+fn test_brutal_hybrid_rag_edge_cases_and_saturation() {
+    // 1. BM25 term frequency saturation test
+    let avg_len = 100.0;
+    let doc_count = 10;
+    let doc_freq = 1;
+
+    let doc_tf_5: Vec<String> = vec!["algorithm".to_string(); 5];
+    let doc_tf_50: Vec<String> = vec!["algorithm".to_string(); 50];
+    let doc_tf_500: Vec<String> = vec!["algorithm".to_string(); 500];
+
+    let score_5 = bm25_score("algorithm", &doc_tf_5, avg_len, doc_count, doc_freq);
+    let score_50 = bm25_score("algorithm", &doc_tf_50, avg_len, doc_count, doc_freq);
+    let score_500 = bm25_score("algorithm", &doc_tf_500, avg_len, doc_count, doc_freq);
+
+    assert!(score_5 < score_50);
+    assert!(score_50 < score_500);
+    assert!((score_500 - score_50) < 5.0 * (score_50 - score_5));
+
+    // 2. Cosine similarity zero norms and stability
+    let zero_vec = vec![0.0, 0.0, 0.0];
+    let normal_vec = vec![1.0, 2.0, 3.0];
+    assert_eq!(cosine_similarity(&zero_vec, &normal_vec), 0.0);
+    assert_eq!(cosine_similarity(&zero_vec, &zero_vec), 0.0);
+
+    // 3. RRF with empty chunks
+    let empty_results = hybrid_rag_search(&[], "query", &[1.0, 0.0], 5, 60);
+    assert!(empty_results.is_empty());
+
+    // 4. Single chunk search
+    let single_chunk = vec![RagChunk {
+        file: "single.rs".to_string(),
+        text: "hello world".to_string(),
+        vector: vec![1.0, 0.0],
+    }];
+    let single_res = hybrid_rag_search(&single_chunk, "hello", &[1.0, 0.0], 1, 60);
+    assert_eq!(single_res.len(), 1);
+    assert_eq!(single_res[0].1.file, "single.rs");
+    let expected_score = 2.0 / 61.0;
+    assert!((single_res[0].0 - expected_score).abs() < 1e-4);
+}
+
+#[test]
+fn test_brutal_context_mentions_punctuation_and_resilience() {
+    let workspace = std::path::Path::new(".");
+
+    // 1. Nested file path mention
+    let prompt1 = "Look at @src/lib.rs and check @src/main.rs please.";
+    let exp1 = expand_context_mentions(prompt1, workspace);
+    assert_eq!(exp1.mentions.len(), 2);
+    assert!(exp1.mentions.iter().any(|m| m.target == "src/lib.rs"));
+    assert!(exp1.mentions.iter().any(|m| m.target == "src/main.rs"));
+
+    // 2. Mentions with weird punctuation
+    let prompt2 = "Review (@Cargo.toml), and also @git? Finally check {@symbol:Cli};";
+    let exp2 = expand_context_mentions(prompt2, workspace);
+    assert_eq!(exp2.mentions.len(), 3);
+    assert!(exp2.mentions.iter().any(|m| m.mention_type == "file" && m.target == "Cargo.toml"));
+    assert!(exp2.mentions.iter().any(|m| m.mention_type == "git"));
+    assert!(exp2.mentions.iter().any(|m| m.mention_type == "symbol" && m.target == "Cli"));
+
+    // 3. Non-existent file mention does not panic or crash
+    let prompt3 = "Inspect @this_file_definitely_does_not_exist_12345.xyz and @file:also_fake.txt";
+    let exp3 = expand_context_mentions(prompt3, workspace);
+    assert_eq!(exp3.mentions.len(), 0);
+    assert_eq!(exp3.context_messages.len(), 0);
+
+    // 4. Extract symbol context on missing symbol
+    let missing_sym = extract_symbol_context(workspace, "completely_nonexistent_symbol_abcxyz_999");
+    assert!(missing_sym.is_none());
+}
+
+#[test]
+fn test_brutal_duckduckgo_html_parser_edge_cases() {
+    // 1. HTML with special encoded characters & parameters
+    let complex_url = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fcrates.io%2Fsearch%3Fq%3Dtokio%26sort%3Ddownloads%23top&rut=xyz";
+    let extracted = extract_duckduckgo_url(complex_url);
+    assert_eq!(extracted, "https://crates.io/search?q=tokio&sort=downloads#top");
+
+    // 2. Direct absolute URLs
+    let direct_url = "https://github.com/rust-lang/rust";
+    assert_eq!(extract_duckduckgo_url(direct_url), "https://github.com/rust-lang/rust");
+
+    // 3. Relative URLs
+    let rel_url = "/html?q=rust";
+    assert_eq!(extract_duckduckgo_url(rel_url), "https://duckduckgo.com/html?q=rust");
+
+    // 4. Malformed HTML without closing tags
+    let broken_html = r##"
+    <div class="result results_links">
+      <div class="result__body">
+        <a class="result__a" href="https://example.com/one">Unclosed Title
+        <a class="result__snippet">Unclosed snippet text
+    </div>
+    "##;
+    let parsed = parse_duckduckgo_html(broken_html);
+    assert!(!parsed.is_empty());
+    assert_eq!(parsed[0].url, "https://example.com/one");
+}
+
+#[test]
+fn test_brutal_time_travel_deep_session_rewind() {
+    let mut deep_messages = Vec::new();
+    deep_messages.push(Message { role: "system".to_string(), content: "CORE SYSTEM INSTRUCTIONS".to_string(), tool_calls: None, images: None });
+    deep_messages.push(Message { role: "system".to_string(), content: "Core Memory: Active project is zy".to_string(), tool_calls: None, images: None });
+
+    // Generate 10 conversation turns
+    for t in 1..=10 {
+        deep_messages.push(Message { role: "user".to_string(), content: format!("Turn {}: Request info", t), tool_calls: None, images: None });
+        deep_messages.push(Message { role: "assistant".to_string(), content: format!("Turn {}: Response info", t), tool_calls: None, images: None });
+    }
+
+    assert_eq!(extract_timeline_turns(&deep_messages).len(), 10);
+
+    // Rewind 3 turns
+    let r1 = rewind_messages(&mut deep_messages, 3);
+    assert_eq!(r1, 3);
+    assert_eq!(extract_timeline_turns(&deep_messages).len(), 7);
+    assert_eq!(deep_messages.last().unwrap().content, "Turn 7: Response info");
+
+    // Rewind 4 more turns
+    let r2 = rewind_messages(&mut deep_messages, 4);
+    assert_eq!(r2, 4);
+    assert_eq!(extract_timeline_turns(&deep_messages).len(), 3);
+    assert_eq!(deep_messages.last().unwrap().content, "Turn 3: Response info");
+
+    // Rewind 100 turns (more than remaining 3)
+    let r3 = rewind_messages(&mut deep_messages, 100);
+    assert_eq!(r3, 3);
+    assert_eq!(extract_timeline_turns(&deep_messages).len(), 0);
+
+    // Both initial system messages preserved!
+    assert_eq!(deep_messages.len(), 2);
+    assert_eq!(deep_messages[0].content, "CORE SYSTEM INSTRUCTIONS");
+    assert_eq!(deep_messages[1].content, "Core Memory: Active project is zy");
+}
+
+#[test]
+fn test_brutal_conventional_commit_parser_and_pr_description() {
+    // 1. Markdown with multiple fences and explanations
+    let complex_llm_response = r#"
+```commit
+refactor(rag): optimize BM25 reciprocal rank fusion calculation
+
+- vectorize inner loop dot products
+- add document frequency caching
+```
+"#;
+    let parsed = parse_conventional_commit(complex_llm_response);
+    assert!(parsed.starts_with("refactor(rag): optimize BM25 reciprocal rank fusion calculation"));
+
+    // 2. Single line with backticks
+    assert_eq!(parse_conventional_commit("`perf(search): accelerate DuckDuckGo parser`"), "perf(search): accelerate DuckDuckGo parser");
+
+    // 3. Fallback PR template generation
+    let branch = "feature/hybrid-rag";
+    let fallback_pr = format!(
+        "## 🎯 Overview\nThis PR updates the `{}` branch.\n\n## 🚀 Key Changes\n- RAG engine\n\n## 🧪 Testing Checklist\n- [x] cargo test\n",
+        branch
+    );
+    assert!(fallback_pr.contains("feature/hybrid-rag"));
+    assert!(fallback_pr.contains("## 🎯 Overview"));
+    assert!(fallback_pr.contains("## 🚀 Key Changes"));
+    assert!(fallback_pr.contains("## 🧪 Testing Checklist"));
+}
+
+
+
