@@ -77,6 +77,14 @@ pub struct Cli {
     /// Vertical Mini-Map with Agent Heatmaps
     #[arg(long)]
     pub minimap: Option<String>,
+
+    /// Autonomous Self-Healing Daemon
+    #[arg(long)]
+    pub daemon: bool,
+
+    /// Transparent Cloud/Edge Handoff
+    #[arg(long)]
+    pub cloud_handoff: bool,
 }
 
 #[derive(Subcommand, Clone, Debug)]
@@ -154,6 +162,25 @@ pub enum Commands {
         /// Launch Full-Screen Interactive TUI Dashboard (ratatui + crossterm)
         #[arg(long)]
         tui: bool,
+    },
+    /// Multi-Agent "Guilds" & Background PRs
+    Guild {
+        /// Name of the guild to spawn
+        name: String,
+    },
+    /// Hyper-Personalized Cognitive Memory
+    Memory {
+        /// Memory subsystem action (e.g., set, get)
+        action: String,
+        /// Optional key
+        key: Option<String>,
+        /// Optional value
+        value: Option<String>,
+    },
+    /// Universal Forge (Text-to-System)
+    Forge {
+        /// Description of the project to generate
+        description: Vec<String>,
     },
     /// Index a directory for RAG
     Index {
