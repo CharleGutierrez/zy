@@ -2801,3 +2801,581 @@ let x = 20;
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+// ============================================================================
+// SYSTEM 1: LOCAL GGUF QUANTIZER & OLLAMA MODEL IMPORTER TESTS
+// ============================================================================
+
+#[test]
+fn test_local_gguf_quantizer_and_ollama_importer() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_quant_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Test Quantization Type Normalization & Compression Ratios
+    let (q4, r4) = normalize_quantization_type("q4_k_m");
+    assert_eq!(q4, "Q4_K_M");
+    assert!((r4 - 0.28).abs() < 0.01);
+
+    let (q5, r5) = normalize_quantization_type("Q5_K");
+    assert_eq!(q5, "Q5_K_M");
+    assert!((r5 - 0.35).abs() < 0.01);
+
+    let (q8, r8) = normalize_quantization_type("q8_0");
+    assert_eq!(q8, "Q8_0");
+    assert!((r8 - 0.50).abs() < 0.01);
+
+    let (fp16, r16) = normalize_quantization_type("f16");
+    assert_eq!(fp16, "FP16");
+    assert!((r16 - 1.00).abs() < 0.01);
+
+    let (custom_q, _) = normalize_quantization_type("q6_k");
+    assert_eq!(custom_q, "Q6_K");
+
+    // 2. Test Modelfile Content Builder
+    let mut params = std::collections::HashMap::new();
+    params.insert("temperature".to_string(), "0.7".to_string());
+    params.insert("top_p".to_string(), "0.9".to_string());
+    params.insert("stop".to_string(), "<|im_end|>,<|endoftext|>".to_string());
+
+    let modelfile = build_modelfile_content("/models/deepseek-7b.gguf", Some("You are an expert AI software architect."), &params);
+    assert!(modelfile.contains("FROM /models/deepseek-7b.gguf"));
+    assert!(modelfile.contains("PARAMETER temperature 0.7"));
+    assert!(modelfile.contains("PARAMETER top_p 0.9"));
+    assert!(modelfile.contains("PARAMETER stop \"<|im_end|>\""));
+    assert!(modelfile.contains("PARAMETER stop \"<|endoftext|>\""));
+    assert!(modelfile.contains("SYSTEM \"\"\"You are an expert AI software architect.\"\"\""));
+    assert!(modelfile.contains("TEMPLATE"));
+
+    // 3. Test Full Quantize and Import Lifecycle with GGUF file
+    let fake_gguf = temp_dir.join("source_model.gguf");
+    std::fs::write(&fake_gguf, "GGUF_BINARY_DATA").unwrap();
+
+    let report_gguf = quantize_and_import_model(&temp_dir, &fake_gguf, "zy-deepseek-q4", "Q4_K_M", Some("You are Zy.")).expect("Quantize failed");
+    assert_eq!(report_gguf.output_name, "zy-deepseek-q4");
+    assert_eq!(report_gguf.quantization_type, "Q4_K_M");
+    assert!(report_gguf.modelfile_path.ends_with("zy-deepseek-q4.Modelfile"));
+    assert!(std::path::Path::new(&report_gguf.modelfile_path).exists());
+    assert!(report_gguf.conversion_command.contains("llama-quantize"));
+
+    // 4. Test Conversion Recipe for PyTorch / Safetensors directory
+    let hf_dir = temp_dir.join("hf_model_dir");
+    std::fs::create_dir_all(&hf_dir).unwrap();
+    std::fs::write(hf_dir.join("config.json"), "{}").unwrap();
+
+    let report_hf = quantize_and_import_model(&temp_dir, &hf_dir, "zy-llama-q8", "Q8_0", None).expect("HF Quantize failed");
+    assert_eq!(report_hf.quantization_type, "Q8_0");
+    assert!(report_hf.conversion_command.contains("convert_hf_to_gguf.py"));
+    assert!(report_hf.conversion_command.contains("llama-quantize"));
+
+    // 5. Test Terminal Formatting
+    let term_out = format_quantize_report_for_terminal(&report_gguf);
+    assert!(term_out.contains("LOCAL GGUF QUANTIZER & OLLAMA MODEL IMPORTER"));
+    assert!(term_out.contains("zy-deepseek-q4"));
+    assert!(term_out.contains("Q4_K_M"));
+
+    // 6. Verify quantize_model in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("quantize_model"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 2: CROSS-FILE DEAD CODE ELIMINATOR TESTS
+// ============================================================================
+
+#[test]
+fn test_cross_file_dead_code_and_unused_symbol_eliminator() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_deadcode_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let src_dir = temp_dir.join("src");
+    let _ = std::fs::create_dir_all(&src_dir);
+
+    // 1. Rust file with active symbols and dead symbols/imports
+    let rs_file = src_dir.join("service.rs");
+    let rs_content = r#"use std::collections::BTreeMap;
+use std::fs;
+
+pub fn active_service_fn() -> i32 {
+    42
+}
+
+pub fn unused_dead_function(x: i32) -> i32 {
+    x * 100
+}
+
+pub struct UnusedDeadStruct {
+    pub value: String,
+}
+"#;
+    std::fs::write(&rs_file, rs_content).unwrap();
+
+    // 2. Python file referencing active_service_fn but having its own dead function
+    let py_file = src_dir.join("app.py");
+    let py_content = r#"import os
+import sys
+
+def active_py_runner():
+    active_service_fn()
+
+def unused_dead_py_calc():
+    return 999
+"#;
+    std::fs::write(&py_file, py_content).unwrap();
+
+    // 3. TypeScript file with dead interface and unused import
+    let ts_file = src_dir.join("client.ts");
+    let ts_content = r#"import { DeadImportHelper } from './helper';
+
+export function activeClientCall() {
+    active_py_runner();
+}
+
+export interface UnusedDeadInterface {
+    id: string;
+}
+"#;
+    std::fs::write(&ts_file, ts_content).unwrap();
+
+    // 4. Run Dead Code Analysis
+    let report = find_dead_code_symbols(&temp_dir).expect("Dead code scan failed");
+    assert!(report.scanned_files >= 3);
+    assert!(!report.dead_symbols.is_empty());
+    assert!(!report.dead_imports.is_empty());
+
+    // Verify specific dead symbols
+    let has_dead_rs_fn = report.dead_symbols.iter().any(|s| s.name == "unused_dead_function");
+    let has_dead_rs_struct = report.dead_symbols.iter().any(|s| s.name == "UnusedDeadStruct");
+    let has_dead_py_fn = report.dead_symbols.iter().any(|s| s.name == "unused_dead_py_calc");
+    let has_dead_ts_iface = report.dead_symbols.iter().any(|s| s.name == "UnusedDeadInterface");
+
+    assert!(has_dead_rs_fn, "Expected unused_dead_function to be detected");
+    assert!(has_dead_rs_struct, "Expected UnusedDeadStruct to be detected");
+    assert!(has_dead_py_fn, "Expected unused_dead_py_calc to be detected");
+    assert!(has_dead_ts_iface, "Expected UnusedDeadInterface to be detected");
+
+    // Verify active symbols are NOT flagged as dead
+    assert!(!report.dead_symbols.iter().any(|s| s.name == "active_service_fn"));
+    assert!(!report.dead_symbols.iter().any(|s| s.name == "active_py_runner"));
+
+    // Verify unused imports
+    let has_dead_import = report.dead_imports.iter().any(|i| i.name == "BTreeMap" || i.name == "DeadImportHelper");
+    assert!(has_dead_import, "Expected dead import to be detected");
+
+    // 5. Test Safe Pruning Patches
+    assert!(!report.patches.is_empty());
+    let rs_patch = report.patches.iter().find(|p| p.symbol_name == "unused_dead_function").unwrap();
+    assert!(rs_patch.diff.contains("unused_dead_function"));
+    assert!(!rs_patch.pruned_content.contains("pub fn unused_dead_function"));
+
+    // Apply pruning
+    let applied = apply_dead_code_pruning(&report.patches).expect("Apply pruning failed");
+    assert!(applied > 0);
+
+    // Verify file on disk is pruned
+    let updated_rs = std::fs::read_to_string(&rs_file).unwrap();
+    assert!(!updated_rs.contains("pub fn unused_dead_function"));
+    assert!(updated_rs.contains("pub fn active_service_fn"));
+
+    // 6. Test Terminal Formatting
+    let term_out = format_dead_code_report_for_terminal(&report);
+    assert!(term_out.contains("CROSS-FILE DEAD CODE & UNUSED SYMBOL ELIMINATOR"));
+    assert!(term_out.contains("unused_dead_function"));
+
+    // 7. Verify dead_code_eliminator in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("dead_code_eliminator"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 3: SECRETS SANITIZER & .env.example SYNTHESIZER TESTS
+// ============================================================================
+
+#[test]
+fn test_secrets_sanitizer_and_env_example_synthesizer() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_env_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Create .env with secret patterns and safe placeholders
+    let env_file = temp_dir.join(".env");
+    let env_content = r#"# Database Configuration
+DATABASE_URL="postgres://appuser:supersecretpass123@localhost:5432/appdb"
+REDIS_URL=redis://localhost:6379
+
+# Authentication & Keys
+OPENAI_API_KEY="sk-samplekey1234567890abcdef"
+JWT_SECRET=super_secret_jwt_signing_key_9999
+AUTH_TOKEN=bearer_sample_token_xyz12345
+
+# App Settings (Safe Placeholders)
+PORT=8080
+NODE_ENV=production
+DEBUG=false
+"#;
+    std::fs::write(&env_file, env_content).unwrap();
+
+    // 2. Create existing .gitignore without .env
+    let gitignore_file = temp_dir.join(".gitignore");
+    std::fs::write(&gitignore_file, "target/\nnode_modules/\n").unwrap();
+
+    // 3. Run Sanitizer
+    let report = sanitize_workspace_environment(&temp_dir, Some(".env")).expect("Env sanitize failed");
+    assert_eq!(report.secrets_detected.len(), 4); // DATABASE_URL, OPENAI_API_KEY, JWT_SECRET, AUTH_TOKEN
+
+    // Verify secret masking
+    let db_sec = report.secrets_detected.iter().find(|s| s.key == "DATABASE_URL").unwrap();
+    assert_eq!(db_sec.secret_type, "database_uri");
+    assert!(!db_sec.masked_value.contains("supersecretpass123"));
+    assert!(db_sec.masked_value.contains("..."));
+
+    let key_sec = report.secrets_detected.iter().find(|s| s.key == "OPENAI_API_KEY").unwrap();
+    assert_eq!(key_sec.secret_type, "api_key");
+    assert!(key_sec.masked_value.starts_with("sk-"));
+
+    // Verify Synthesized .env.example
+    let ex_content = &report.example_content;
+    assert!(ex_content.contains("DATABASE_URL=postgres://user:password@localhost:5432/dbname"));
+    assert!(ex_content.contains("OPENAI_API_KEY=your_openai_api_key_here"));
+    assert!(ex_content.contains("JWT_SECRET=your_jwt_secret_key_here"));
+    assert!(ex_content.contains("AUTH_TOKEN=your_auth_token_here"));
+    assert!(ex_content.contains("PORT=8080"));
+    assert!(ex_content.contains("NODE_ENV=production"));
+
+    // 4. Test Writing Example & Updating .gitignore
+    let written = write_env_example_and_update_gitignore(&report, &temp_dir).expect("Write env example failed");
+    assert!(written);
+
+    let ex_file = temp_dir.join(".env.example");
+    assert!(ex_file.exists());
+    let ex_file_text = std::fs::read_to_string(&ex_file).unwrap();
+    assert!(ex_file_text.contains("DATABASE_URL=postgres://user:password@localhost:5432/dbname"));
+
+    let updated_gi = std::fs::read_to_string(&gitignore_file).unwrap();
+    assert!(updated_gi.contains(".env"));
+    assert!(updated_gi.contains("*.env"));
+
+    // 5. Test Terminal Formatting
+    let term_out = format_env_sanitize_report_for_terminal(&report);
+    assert!(term_out.contains("SECRETS SANITIZER & .env.example SYNTHESIZER"));
+    assert!(term_out.contains("OPENAI_API_KEY"));
+    assert!(term_out.contains("DATABASE_URL"));
+
+    // 6. Verify sanitize_env in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("sanitize_env"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 4: OPENAPI / SWAGGER CLIENT SDK GENERATOR TESTS
+// ============================================================================
+
+#[test]
+fn test_openapi_swagger_client_sdk_generator() {
+    let spec = r#"{
+  "openapi": "3.0.0",
+  "info": { "title": "User Management API", "version": "1.0.0" },
+  "paths": {
+    "/users": {
+      "get": {
+        "operationId": "get_all_users",
+        "summary": "Retrieve all users",
+        "responses": { "200": { "description": "Success" } }
+      },
+      "post": {
+        "operationId": "create_new_user",
+        "summary": "Create a user",
+        "responses": { "201": { "description": "Created" } }
+      }
+    },
+    "/users/{id}": {
+      "get": {
+        "operationId": "get_user_by_id",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "User details" } }
+      },
+      "delete": {
+        "operationId": "delete_user",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "204": { "description": "Deleted" } }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "User": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "age": { "type": "integer" },
+          "is_active": { "type": "boolean" }
+        }
+      },
+      "CreateUserRequest": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "email": { "type": "string" }
+        }
+      }
+    }
+  }
+}"#;
+
+    // 1. Generate Rust SDK
+    let rust_sdk = generate_openapi_sdk(spec, "rust", "user_client").expect("Rust SDK gen failed");
+    assert_eq!(rust_sdk.language, "rust");
+    assert_eq!(rust_sdk.models.len(), 2);
+    assert_eq!(rust_sdk.endpoints.len(), 4);
+    assert!(rust_sdk.files.contains_key("client.rs"));
+    assert!(rust_sdk.files.contains_key("models.rs"));
+    assert!(rust_sdk.files.contains_key("lib.rs"));
+
+    assert!(rust_sdk.models_code.contains("pub struct User"));
+    assert!(rust_sdk.models_code.contains("pub is_active: Option<bool>"));
+    assert!(rust_sdk.models_code.contains("pub age: Option<i64>"));
+    assert!(rust_sdk.client_code.contains("pub struct ApiClient"));
+    assert!(rust_sdk.client_code.contains("pub async fn get_all_users"));
+    assert!(rust_sdk.client_code.contains("pub async fn get_user_by_id"));
+    assert!(rust_sdk.client_code.contains("pub async fn delete_user"));
+
+    // 2. Generate TypeScript SDK
+    let ts_sdk = generate_openapi_sdk(spec, "typescript", "user-client").expect("TS SDK gen failed");
+    assert_eq!(ts_sdk.language, "typescript");
+    assert!(ts_sdk.models_code.contains("export interface User"));
+    assert!(ts_sdk.models_code.contains("is_active?: boolean;"));
+    assert!(ts_sdk.models_code.contains("age?: number;"));
+    assert!(ts_sdk.client_code.contains("export class ApiClient"));
+    assert!(ts_sdk.client_code.contains("async get_all_users()"));
+    assert!(ts_sdk.client_code.contains("fetch("));
+
+    // 3. Generate Python SDK
+    let py_sdk = generate_openapi_sdk(spec, "python", "user_sdk").expect("Python SDK gen failed");
+    assert_eq!(py_sdk.language, "python");
+    assert!(py_sdk.models_code.contains("class User(BaseModel):"));
+    assert!(py_sdk.models_code.contains("is_active: Optional[bool] = None"));
+    assert!(py_sdk.models_code.contains("age: Optional[int] = None"));
+    assert!(py_sdk.client_code.contains("class ApiClient:"));
+    assert!(py_sdk.client_code.contains("async def get_all_users(self) -> Any:"));
+    assert!(py_sdk.client_code.contains("httpx.AsyncClient()"));
+
+    // 4. Test Terminal Formatting
+    let term_out = format_sdk_report_for_terminal(&rust_sdk);
+    assert!(term_out.contains("OPENAPI / SWAGGER STRONGLY-TYPED CLIENT SDK GENERATOR"));
+    assert!(term_out.contains("user_client"));
+    assert!(term_out.contains("get_all_users"));
+
+    // 5. Verify generate_sdk in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("generate_sdk"));
+}
+
+// ============================================================================
+// SYSTEM 5: INTERACTIVE REGEX, JQ & SCRATCHPAD EVALUATOR TESTS
+// ============================================================================
+
+#[test]
+fn test_interactive_regex_jq_and_scratchpad_evaluator() {
+    // 1. Test Regex Engine with Named and Indexed Capture Groups
+    let regex_pattern = r"(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})";
+    let text_data = "Release date: 2026-09-04 and next patch on 2027-01-15.";
+
+    let re_res = evaluate_scratchpad_query("regex", regex_pattern, text_data).expect("Regex eval failed");
+    assert!(re_res.success);
+    assert_eq!(re_res.engine, "regex");
+    let matches = re_res.matches.as_ref().unwrap();
+    assert_eq!(matches.len(), 2);
+    assert_eq!(matches[0].matched_text, "2026-09-04");
+    assert_eq!(matches[1].matched_text, "2027-01-15");
+    assert!(matches[0].groups.iter().any(|(k, v)| k == "year" && v == "2026"));
+    assert!(matches[0].groups.iter().any(|(k, v)| k == "month" && v == "09"));
+    assert!(matches[0].groups.iter().any(|(k, v)| k == "day" && v == "04"));
+
+    // 2. Test JQ Engine Queries
+    let json_data = r#"{
+  "service": "zy-agent",
+  "version": "1.0.0",
+  "active": true,
+  "users": [
+    { "id": 101, "name": "Alice", "role": "admin" },
+    { "id": 102, "name": "Bob", "role": "user" }
+  ],
+  "nested": {
+    "deep": {
+      "id": 999
+    }
+  }
+}"#;
+
+    // Field access & Array indexing
+    let jq_name = evaluate_scratchpad_query("jq", ".users[0].name", json_data).unwrap();
+    assert_eq!(jq_name.output, serde_json::json!("Alice"));
+
+    // Root keys
+    let jq_keys = evaluate_scratchpad_query("jq", "keys", json_data).unwrap();
+    assert!(jq_keys.output.as_array().unwrap().contains(&serde_json::json!("service")));
+    assert!(jq_keys.output.as_array().unwrap().contains(&serde_json::json!("users")));
+
+    // Length
+    let jq_len = evaluate_scratchpad_query("jq", "length", json_data).unwrap();
+    assert_eq!(jq_len.output, serde_json::json!(5));
+
+    // Type
+    let jq_type = evaluate_scratchpad_query("jq", "type", json_data).unwrap();
+    assert_eq!(jq_type.output, serde_json::json!("object"));
+
+    // Recursive descent `..id`
+    let jq_desc = evaluate_scratchpad_query("jq", "..id", json_data).unwrap();
+    let desc_arr = jq_desc.output.as_array().unwrap();
+    assert!(desc_arr.contains(&serde_json::json!(101)));
+    assert!(desc_arr.contains(&serde_json::json!(102)));
+    assert!(desc_arr.contains(&serde_json::json!(999)));
+
+    // 3. Test Math / Expr Evaluator
+    // Standard arithmetic with precedence and power
+    let math1 = evaluate_scratchpad_query("math", "(10 * 5) + 2^3 - sqrt(16)", "").unwrap();
+    assert_eq!(math1.output, serde_json::json!(54.0));
+
+    // Math functions and constants
+    let math2 = evaluate_scratchpad_query("math", "max(4, 18) + min(10, 2) * 3", "").unwrap();
+    assert_eq!(math2.output, serde_json::json!(24.0));
+
+    let math_pi = evaluate_scratchpad_query("math", "sin(0) + cos(0) * 10", "").unwrap();
+    assert_eq!(math_pi.output, serde_json::json!(10.0));
+
+    // Variables and Assignments
+    let math_vars = evaluate_scratchpad_query("math", "x = 10; y = 20; x * y + 5", "").unwrap();
+    assert_eq!(math_vars.output, serde_json::json!(205.0));
+
+    // Context from input JSON
+    let math_ctx = evaluate_scratchpad_query("math", "a / b + 2", "{\"a\": 15, \"b\": 3}").unwrap();
+    assert_eq!(math_ctx.output, serde_json::json!(7.0));
+
+    // 4. Test Terminal Formatting
+    let term_out = format_eval_result_for_terminal(&re_res);
+    assert!(term_out.contains("INTERACTIVE REGEX, JQ & SCRATCHPAD EVALUATOR"));
+    assert!(term_out.contains("regex"));
+    assert!(term_out.contains("2026-09-04"));
+
+    // 5. Verify interactive_eval in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("interactive_eval"));
+}
+
+// ============================================================================
+// SYSTEM 6: SMART GIT REBASE & HISTORY SQUEEZER TESTS
+// ============================================================================
+
+#[test]
+fn test_smart_git_rebase_and_history_squeezer() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_rebase_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Test Commit Line Parsing
+    let c1 = parse_rebase_commit_line("a1b2c3d|Dev|feat(auth): implement oauth2 login flow").unwrap();
+    assert_eq!(c1.hash, "a1b2c3d");
+    assert_eq!(c1.author, "Dev");
+    assert_eq!(c1.commit_type, "feat");
+    assert_eq!(c1.scope.as_deref(), Some("auth"));
+
+    let c2 = parse_rebase_commit_line("e4f5g6h|Dev|wip: fix typo in auth handler").unwrap();
+    assert_eq!(c2.commit_type, "wip");
+
+    let c3 = parse_rebase_commit_line("i7j8k9l|Dev|fix(ui): button margin on mobile").unwrap();
+    assert_eq!(c3.commit_type, "fix");
+    assert_eq!(c3.scope.as_deref(), Some("ui"));
+
+    // 2. Test Plan Smart Rebase
+    let plan = plan_smart_rebase(&temp_dir, Some("main")).expect("Plan rebase failed");
+    assert_eq!(plan.base_branch, "main");
+    assert!(plan.total_commits >= 1);
+    assert!(!plan.clusters.is_empty());
+    assert!(!plan.git_commands.is_empty());
+
+    // Verify git-rebase-todo script format
+    let script = &plan.rebase_todo_script;
+    assert!(script.contains("pick"));
+    assert!(script.contains("squash") || plan.clusters.len() == plan.total_commits);
+
+    // Verify Synthesized Conventional Commit message
+    let first_cluster = &plan.clusters[0];
+    assert!(first_cluster.synthesized_message.starts_with("feat") || first_cluster.synthesized_message.starts_with("fix") || first_cluster.synthesized_message.starts_with("chore"));
+
+    // 3. Test Rebase Execution Staging
+    let exec_res = execute_smart_rebase(&temp_dir, &plan, true).expect("Execute smart rebase failed");
+    assert!(exec_res.contains("Rebase plan written"));
+    assert!(temp_dir.join(".zy").join("rebase_plan.sh").exists());
+
+    // 4. Test Terminal Formatting
+    let term_out = format_rebase_plan_for_terminal(&plan);
+    assert!(term_out.contains("SMART GIT REBASE & HISTORY SQUEEZER"));
+    assert!(term_out.contains("Base Branch:"));
+    assert!(term_out.contains("Total Commits:"));
+
+    // 5. Verify smart_rebase in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("smart_rebase"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 7: BRUTAL EDGE CASES ACROSS ALL 6 NEW SYSTEMS
+// ============================================================================
+
+#[test]
+fn test_brutal_edge_cases_across_6_new_systems() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_brutal_new6_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Quantizer on non-existent path and weird quant type
+    let weird_quant = quantize_and_import_model(&temp_dir, std::path::Path::new("missing_model.bin"), "weird-model", "q99_custom", None).unwrap();
+    assert_eq!(weird_quant.quantization_type, "Q99_CUSTOM");
+    assert!(weird_quant.modelfile_content.contains("FROM"));
+
+    // 2. Dead code eliminator on totally empty workspace
+    let empty_dir = temp_dir.join("empty_ws");
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let empty_dead_rep = find_dead_code_symbols(&empty_dir).unwrap();
+    assert_eq!(empty_dead_rep.scanned_files, 0);
+    assert_eq!(empty_dead_rep.dead_symbols.len(), 0);
+    assert_eq!(empty_dead_rep.patches.len(), 0);
+
+    // 3. Secrets sanitizer on empty file
+    let empty_env = temp_dir.join(".env.empty");
+    std::fs::write(&empty_env, "# Just comments\n# Another comment\n").unwrap();
+    let env_rep = sanitize_workspace_environment(&temp_dir, Some(".env.empty")).unwrap();
+    assert_eq!(env_rep.secrets_detected.len(), 0);
+    assert!(env_rep.example_content.contains("# Just comments"));
+
+    // 4. OpenAPI generator on minimal empty spec
+    let mini_spec = r#"{ "openapi": "3.0.0", "info": { "title": "Minimal", "version": "1.0" }, "paths": {} }"#;
+    let mini_sdk = generate_openapi_sdk(mini_spec, "rust", "mini_client").unwrap();
+    assert_eq!(mini_sdk.models.len(), 0);
+    assert!(mini_sdk.endpoints.len() >= 1); // Synthesizes default fallback endpoint
+
+    // 5. Evaluator edge cases: invalid regex, malformed JSON, math division by zero
+    let bad_re = evaluate_scratchpad_query("regex", "[a-z", "text");
+    assert!(bad_re.is_err());
+
+    let div_zero = evaluate_scratchpad_query("math", "100 / 0", "");
+    assert!(div_zero.is_err());
+
+    let bad_engine = evaluate_scratchpad_query("unknown_engine", "1+1", "");
+    assert!(bad_engine.is_err());
+
+    // 6. Smart rebase on empty commit line
+    assert!(parse_rebase_commit_line("").is_none());
+    assert!(parse_rebase_commit_line("incomplete|line").is_none());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+

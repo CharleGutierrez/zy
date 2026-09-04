@@ -30,3 +30,4 @@ similar = "2.4.0"
 ratatui = "0.26.3"
 crossterm = "0.27.0"
 rusqlite = { version = "0.31.0", features = ["bundled"] }
+regex = "1.10"

@@ -157,6 +157,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Some(Commands::Quantize { model_path, output_name, quant_type, system, path }) => {
+            let rep = quantize_and_import_model(std::path::Path::new(path), std::path::Path::new(model_path), output_name, quant_type, system.as_deref())?;
+            println!("{}", format_quantize_report_for_terminal(&rep));
+        }
+        Some(Commands::Prune { path, apply }) => {
+            let rep = find_dead_code_symbols(std::path::Path::new(path))?;
+            if *apply && !rep.patches.is_empty() {
+                let pruned = apply_dead_code_pruning(&rep.patches)?;
+                println!("Auto-applied {} pruning patch(es).", pruned);
+            }
+            println!("{}", format_dead_code_report_for_terminal(&rep));
+        }
+        Some(Commands::Env { file, path, apply }) => {
+            let rep = sanitize_workspace_environment(std::path::Path::new(path), file.as_deref())?;
+            if *apply {
+                let _ = write_env_example_and_update_gitignore(&rep, std::path::Path::new(path));
+            }
+            println!("{}", format_env_sanitize_report_for_terminal(&rep));
+        }
+        Some(Commands::Sdk { spec, lang, package }) => {
+            let spec_content = if std::path::Path::new(spec).is_file() {
+                std::fs::read_to_string(spec)?
+            } else {
+                spec.clone()
+            };
+            let sdk = generate_openapi_sdk(&spec_content, lang, package)?;
+            println!("{}", format_sdk_report_for_terminal(&sdk));
+        }
+        Some(Commands::Eval { engine, query, data }) => {
+            let res = evaluate_scratchpad_query(engine, query, data)?;
+            println!("{}", format_eval_result_for_terminal(&res));
+        }
+        Some(Commands::Rebase { base, path, execute }) => {
+            let plan = plan_smart_rebase(std::path::Path::new(path), Some(base.as_str()))?;
+            if *execute {
+                let _ = execute_smart_rebase(std::path::Path::new(path), &plan, true)?;
+            }
+            println!("{}", format_rebase_plan_for_terminal(&plan));
+        }
         None => {
             if cli.tui {
                 let tuner = run_ai_tuner(0.1, true);
