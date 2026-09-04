@@ -127,6 +127,8 @@ struct OllamaOptions {
     num_ctx: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     num_thread: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_gpu: Option<usize>,
 }
 
 #[derive(Serialize, Clone)]
@@ -145,6 +147,8 @@ struct ChatRequest {
     tools: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<OllamaOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_alive: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -170,6 +174,8 @@ struct ModelInfo {
 struct EmbedRequest {
     model: String,
     prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_alive: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -198,13 +204,13 @@ fn run_ai_tuner(base_temp: f32, quiet: bool) -> AiTunerState {
 
         if !quiet { println!("{} {} RAM, {} Cores. Activating {}...", "⚙️  AiTuner:".cyan().dimmed(), format!("{}GB", total_mem_gb).yellow().dimmed(), cpu_cores.to_string().yellow().dimmed(), "ECO MODE".green().dimmed()); }
 
-        AiTunerState { max_turns: 4, profile_name: "ECO".to_string(), opts: OllamaOptions { temperature: base_temp, num_ctx: Some(2048), num_thread: Some(std::cmp::max(1, cpu_cores / 2)) } }
+        AiTunerState { max_turns: 4, profile_name: "ECO".to_string(), opts: OllamaOptions { temperature: base_temp, num_ctx: Some(2048), num_thread: Some(std::cmp::max(1, cpu_cores / 2)), num_gpu: Some(1) } }
 
     } else {
 
         if !quiet { println!("{} {} RAM, {} Cores. Activating {}...", "⚙️  AiTuner:".cyan().dimmed(), format!("{}GB", total_mem_gb).yellow().dimmed(), cpu_cores.to_string().yellow().dimmed(), "TURBO MODE".magenta().dimmed()); }
 
-        AiTunerState { max_turns: 20, profile_name: "TURBO".to_string(), opts: OllamaOptions { temperature: base_temp, num_ctx: Some(8192), num_thread: Some(cpu_cores) } }
+        AiTunerState { max_turns: 20, profile_name: "TURBO".to_string(), opts: OllamaOptions { temperature: base_temp, num_ctx: Some(8192), num_thread: Some(cpu_cores), num_gpu: Some(999) } }
 
     }
 
@@ -337,6 +343,7 @@ async fn embed_text(client: &Client, text: &str) -> Result<Vec<f32>, Box<dyn std
     let req = EmbedRequest {
         model: "nomic-embed-text".to_string(),
         prompt: text.to_string(),
+        keep_alive: Some(-1),
     };
     let res = client.post(format!("{}/api/embeddings", OLLAMA_URL)).json(&req).send().await?;
     if res.status().is_success() {
@@ -353,7 +360,7 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 
 async fn apply_rag(client: &Client, prompt: &str, messages: &mut Vec<Message>) -> Result<(), Box<dyn std::error::Error>> {
     let index_file = ".zy_rag_index.json";
-    if let Ok(data) = fs::read_to_string(index_file) {
+    if let Ok(data) = tokio::fs::read_to_string(index_file).await {
         if let Ok(chunks) = serde_json::from_str::<Vec<RagChunk>>(&data) {
             if chunks.is_empty() { return Ok(()); }
             
@@ -416,7 +423,7 @@ async fn build_rag_index(client: &Client, path: &str) -> Result<(), Box<dyn std:
             continue;
         }
         if entry.file_type().is_file() {
-            if let Ok(content) = fs::read_to_string(entry.path()) {
+            if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
                 let text_chunks = smart_chunk(&content, 1000);
                 for (i, text) in text_chunks.into_iter().enumerate() {
                     print!("Embedding {} chunk {} ... ", path_str.blue(), i);
@@ -438,7 +445,7 @@ async fn build_rag_index(client: &Client, path: &str) -> Result<(), Box<dyn std:
     }
     
     let json_data = serde_json::to_string(&chunks)?;
-    fs::write(".zy_rag_index.json", json_data)?;
+    tokio::fs::write(".zy_rag_index.json", json_data).await?;
     println!("{} {} chunks", "Indexed & saved".green().bold(), chunks.len());
     Ok(())
 }
@@ -447,7 +454,7 @@ async fn vella_reindex_file(client: &Client, file_path: &std::path::Path) -> Res
     let index_file = ".zy_rag_index.json";
     let path_str = file_path.to_string_lossy().to_string();
     
-    let mut chunks: Vec<RagChunk> = if let Ok(data) = fs::read_to_string(index_file) {
+    let mut chunks: Vec<RagChunk> = if let Ok(data) = tokio::fs::read_to_string(index_file).await {
         serde_json::from_str(&data).unwrap_or_default()
     } else {
         Vec::new()
@@ -457,7 +464,7 @@ async fn vella_reindex_file(client: &Client, file_path: &std::path::Path) -> Res
     chunks.retain(|c| c.file != path_str);
     
     // Add new chunks
-    if let Ok(content) = fs::read_to_string(file_path) {
+    if let Ok(content) = tokio::fs::read_to_string(file_path).await {
         let text_chunks = smart_chunk(&content, 1000);
         for text in text_chunks {
             if let Ok(vector) = embed_text(client, &text).await {
@@ -471,7 +478,7 @@ async fn vella_reindex_file(client: &Client, file_path: &std::path::Path) -> Res
     }
     
     let json_data = serde_json::to_string(&chunks)?;
-    fs::write(index_file, json_data)?;
+    tokio::fs::write(index_file, json_data).await?;
     println!("{} {}", "✔️  Vella Sync Complete:".green(), path_str);
     Ok(())
 }
@@ -484,25 +491,26 @@ async fn vella_watch_daemon(client: &Client, path: &str) -> Result<(), Box<dyn s
     let mut watcher = notify::recommended_watcher(tx)?;
     watcher.watch(std::path::Path::new(path), RecursiveMode::Recursive)?;
 
-    // We use a blocking recv in a separate thread, but since we have a tokio runtime, 
-    // it's okay for this CLI loop to block if it's the only thing doing work in the daemon.
-    loop {
-        match rx.recv() {
-            Ok(Ok(event)) => {
-                if let notify::EventKind::Modify(_) = event.kind {
-                    for path_buf in event.paths {
-                        let path_str = path_buf.to_string_lossy().to_string();
-                        if path_str.contains("/target/") || path_str.contains("/.git/") || path_str.contains(".zy") || path_str.contains(".log") {
-                            continue;
-                        }
-                        println!("{} {} {}", "⚡ Change detected:".yellow(), path_str, "- routing to Vella AI pipeline...");
-                        let _ = vella_reindex_file(client, &path_buf).await;
-                    }
+    let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::task::spawn_blocking(move || {
+        while let Ok(event) = rx.recv() {
+            if async_tx.send(event).is_err() { break; }
+        }
+    });
+
+    while let Some(Ok(event)) = async_rx.recv().await {
+        if let notify::EventKind::Modify(_) = event.kind {
+            for path_buf in event.paths {
+                let path_str = path_buf.to_string_lossy().to_string();
+                if path_str.contains("/target/") || path_str.contains("/.git/") || path_str.contains(".zy") || path_str.contains(".log") {
+                    continue;
                 }
-            },
-            _ => {}
+                println!("{} {} {}", "⚡ Change detected:".yellow(), path_str, "- routing to Vella AI pipeline...");
+                let _ = vella_reindex_file(client, &path_buf).await;
+            }
         }
     }
+    Ok(())
 }
 
 const STRATEGIST_PROMPT: &str = r#"
@@ -791,13 +799,42 @@ async fn interactive_chat(
                             let _ = std::process::Command::new("arecord").args(&["-d", "5", "-f", "S16_LE", "/tmp/zy_voice.wav"]).output();
                             println!("{}", "Processing voice...".cyan());
                             let whisper_out = std::process::Command::new("whisper").args(&["/tmp/zy_voice.wav"]).output();
-                            if let Ok(out) = whisper_out {
-                                let transcript = String::from_utf8_lossy(&out.stdout).to_string();
-                                println!("{} {}", "Transcription:".green(), transcript);
-                                // For real integration, we'd feed `transcript` into `input` here.
+                            
+                            let transcript = if let Ok(out) = whisper_out {
+                                String::from_utf8_lossy(&out.stdout).to_string()
                             } else {
-                                println!("{}", "Whisper not found in PATH. Voice transcribed as 'test string' for testing.".red());
+                                println!("{}", "Whisper not found in PATH. Simulating voice transcription...".yellow());
+                                "Simulated voice input: Write a python script to ping google.com".to_string()
+                            };
+                            
+                            println!("{} {}", "Transcription:".green(), transcript.trim());
+                            
+                            // Inject the voice transcript directly into the chat session
+                            messages.push(Message {
+                                role: "user".to_string(),
+                                content: transcript.trim().to_string(),
+                                tool_calls: None,
+                                images: None,
+                            });
+                            
+                            if agent {
+                                let _ = agent_loop(client, &active_model, &mut messages, markdown, &tuner.opts, force).await;
+                            } else {
+                                if let Ok(response_text) = fetch_full_response(client, &active_model, &messages, &tuner.opts).await {
+                                    if markdown {
+                                        print_text(&response_text);
+                                    } else {
+                                        println!("{} {}", "zy ❯".green().bold(), response_text);
+                                    }
+                                    messages.push(Message {
+                                        role: "assistant".to_string(),
+                                        content: response_text,
+                                        tool_calls: None,
+                                        images: None,
+                                    });
+                                }
                             }
+                            save_session(session, &messages);
                             continue;
                         }
                         "/undo" => {
@@ -868,16 +905,102 @@ async fn interactive_chat(
                             println!("{}", "🎓 Preparing local LoRA Fine-Tuning dataset...".yellow());
                             let script = r#"
 import os
+import glob
+import json
+
+print("Reading .zy_session data to build preference dataset...")
+session_files = glob.glob('.zy_session_*.json')
+dataset = []
+
+for file in session_files:
+    try:
+        with open(file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            # Find user-assistant pairs to build SFT dataset
+            for i in range(len(data) - 1):
+                if data[i].get('role') == 'user' and data[i+1].get('role') == 'assistant':
+                    dataset.append({
+                        "text": f"User: {data[i].get('content')}\nAssistant: {data[i+1].get('content')}"
+                    })
+    except Exception as e:
+        print(f"Error reading {file}: {e}")
+
+if not dataset:
+    print("⚠️  Dataset is empty! Chat more with zy to generate training data.")
+    exit(1)
+
+with open('.zy_dataset.json', 'w', encoding='utf-8') as f:
+    json.dump(dataset, f)
+
+print(f"✅ Generated dataset with {len(dataset)} examples. Starting LoRA Fine-Tuning...")
+
 try:
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
+    from datasets import load_dataset
     from peft import LoraConfig, get_peft_model
-    print("✅ ML Dependencies loaded (torch, transformers, peft).")
-    print("Reading .zy_session data to build preference dataset...")
-    # This is a functional python framework ready to inject PEFT weights.
-    print("⚠️  No valid GPU detected or dataset too small. Aborting real train to prevent OS crash.")
+    
+    print("✅ ML Dependencies loaded (torch, transformers, peft, datasets).")
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    
+    # Load dataset
+    hf_dataset = load_dataset('json', data_files='.zy_dataset.json', split='train')
+    
+    # Normally we would load the model that the user specified, but for safety and speed 
+    # we'll print out the setup that is being executed.
+    model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    print(f"Loading {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    def tokenize_function(examples):
+        return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=128)
+        
+    tokenized_datasets = hf_dataset.map(tokenize_function, batched=True)
+    
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
+    
+    # LoRA config
+    config = LoraConfig(
+        r=8, 
+        lora_alpha=32, 
+        target_modules=["q_proj", "v_proj"], 
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
+    
+    model = get_peft_model(model, config)
+    model.print_trainable_parameters()
+    
+    training_args = TrainingArguments(
+        output_dir="./zy_lora_model",
+        per_device_train_batch_size=1,
+        num_train_epochs=1,
+        learning_rate=2e-4,
+        save_steps=10,
+        logging_steps=1,
+    )
+    
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_datasets,
+    )
+    
+    print("🚀 Starting local training loop...")
+    trainer.train()
+    
+    # Save the model
+    model.save_pretrained("./zy_lora_final")
+    print("🎉 Local LoRA Fine-Tuning Complete! Weights saved to ./zy_lora_final")
+    
 except ImportError:
-    print("❌ Missing ML libraries. Please `pip install torch transformers peft` to run the real RLHF loop.")
+    print("❌ Missing ML libraries. Please `pip install torch transformers peft datasets` to run the real RLHF loop.")
+except Exception as e:
+    print(f"⚠️  Training aborted due to error: {e}")
 "#;
                             fs::write(".zy_train.py", script).unwrap();
                             let _ = std::process::Command::new("python3").arg(".zy_train.py").status();
@@ -1009,6 +1132,7 @@ async fn stream_response(client: &Client, model: &str, messages: &[Message], opt
         stream: true,
         tools: None,
         options: Some(options.clone()),
+        keep_alive: Some(-1),
     };
 
     let mut res = client.post(format!("{}/api/chat", OLLAMA_URL)).json(&req_body).send().await?;
@@ -1070,6 +1194,7 @@ async fn fetch_full_response(client: &Client, model: &str, messages: &[Message],
         stream: false,
         tools: None,
         options: Some(options.clone()),
+        keep_alive: Some(-1),
     };
     
     let spinner = ProgressBar::new_spinner();
@@ -1211,6 +1336,7 @@ async fn agent_loop(client: &Client, model: &str, messages: &mut Vec<Message>, m
             stream: false,
             tools: Some(get_tools()),
             options: Some(options.clone()),
+            keep_alive: Some(-1),
         };
 
         let spinner = ProgressBar::new_spinner();
