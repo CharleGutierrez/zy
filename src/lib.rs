@@ -21,6 +21,24 @@ use sysinfo::System;
 use termimad::print_text;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use walkdir::WalkDir;
+use rayon::prelude::*;
+
+pub fn fast_read_to_string(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    let file = std::fs::File::open(path.as_ref())?;
+    let metadata = file.metadata()?;
+    if metadata.len() == 0 {
+        return Ok(String::new());
+    }
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    Ok(String::from_utf8_lossy(&mmap).into_owned())
+}
+
+pub async fn fast_read_to_string_async(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    let path = path.as_ref().to_owned();
+    tokio::task::spawn_blocking(move || {
+        fast_read_to_string(path)
+    }).await.unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+}
 
 pub mod tier3_ux;
 pub use tier3_ux::*;
@@ -85,6 +103,10 @@ pub struct Cli {
     /// Transparent Cloud/Edge Handoff
     #[arg(long)]
     pub cloud_handoff: bool,
+
+    /// Hyper-optimize Ollama payload with extreme hardware flags
+    #[arg(long)]
+    pub hyper_optimize: bool,
 }
 
 #[derive(Subcommand, Clone, Debug)]
@@ -692,6 +714,8 @@ pub struct OllamaOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_predict: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_mlock: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
 }
 
@@ -707,6 +731,7 @@ impl Default for OllamaOptions {
             repeat_penalty: Some(1.1),
             f16_kv: Some(true),
             use_mmap: Some(true),
+            use_mlock: None,
             num_predict: Some(4096),
             stop: None,
         }
@@ -1450,7 +1475,7 @@ pub async fn classify_query_route(
     let req = ChatRequest {
         model: scout_model.to_string(),
         messages: vec![Message { role: "user".to_string(), content: prompt, tool_calls: None, images: None }],
-        stream: false,
+        stream: true,
         tools: None,
         format: None,
         options: Some(OllamaOptions {
@@ -1464,12 +1489,24 @@ pub async fn classify_query_route(
     };
 
     if let Ok(res) = client.post(format!("{}/api/chat", OLLAMA_URL)).json(&req).send().await {
-        if let Ok(parsed) = res.json::<ChatResponse>().await {
-            if let Some(msg) = parsed.message {
-                let upper = msg.content.to_uppercase();
-                if upper.contains("CHAT") && !upper.contains("CODING") {
-                    return RouteDecision::Chat;
+        if res.status().is_success() {
+            let mut full_response = String::new();
+            let mut stream = res.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                if let Ok(bytes) = chunk {
+                    let s = String::from_utf8_lossy(&bytes);
+                    for line in s.lines() {
+                        if let Ok(parsed) = serde_json::from_str::<ChatResponse>(line.trim()) {
+                            if let Some(msg) = parsed.message {
+                                full_response.push_str(&msg.content);
+                            }
+                        }
+                    }
                 }
+            }
+            let upper = full_response.to_uppercase();
+            if upper.contains("CHAT") && !upper.contains("CODING") {
+                return RouteDecision::Chat;
             }
         }
     }
@@ -2085,14 +2122,14 @@ pub fn build_sandbox_command(cmd: &str, workspace: &std::path::Path, image: Opti
 // CORE SYSTEM SETUP & TUNER
 // -------------------------------------------------------------------------------------------------
 
-pub fn run_ai_tuner(base_temp: f32, quiet: bool) -> AiTunerState {
+pub fn run_ai_tuner(base_temp: f32, quiet: bool, hyper_optimize: bool) -> AiTunerState {
     let prof = OllamaHardwareProfiler::profile();
 
     if prof.recommended_mode == "POTATO_ECO" || prof.total_memory_mb < 12288 {
         if !quiet {
             println!("{} {} RAM, {} Cores. Activating {}...", "⚙️  AiTuner:".cyan().dimmed(), format!("{}MB", prof.total_memory_mb).yellow().dimmed(), prof.physical_cores.to_string().yellow().dimmed(), format!("ECO MODE ({} ctx)", prof.optimal_ctx).green().dimmed());
         }
-        AiTunerState {
+        let mut state = AiTunerState {
             num_ctx: prof.optimal_ctx,
             profile_name: "ECO".to_string(),
             opts: OllamaOptions {
@@ -2104,16 +2141,22 @@ pub fn run_ai_tuner(base_temp: f32, quiet: bool) -> AiTunerState {
                 top_p: Some(0.9),
                 repeat_penalty: Some(1.1),
                 f16_kv: Some(prof.f16_kv),
-                use_mmap: Some(prof.use_mmap),
+                use_mmap: Some(if hyper_optimize { true } else { prof.use_mmap }),
+                use_mlock: if hyper_optimize { Some(true) } else { None },
                 num_predict: Some(prof.optimal_ctx as i32),
                 stop: None,
             },
+        };
+        if hyper_optimize {
+            state.opts.num_thread = Some(16);
+            state.opts.num_ctx = Some(8192);
         }
+        state
     } else {
         if !quiet {
             println!("{} {} RAM, {} Cores. Activating {}...", "⚙️  AiTuner:".cyan().dimmed(), format!("{}MB", prof.total_memory_mb).yellow().dimmed(), prof.physical_cores.to_string().yellow().dimmed(), format!("TURBO MODE ({} ctx)", prof.optimal_ctx).magenta().dimmed());
         }
-        AiTunerState {
+        let mut state = AiTunerState {
             num_ctx: prof.optimal_ctx,
             profile_name: "TURBO".to_string(),
             opts: OllamaOptions {
@@ -2125,11 +2168,17 @@ pub fn run_ai_tuner(base_temp: f32, quiet: bool) -> AiTunerState {
                 top_p: Some(0.9),
                 repeat_penalty: Some(1.1),
                 f16_kv: Some(prof.f16_kv),
-                use_mmap: Some(prof.use_mmap),
+                use_mmap: Some(if hyper_optimize { true } else { prof.use_mmap }),
+                use_mlock: if hyper_optimize { Some(true) } else { None },
                 num_predict: Some(prof.optimal_ctx as i32),
                 stop: None,
             },
+        };
+        if hyper_optimize {
+            state.opts.num_thread = Some(16);
+            state.opts.num_ctx = Some(8192);
         }
+        state
     }
 }
 
@@ -2174,7 +2223,7 @@ pub async fn interactive_wizard(client: &Client, default_model: &str, default_sc
             let session = Text::new("Session name (leave empty for none):").prompt()?;
             let session_opt = if session.trim().is_empty() { None } else { Some(session.trim()) };
 
-            let tuner = run_ai_tuner(0.1, true);
+            let tuner = run_ai_tuner(0.1, true, false);
             println!("\n{}", "--- Configuration Complete ---".green().bold());
             interactive_chat(client, &selected_model, None, &[], agent, session_opt, rag, markdown, &tuner, force, None, false, default_scout, None, false, false).await?;
         }
@@ -2455,13 +2504,14 @@ pub fn hybrid_rag_search<'a>(
     // 3. Reciprocal Rank Fusion
     let rrf_k_f32 = rrf_k as f32;
     let mut fused: Vec<(usize, f32)> = (0..chunks.len())
+        .into_par_iter()
         .map(|idx| {
             let r_vec = vector_ranks[idx] as f32;
             let r_bm25 = bm25_ranks[idx] as f32;
             let rrf_score = (1.0 / (rrf_k_f32 + r_vec)) + (1.0 / (rrf_k_f32 + r_bm25));
             (idx, rrf_score)
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -2476,12 +2526,12 @@ pub async fn apply_rag(client: &Client, prompt: &str, messages: &mut Vec<Message
     let chunks: Vec<RagChunk> = if bin_path.exists() {
         if let Ok(store) = load_binary_vector_index(bin_path) {
             store.chunks
-        } else if let Ok(data) = tokio::fs::read_to_string(".zy_rag_index.json").await {
+        } else if let Ok(data) = fast_read_to_string_async(".zy_rag_index.json").await {
             serde_json::from_str(&data).unwrap_or_default()
         } else {
             Vec::new()
         }
-    } else if let Ok(data) = tokio::fs::read_to_string(".zy_rag_index.json").await {
+    } else if let Ok(data) = fast_read_to_string_async(".zy_rag_index.json").await {
         serde_json::from_str(&data).unwrap_or_default()
     } else {
         Vec::new()
@@ -2569,12 +2619,12 @@ pub async fn vella_reindex_file(client: &Client, file_path: &std::path::Path) ->
     let mut chunks: Vec<RagChunk> = if bin_path.exists() {
         if let Ok(store) = load_binary_vector_index(bin_path) {
             store.chunks
-        } else if let Ok(data) = tokio::fs::read_to_string(".zy_rag_index.json").await {
+        } else if let Ok(data) = fast_read_to_string_async(".zy_rag_index.json").await {
             serde_json::from_str(&data).unwrap_or_default()
         } else {
             Vec::new()
         }
-    } else if let Ok(data) = tokio::fs::read_to_string(".zy_rag_index.json").await {
+    } else if let Ok(data) = fast_read_to_string_async(".zy_rag_index.json").await {
         serde_json::from_str(&data).unwrap_or_default()
     } else {
         Vec::new()
@@ -18627,7 +18677,7 @@ pub async fn fetch_full_response(
     let req_body = ChatRequest {
         model: model.to_string(),
         messages: messages.to_vec(),
-        stream: false,
+        stream: true,
         tools: None,
         format: format.cloned(),
         options: Some(options.clone()),
@@ -18640,18 +18690,28 @@ pub async fn fetch_full_response(
     spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
     let res = client.post(format!("{}/api/chat", OLLAMA_URL)).json(&req_body).send().await?;
-    spinner.finish_and_clear();
     
     if !res.status().is_success() {
+        spinner.finish_and_clear();
         return Ok(format!("Error: Failed to get response. Is model '{}' installed?", model));
     }
     
-    let parsed: ChatResponse = res.json().await?;
-    if let Some(msg) = parsed.message {
-        Ok(msg.content)
-    } else {
-        Ok(String::new())
+    let mut full_response = String::new();
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        if let Ok(bytes) = chunk {
+            let s = String::from_utf8_lossy(&bytes);
+            for line in s.lines() {
+                if let Ok(parsed) = serde_json::from_str::<ChatResponse>(line.trim()) {
+                    if let Some(msg) = parsed.message {
+                        full_response.push_str(&msg.content);
+                    }
+                }
+            }
+        }
     }
+    spinner.finish_and_clear();
+    Ok(full_response)
 }
 
 pub fn get_tools() -> serde_json::Value {

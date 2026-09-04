@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let swarm_goal = swarm.clone().or_else(|| cli.swarm.clone());
             let tui_flag = *tui || cli.tui;
             
-            let tuner = run_ai_tuner(*temperature, true);
+            let tuner = run_ai_tuner(*temperature, true, cli.hyper_optimize);
             let format_schema = format.as_deref().map(|f| {
                 if f.eq_ignore_ascii_case("json") {
                     serde_json::json!("json")
@@ -561,7 +561,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Voice { model, timeout }) | Some(Commands::Duplex { model, timeout }) => {
             let m = model.as_deref().unwrap_or(&cli.model);
-            let tuner = run_ai_tuner(0.1, true);
+            let tuner = run_ai_tuner(0.1, true, cli.hyper_optimize);
             let summary = run_duplex_voice_loop(&client, m, &tuner.opts, *timeout).await?;
             println!("{}", format_duplex_voice_summary_for_terminal(&summary));
         }
@@ -777,7 +777,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             if cli.tui {
-                let tuner = run_ai_tuner(0.1, true);
+                let tuner = run_ai_tuner(0.1, true, cli.hyper_optimize);
                 run_tui_app(&client, &cli.model, cli.system.as_deref(), &[], false, false, &tuner, false).await?;
             } else if cli.scrubber {
                 run_time_travel_scrubber().await?;
@@ -786,7 +786,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else if let Some(file) = &cli.minimap {
                 run_vertical_minimap(file).await?;
             } else if let Some(goal) = &cli.swarm {
-                let tuner = run_ai_tuner(0.1, true);
+                let tuner = run_ai_tuner(0.1, true, cli.hyper_optimize);
                 run_swarm_workflow(&client, &cli.model, None, goal, &tuner.opts, true, false, cli.sandbox).await?;
             } else {
                 interactive_wizard(&client, &cli.model, cli.scout.clone()).await?;

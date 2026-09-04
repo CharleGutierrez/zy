@@ -25,6 +25,7 @@ pub fn create_optimized_ollama_client() -> Client {
         .pool_max_idle_per_host(64)
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(300))
+        .http2_prior_knowledge()
         .build()
         .unwrap_or_else(|_| Client::new())
 }
@@ -104,6 +105,7 @@ impl OllamaHardwareProfiler {
             repeat_penalty: Some(1.1),
             f16_kv: Some(prof.f16_kv),
             use_mmap: Some(prof.use_mmap),
+            use_mlock: None,
             num_predict: Some(prof.optimal_ctx as i32),
             stop: None,
         }
@@ -405,6 +407,7 @@ impl OllamaBenchmarkEngine {
                 repeat_penalty: None,
                 f16_kv: Some(true),
                 use_mmap: Some(true),
+                use_mlock: None,
                 num_predict: Some(1),
                 stop: None,
             }),
