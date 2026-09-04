@@ -11,6 +11,8 @@ panic = "abort"
 strip = true
 
 [dependencies]
+syn = { version = "2.0", features = ["full", "visit", "fold", "clone-impls", "extra-traits", "parsing", "printing"] }
+serde_yaml = "0.9"
 clap = { version = "4.4", features = ["derive"] }
 reqwest = { version = "0.11", features = ["json", "stream"] }
 tokio = { version = "1.32", features = ["full"] }
