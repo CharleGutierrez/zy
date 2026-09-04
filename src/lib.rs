@@ -37,6 +37,14 @@ pub struct Cli {
     /// Fast scout model for speculative routing
     #[arg(long)]
     pub scout: Option<String>,
+
+    /// Inject compact repository symbol map into conversation context
+    #[arg(long)]
+    pub map: bool,
+
+    /// Ephemeral Sandbox Container Engine for isolated command execution
+    #[arg(long)]
+    pub sandbox: bool,
 }
 
 #[derive(Subcommand, Clone, Debug)]
@@ -98,6 +106,14 @@ pub enum Commands {
         /// Grammar-constrained JSON format schema (e.g. "json" or custom schema JSON string)
         #[arg(long)]
         format: Option<String>,
+
+        /// Inject compact repository symbol map into conversation context
+        #[arg(long)]
+        map: bool,
+
+        /// Ephemeral Sandbox Container Engine for isolated command execution
+        #[arg(long)]
+        sandbox: bool,
     },
     /// Index a directory for RAG
     Index {
@@ -908,6 +924,611 @@ pub async fn classify_query_route(
 }
 
 // -------------------------------------------------------------------------------------------------
+// FEATURE 7: .zyrules & zy.toml RULES ENGINE
+// -------------------------------------------------------------------------------------------------
+
+pub fn get_global_config_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        paths.push(std::path::PathBuf::from(appdata).join("zy").join("config.toml"));
+    }
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        paths.push(std::path::PathBuf::from(userprofile).join(".config").join("zy").join("config.toml"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        paths.push(std::path::PathBuf::from(home).join(".config").join("zy").join("config.toml"));
+    }
+    paths
+}
+
+pub fn parse_toml_rules(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut in_rules_section = false;
+    let mut rules_lines = Vec::new();
+
+    for line in content.lines() {
+        let line_trim = line.trim();
+        if line_trim.starts_with('[') && line_trim.ends_with(']') {
+            let section = line_trim.trim_matches(|c| c == '[' || c == ']').trim();
+            if section.eq_ignore_ascii_case("rules") || section.eq_ignore_ascii_case("instructions") {
+                in_rules_section = true;
+                continue;
+            } else {
+                in_rules_section = false;
+            }
+        }
+
+        if in_rules_section {
+            if !line_trim.is_empty() && !line_trim.starts_with('#') {
+                if let Some((_k, v)) = line_trim.split_once('=') {
+                    let v_clean = v.trim().trim_matches(|c| c == '"' || c == '\'');
+                    rules_lines.push(v_clean.to_string());
+                } else {
+                    rules_lines.push(line.to_string());
+                }
+            }
+        } else if line_trim.starts_with("rules") || line_trim.starts_with("instructions") || line_trim.starts_with("system") {
+            if let Some((_k, v)) = line_trim.split_once('=') {
+                let v_clean = v.trim().trim_matches(|c| c == '"' || c == '\'' || c == '[' || c == ']');
+                if !v_clean.is_empty() {
+                    rules_lines.push(v_clean.to_string());
+                }
+            }
+        }
+    }
+
+    if !rules_lines.is_empty() {
+        Some(rules_lines.join("\n").trim().to_string())
+    } else if !trimmed.is_empty() && (content.contains("rules") || content.contains("instructions") || !content.contains('[')) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+pub fn load_project_rules(path: &std::path::Path) -> Option<String> {
+    let mut rules_sections = Vec::new();
+
+    // 1. Check <path>/.zyrules
+    let zyrules_path = path.join(".zyrules");
+    if zyrules_path.is_file() {
+        if let Ok(content) = fs::read_to_string(&zyrules_path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                rules_sections.push(format!("### Project Rules (.zyrules):\n{}", trimmed));
+            }
+        }
+    }
+
+    // 2. Check <path>/.zy/rules.md
+    let zy_md_path = path.join(".zy").join("rules.md");
+    if zy_md_path.is_file() {
+        if let Ok(content) = fs::read_to_string(&zy_md_path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                rules_sections.push(format!("### Project Rules (.zy/rules.md):\n{}", trimmed));
+            }
+        }
+    }
+
+    // 3. Check <path>/zy.toml
+    let zy_toml_path = path.join("zy.toml");
+    if zy_toml_path.is_file() {
+        if let Ok(content) = fs::read_to_string(&zy_toml_path) {
+            if let Some(rules) = parse_toml_rules(&content) {
+                rules_sections.push(format!("### Config Rules (zy.toml):\n{}", rules));
+            }
+        }
+    }
+
+    // 4. Check global config (~/.config/zy/config.toml or %APPDATA%\zy\config.toml)
+    let global_config_paths = get_global_config_paths();
+    for gpath in global_config_paths {
+        if gpath.is_file() {
+            if let Ok(content) = fs::read_to_string(&gpath) {
+                if let Some(rules) = parse_toml_rules(&content) {
+                    rules_sections.push(format!("### Global Rules ({}):\n{}", gpath.display(), rules));
+                    break;
+                }
+            }
+        }
+    }
+
+    if rules_sections.is_empty() {
+        None
+    } else {
+        Some(rules_sections.join("\n\n"))
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// FEATURE 8: COMPACT REPOSITORY MAP (SYMBOL HIERARCHY)
+// -------------------------------------------------------------------------------------------------
+
+pub fn extract_identifier_after<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    if let Some(idx) = line.find(prefix) {
+        let after = &line[idx + prefix.len()..];
+        let name = after.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("").trim();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+pub fn extract_symbols(content: &str, ext: &str) -> Vec<String> {
+    let mut symbols = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            continue;
+        }
+
+        match ext {
+            "rs" => {
+                if trimmed.starts_with("pub fn ") || trimmed.starts_with("fn ") || trimmed.starts_with("pub async fn ") || trimmed.starts_with("async fn ") || trimmed.starts_with("pub(crate) fn ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "fn ") {
+                        symbols.push(format!("fn {}", name));
+                    }
+                } else if trimmed.starts_with("pub struct ") || trimmed.starts_with("struct ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "struct ") {
+                        symbols.push(format!("struct {}", name));
+                    }
+                } else if trimmed.starts_with("pub enum ") || trimmed.starts_with("enum ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "enum ") {
+                        symbols.push(format!("enum {}", name));
+                    }
+                } else if trimmed.starts_with("pub trait ") || trimmed.starts_with("trait ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "trait ") {
+                        symbols.push(format!("trait {}", name));
+                    }
+                } else if trimmed.starts_with("pub type ") || trimmed.starts_with("type ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "type ") {
+                        symbols.push(format!("type {}", name));
+                    }
+                }
+            }
+            "py" => {
+                if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "def ") {
+                        symbols.push(format!("def {}", name));
+                    }
+                } else if trimmed.starts_with("class ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "class ") {
+                        symbols.push(format!("class {}", name));
+                    }
+                }
+            }
+            "js" | "ts" | "jsx" | "tsx" => {
+                if trimmed.starts_with("function ") || trimmed.starts_with("export function ") || trimmed.starts_with("async function ") || trimmed.starts_with("export async function ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "function ") {
+                        symbols.push(format!("fn {}", name));
+                    }
+                } else if trimmed.starts_with("class ") || trimmed.starts_with("export class ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "class ") {
+                        symbols.push(format!("class {}", name));
+                    }
+                } else if trimmed.starts_with("interface ") || trimmed.starts_with("export interface ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "interface ") {
+                        symbols.push(format!("interface {}", name));
+                    }
+                } else if trimmed.starts_with("type ") || trimmed.starts_with("export type ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "type ") {
+                        symbols.push(format!("type {}", name));
+                    }
+                } else if (trimmed.starts_with("const ") || trimmed.starts_with("export const ")) && (trimmed.contains("=>") || trimmed.contains("function")) {
+                    if let Some(name) = extract_identifier_after(trimmed, "const ") {
+                        symbols.push(format!("const {}", name));
+                    }
+                }
+            }
+            "go" => {
+                if trimmed.starts_with("func ") {
+                    if let Some(rest) = trimmed.strip_prefix("func ") {
+                        let name = if rest.starts_with('(') {
+                            if let Some((_recv, rest_after)) = rest.split_once(')') {
+                                rest_after.trim().split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("")
+                            } else {
+                                ""
+                            }
+                        } else {
+                            rest.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("")
+                        };
+                        if !name.is_empty() {
+                            symbols.push(format!("func {}", name));
+                        }
+                    }
+                } else if trimmed.starts_with("type ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "type ") {
+                        symbols.push(format!("type {}", name));
+                    }
+                }
+            }
+            "c" | "cpp" | "h" | "hpp" | "cc" => {
+                if trimmed.starts_with("struct ") || trimmed.starts_with("typedef struct ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "struct ") {
+                        symbols.push(format!("struct {}", name));
+                    }
+                } else if trimmed.starts_with("class ") {
+                    if let Some(name) = extract_identifier_after(trimmed, "class ") {
+                        symbols.push(format!("class {}", name));
+                    }
+                } else if (trimmed.contains('(') && trimmed.contains(')')) && !trimmed.starts_with("if") && !trimmed.starts_with("while") && !trimmed.starts_with("for") && !trimmed.starts_with("switch") {
+                    if let Some((before_paren, _)) = trimmed.split_once('(') {
+                        if let Some(func_name) = before_paren.split_whitespace().last() {
+                            let clean_name = func_name.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                            if !clean_name.is_empty() && clean_name != "main" {
+                                symbols.push(format!("fn {}", clean_name));
+                            } else if clean_name == "main" {
+                                symbols.push("fn main".to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    symbols.dedup();
+    symbols
+}
+
+pub fn build_repo_map(path: &std::path::Path, max_tokens: usize) -> String {
+    let mut file_entries: Vec<(String, Vec<String>)> = Vec::new();
+
+    let walker = WalkDir::new(path).into_iter().filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        if e.file_type().is_dir() {
+            !name.starts_with('.') && name != "target" && name != "node_modules" && name != "dist" 
+            && name != "build" && name != "__pycache__" && name != "venv" && name != ".venv"
+            && name != "obj" && name != "bin" && name != "vendor"
+        } else {
+            true
+        }
+    });
+
+    for entry in walker.flatten() {
+        if entry.file_type().is_file() {
+            let p = entry.path();
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if matches!(ext, "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "c" | "cpp" | "h" | "hpp" | "cc" | "go" | "java" | "cs" | "rb" | "php" | "swift" | "kt" | "scala" | "sh" | "bash" | "toml" | "yaml" | "yml" | "sql") {
+                if let Ok(content) = fs::read_to_string(p) {
+                    let symbols = extract_symbols(&content, ext);
+                    if !symbols.is_empty() {
+                        let rel_path = p.strip_prefix(path).unwrap_or(p).to_string_lossy().replace('\\', "/");
+                        file_entries.push((rel_path, symbols));
+                    }
+                }
+            }
+        }
+    }
+
+    file_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut output = String::new();
+    output.push_str("Repository Symbol Map:\n");
+
+    for (file, symbols) in file_entries {
+        let sym_line = symbols.join(", ");
+        let line = format!("{}: {}\n", file, sym_line);
+        if estimate_tokens(&format!("{}{}", output, line)) > max_tokens {
+            output.push_str("... (truncated symbol map to fit token budget)\n");
+            break;
+        }
+        output.push_str(&line);
+    }
+
+    output.trim_end().to_string()
+}
+
+// -------------------------------------------------------------------------------------------------
+// FEATURE 9: AUTONOMOUS TDD TEST-FIX LOOP (/test & auto_repair)
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TestReport {
+    pub runner: String,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub passed_count: usize,
+    pub failed_count: usize,
+    pub failure_details: Vec<String>,
+    pub stdout: String,
+    pub stderr: String,
+    pub summary: String,
+}
+
+pub fn detect_test_runner(path: &std::path::Path) -> String {
+    if path.join("Cargo.toml").exists() {
+        "cargo test".to_string()
+    } else if path.join("pytest.ini").exists() || path.join("pyproject.toml").exists() || path.join("requirements.txt").exists() || path.join("setup.py").exists() {
+        "pytest".to_string()
+    } else if path.join("package.json").exists() {
+        "npm test".to_string()
+    } else if path.join("go.mod").exists() {
+        "go test ./...".to_string()
+    } else {
+        let has_rs = WalkDir::new(path).max_depth(2).into_iter().flatten().any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("rs"));
+        if has_rs {
+            "cargo test".to_string()
+        } else {
+            "cargo test".to_string()
+        }
+    }
+}
+
+pub fn parse_test_output(runner: &str, stdout: &str, stderr: &str, exit_code: Option<i32>) -> (usize, usize, Vec<String>, String) {
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut failures = Vec::new();
+    let combined = format!("{}\n{}", stdout, stderr);
+
+    if runner.contains("cargo") {
+        for line in combined.lines() {
+            let line_trim = line.trim();
+            if line_trim.starts_with("test ") && line_trim.ends_with(" ... ok") {
+                passed += 1;
+            } else if line_trim.starts_with("test ") && (line_trim.ends_with(" ... FAILED") || line_trim.ends_with(" ... failed")) {
+                failed += 1;
+                failures.push(line_trim.to_string());
+            } else if line_trim.contains("failures:") || line_trim.starts_with("error[E") {
+                failures.push(line_trim.to_string());
+            }
+        }
+    } else if runner.contains("pytest") {
+        for line in combined.lines() {
+            let line_trim = line.trim();
+            if line_trim.starts_with("PASSED ") || line_trim.ends_with(" PASSED") {
+                passed += 1;
+            } else if line_trim.starts_with("FAILED ") || line_trim.ends_with(" FAILED") {
+                failed += 1;
+                failures.push(line_trim.to_string());
+            }
+        }
+    } else if runner.contains("npm") || runner.contains("jest") {
+        for line in combined.lines() {
+            let line_trim = line.trim();
+            if line_trim.contains("✓") || line_trim.contains("pass") {
+                passed += 1;
+            } else if line_trim.contains("✕") || line_trim.contains("FAIL") {
+                failed += 1;
+                failures.push(line_trim.to_string());
+            }
+        }
+    } else if runner.contains("go test") {
+        for line in combined.lines() {
+            let line_trim = line.trim();
+            if line_trim.starts_with("--- PASS:") {
+                passed += 1;
+            } else if line_trim.starts_with("--- FAIL:") {
+                failed += 1;
+                failures.push(line_trim.to_string());
+            }
+        }
+    }
+
+    if passed == 0 && failed == 0 {
+        if exit_code == Some(0) {
+            passed = 1;
+        } else {
+            failed = 1;
+            failures.push("Test runner exited with non-zero status code.".to_string());
+        }
+    }
+
+    let summary = if failed == 0 && exit_code == Some(0) {
+        format!("All tests passed ({} passed) using '{}'", passed, runner)
+    } else {
+        format!("Tests failed ({} failed, {} passed) using '{}'", failed, passed, runner)
+    };
+
+    (passed, failed, failures, summary)
+}
+
+pub fn run_project_tests(path: &std::path::Path, custom_cmd: Option<&str>) -> Result<TestReport, Box<dyn std::error::Error>> {
+    let runner_cmd = custom_cmd.map(|s| s.to_string()).unwrap_or_else(|| detect_test_runner(path));
+    
+    #[cfg(windows)]
+    let output = std::process::Command::new("cmd")
+        .arg("/C")
+        .arg(&runner_cmd)
+        .current_dir(path)
+        .output()?;
+
+    #[cfg(not(windows))]
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&runner_cmd)
+        .current_dir(path)
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code();
+
+    let (passed_count, failed_count, failure_details, summary) = parse_test_output(&runner_cmd, &stdout, &stderr, exit_code);
+    let success = output.status.success() && failed_count == 0;
+
+    Ok(TestReport {
+        runner: runner_cmd,
+        success,
+        exit_code,
+        passed_count,
+        failed_count,
+        failure_details,
+        stdout,
+        stderr,
+        summary,
+    })
+}
+
+pub fn format_test_report_for_terminal(report: &TestReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("🧪 Test Suite Report: {}\n", report.runner.bold()));
+    if report.success {
+        out.push_str(&format!("Status: {}\n", "PASSED".green().bold()));
+        out.push_str(&format!("Results: {} passed, {} failed\n", report.passed_count.to_string().green(), report.failed_count.to_string().dimmed()));
+    } else {
+        out.push_str(&format!("Status: {}\n", "FAILED".red().bold()));
+        out.push_str(&format!("Results: {} failed, {} passed\n", report.failed_count.to_string().red().bold(), report.passed_count.to_string().green()));
+        if !report.failure_details.is_empty() {
+            out.push_str(&format!("Failures:\n{}\n", report.failure_details.join("\n").red()));
+        }
+    }
+    out
+}
+
+// -------------------------------------------------------------------------------------------------
+// FEATURE 10: ATOMIC GIT MICRO-CHECKPOINTS (/checkpoint & /rollback)
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct GitCheckpoint {
+    pub id: String,
+    pub label: String,
+    pub commit_sha: String,
+    pub timestamp: u64,
+}
+
+pub const CHECKPOINTS_FILE: &str = ".zy_checkpoints.json";
+
+pub fn load_checkpoints() -> Vec<GitCheckpoint> {
+    if let Ok(content) = fs::read_to_string(CHECKPOINTS_FILE) {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+pub fn save_checkpoints(checkpoints: &[GitCheckpoint]) {
+    if let Ok(data) = serde_json::to_string_pretty(checkpoints) {
+        let _ = fs::write(CHECKPOINTS_FILE, data);
+    }
+}
+
+pub fn create_git_checkpoint_with_label(label: Option<&str>) -> Result<String, String> {
+    if !std::path::Path::new(".git").exists() {
+        return Err("Not a git repository: .git directory not found.".to_string());
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    let chk_id = format!("chk_{}", timestamp);
+    let lbl = label.unwrap_or("auto-checkpoint").to_string();
+
+    let _ = std::process::Command::new("git").args(["add", "-A"]).output();
+    let stash_out = std::process::Command::new("git")
+        .args(["stash", "create", &format!("zy-checkpoint-{}", chk_id)])
+        .output();
+
+    let mut commit_sha = String::new();
+    if let Ok(out) = stash_out {
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !sha.is_empty() {
+            commit_sha = sha;
+        }
+    }
+
+    if commit_sha.is_empty() {
+        if let Ok(head_out) = std::process::Command::new("git").args(["rev-parse", "HEAD"]).output() {
+            commit_sha = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+        }
+    }
+
+    if commit_sha.is_empty() {
+        return Err("Failed to resolve git commit SHA for checkpoint.".to_string());
+    }
+
+    let ref_name = format!("refs/zy/checkpoints/{}", chk_id);
+    let _ = std::process::Command::new("git").args(["update-ref", &ref_name, &commit_sha]).output();
+
+    let mut list = load_checkpoints();
+    list.push(GitCheckpoint {
+        id: chk_id.clone(),
+        label: lbl,
+        commit_sha: commit_sha.clone(),
+        timestamp,
+    });
+    save_checkpoints(&list);
+
+    Ok(chk_id)
+}
+
+pub fn create_git_checkpoint() -> Option<String> {
+    create_git_checkpoint_with_label(None).ok()
+}
+
+pub fn rollback_git_checkpoint_to(checkpoint_id: Option<&str>) -> Result<String, String> {
+    if !std::path::Path::new(".git").exists() {
+        return Err("Not a git repository: .git directory not found.".to_string());
+    }
+
+    let mut list = load_checkpoints();
+    if list.is_empty() {
+        return Err("No checkpoints found in repository history.".to_string());
+    }
+
+    let target_idx = if let Some(id) = checkpoint_id {
+        list.iter().rposition(|c| c.id == id || c.id.starts_with(id))
+    } else {
+        if !list.is_empty() { Some(list.len() - 1) } else { None }
+    };
+
+    if let Some(idx) = target_idx {
+        let chk = list.remove(idx);
+        let _ = std::process::Command::new("git").args(["checkout", &chk.commit_sha, "--", "."]).output();
+        let _ = std::process::Command::new("git").args(["clean", "-fd"]).output();
+        
+        save_checkpoints(&list);
+        Ok(format!("Successfully rolled back workspace to checkpoint `{}` ({})", chk.id, chk.label))
+    } else {
+        Err(format!("Checkpoint `{}` not found.", checkpoint_id.unwrap_or("latest")))
+    }
+}
+
+pub fn rollback_git_checkpoint() -> Result<String, String> {
+    rollback_git_checkpoint_to(None)
+}
+
+// -------------------------------------------------------------------------------------------------
+// FEATURE 11: EPHEMERAL SANDBOX CONTAINER ENGINE
+// -------------------------------------------------------------------------------------------------
+
+pub fn build_sandbox_command(cmd: &str, workspace: &std::path::Path, image: Option<&str>) -> (String, Vec<String>) {
+    let abs_workspace = if workspace.is_absolute() {
+        workspace.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf()).join(workspace)
+    };
+    let ws_str = abs_workspace.to_string_lossy().replace('\\', "/");
+    let container_image = image.unwrap_or("alpine:latest");
+
+    let program = "docker".to_string();
+    let args = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "-i".to_string(),
+        "-v".to_string(),
+        format!("{}:/workspace", ws_str),
+        "-w".to_string(),
+        "/workspace".to_string(),
+        container_image.to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        cmd.to_string(),
+    ];
+
+    (program, args)
+}
+
+// -------------------------------------------------------------------------------------------------
 // CORE SYSTEM SETUP & TUNER
 // -------------------------------------------------------------------------------------------------
 
@@ -991,7 +1612,7 @@ pub async fn interactive_wizard(client: &Client, default_model: &str, default_sc
 
             let tuner = run_ai_tuner(0.1, true);
             println!("\n{}", "--- Configuration Complete ---".green().bold());
-            interactive_chat(client, &selected_model, None, &[], agent, session_opt, rag, markdown, &tuner, force, None, false, default_scout, None).await?;
+            interactive_chat(client, &selected_model, None, &[], agent, session_opt, rag, markdown, &tuner, force, None, false, default_scout, None, false, false).await?;
         }
         _ => {}
     }
@@ -1220,26 +1841,30 @@ Always wrap your strategic reasoning in <STRATEGY> ... </STRATEGY> tags before t
 
 pub fn build_initial_messages(system: Option<&str>, files: &[String], strategist: bool) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
     let mut messages = Vec::new();
+    let project_rules = load_project_rules(std::path::Path::new("."));
 
-    if let Some(sys) = system {
+    let base_system = if let Some(sys) = system {
         let mut final_sys = sys.to_string();
         if strategist { final_sys.push_str(STRATEGIST_PROMPT); }
-        messages.push(Message {
-            role: "system".to_string(),
-            content: final_sys,
-            tool_calls: None,
-            images: None,
-        });
+        final_sys
     } else {
         let mut default_sys = "You are an expert, deterministic coding assistant. Provide highly accurate and factual answers. If you do not know the answer or lack context, explicitly state 'I do not have enough information' instead of guessing or making up functions. Stick strictly to the provided files or RAG context.".to_string();
         if strategist { default_sys.push_str(STRATEGIST_PROMPT); }
-        messages.push(Message {
-            role: "system".to_string(),
-            content: default_sys,
-            tool_calls: None,
-            images: None,
-        });
-    }
+        default_sys
+    };
+
+    let full_system = if let Some(rules) = project_rules {
+        format!("{}\n\n=== ACTIVE PROJECT & USER RULES ===\n{}\n===================================", base_system, rules)
+    } else {
+        base_system
+    };
+
+    messages.push(Message {
+        role: "system".to_string(),
+        content: full_system,
+        tool_calls: None,
+        images: None,
+    });
 
     for path in files {
         if path.ends_with(".png") || path.ends_with(".jpg") || path.ends_with(".jpeg") {
@@ -1285,12 +1910,25 @@ pub async fn single_prompt(
     strategist: bool,
     scout: Option<String>,
     format_schema: Option<serde_json::Value>,
+    map: bool,
+    sandbox: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut messages = load_session(session);
     budget_aware_prune(&mut messages, tuner.num_ctx);
 
     let mut init_msgs = build_initial_messages(system, files, strategist)?;
     messages.append(&mut init_msgs);
+
+    if map {
+        let repo_map = build_repo_map(std::path::Path::new("."), 2048);
+        messages.push(Message {
+            role: "system".to_string(),
+            content: format!("Repository Symbol Map:\n{}", repo_map),
+            tool_calls: None,
+            images: None,
+        });
+        println!("{}", "🗺️  Injected Repository Map into prompt context.".cyan());
+    }
     
     if rag {
         apply_rag(client, prompt, &mut messages).await?;
@@ -1332,9 +1970,9 @@ pub async fn single_prompt(
         
         println!("\n{} {}", "⚡ Swarm Executor Working...".yellow().bold(), exec);
         messages.push(Message { role: "user".to_string(), content: format!("Execute this plan using tools:\n{}", plan), tool_calls: None, images: None });
-        agent_loop(client, &exec, &mut messages, markdown, &tuner.opts, force, format_schema.as_ref()).await?;
+        agent_loop(client, &exec, &mut messages, markdown, &tuner.opts, force, format_schema.as_ref(), sandbox).await?;
     } else if agent {
-        agent_loop(client, model, &mut messages, markdown, &tuner.opts, force, format_schema.as_ref()).await?;
+        agent_loop(client, model, &mut messages, markdown, &tuner.opts, force, format_schema.as_ref(), sandbox).await?;
     } else {
         if markdown {
             let res = fetch_full_response(client, model, &messages, &tuner.opts, format_schema.as_ref()).await?;
@@ -1366,6 +2004,8 @@ pub async fn interactive_chat(
     strategist_flag: bool,
     scout_flag: Option<String>,
     format_schema_flag: Option<serde_json::Value>,
+    map_flag: bool,
+    sandbox_flag: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut active_model = model.to_string();
     let mut agent = agent_flag;
@@ -1374,12 +2014,24 @@ pub async fn interactive_chat(
     let mut strategist = strategist_flag;
     let mut scout_model = scout_flag;
     let mut format_schema = format_schema_flag;
+    let mut sandbox = sandbox_flag;
 
     let mut messages = load_session(session);
     budget_aware_prune(&mut messages, tuner.num_ctx);
     
     let mut init_msgs = build_initial_messages(system, files, strategist)?;
     messages.append(&mut init_msgs);
+
+    if map_flag {
+        let repo_map = build_repo_map(std::path::Path::new("."), 2048);
+        messages.push(Message {
+            role: "system".to_string(),
+            content: format!("Repository Symbol Map:\n{}", repo_map),
+            tool_calls: None,
+            images: None,
+        });
+        println!("{}", "🗺️  Injected Repository Map into conversation context.".cyan());
+    }
 
     let scout_disp = scout_model.as_deref().unwrap_or("OFF");
     let format_disp = if format_schema.is_some() { "ON" } else { "OFF" };
@@ -1388,11 +2040,11 @@ pub async fn interactive_chat(
     println!("\n{}", "╭──────────────────────────────────────────────────────────╮".cyan());
     println!("{} {} {}", "│".cyan(), "🤖 zy Agent Dashboard".bold().white(), "                                │".cyan());
     println!("{}", "├──────────────────────────────────────────────────────────┤".cyan());
-    println!("{} Model:  {:<12} │ Agent: {:<3} (Force: {:<3})          {}", "│".cyan(), active_model.yellow().bold(), if agent { "ON".green() } else { "OFF".red() }, if force { "ON".red() } else { "OFF".green() }, "│".cyan());
-    println!("{} RAG:    {:<12} │ Strategy: {:<20} {}", "│".cyan(), if rag { "ON".green() } else { "OFF".red() }, if strategist { "ENGAGED".red().bold() } else { "OFF".green() }, "│".cyan());
-    println!("{} Swarm:  {:<12} │ Tuner: {:<22} {}", "│".cyan(), if let Some(e) = &executor { e.magenta().bold().to_string() } else { "OFF".green().to_string() }, format!("{} ({} ctx)", tuner.profile_name, tuner.num_ctx).blue().bold(), "│".cyan());
-    println!("{} Router: {:<12} │ Format: {:<21} {}", "│".cyan(), if scout_model.is_some() { scout_disp.cyan().bold().to_string() } else { scout_disp.dimmed().to_string() }, if format_schema.is_some() { format_disp.green().bold().to_string() } else { format_disp.dimmed().to_string() }, "│".cyan());
-    println!("{} Tokens: {:<47} {}", "│".cyan(), token_disp, "│".cyan());
+    println!("{} Model:   {:<12} │ Agent:   {:<3} (Force: {:<3})        {}", "│".cyan(), active_model.yellow().bold(), if agent { "ON".green() } else { "OFF".red() }, if force { "ON".red() } else { "OFF".green() }, "│".cyan());
+    println!("{} RAG:     {:<12} │ Sandbox: {:<20} {}", "│".cyan(), if rag { "ON".green() } else { "OFF".red() }, if sandbox { "DOCKER ON".green().bold() } else { "OFF".yellow() }, "│".cyan());
+    println!("{} Swarm:   {:<12} │ Strategy:{:<20} {}", "│".cyan(), if let Some(e) = &executor { e.magenta().bold().to_string() } else { "OFF".green().to_string() }, if strategist { "ENGAGED".red().bold() } else { "OFF".green() }, "│".cyan());
+    println!("{} Router:  {:<12} │ Format:  {:<20} {}", "│".cyan(), if scout_model.is_some() { scout_disp.cyan().bold().to_string() } else { scout_disp.dimmed().to_string() }, if format_schema.is_some() { format_disp.green().bold().to_string() } else { format_disp.dimmed().to_string() }, "│".cyan());
+    println!("{} Tokens:  {:<47} {}", "│".cyan(), token_disp, "│".cyan());
     let sess_display = session.unwrap_or("None");
     println!("{} Session: {:<46} {}", "│".cyan(), sess_display.white().dimmed(), "│".cyan());
     println!("{}\n", "╰──────────────────────────────────────────────────────────╯".cyan());
@@ -1413,6 +2065,12 @@ pub async fn interactive_chat(
                         "/help" => {
                             println!("{}", "Available slash commands:".yellow());
                             println!("  /help                 - Show this help message");
+                            println!("  /rules                - Display & reload active project rules (.zyrules/zy.toml)");
+                            println!("  /map [path]           - Generate & inject compact repository symbol map");
+                            println!("  /test [runner_cmd]    - Run tests & launch autonomous TDD auto-repair loop");
+                            println!("  /checkpoint [label]   - Create lightweight atomic git micro-checkpoint");
+                            println!("  /rollback [id]        - Rollback workspace to previous micro-checkpoint");
+                            println!("  /sandbox <on|off>     - Toggle Ephemeral Docker Sandbox container mode");
                             println!("  /lsp <file_or_cmd>    - Native LSP / Compiler Diagnostics engine");
                             println!("  /mcp <srv> <tool> <js>- Execute tool on external MCP server via stdio");
                             println!("  /router <scout|off>   - Configure Dual-Model Speculative Router");
@@ -1434,6 +2092,141 @@ pub async fn interactive_chat(
                             println!("  /train                - Export RLHF dataset & run local LoRA fine-tuning");
                             println!("  /undo                 - Git-revert the last agent file edit");
                             println!("  /exit, /quit          - End the session");
+                            continue;
+                        }
+                        "/rules" => {
+                            let rules_opt = load_project_rules(std::path::Path::new("."));
+                            match rules_opt {
+                                Some(rules) => {
+                                    println!("\n{}\n{}\n", "📜 Active Project & User Rules:".cyan().bold(), rules);
+                                    let mut updated = false;
+                                    for m in &mut messages {
+                                        if m.role == "system" {
+                                            if !m.content.contains("ACTIVE PROJECT & USER RULES") {
+                                                m.content.push_str(&format!("\n\n=== ACTIVE PROJECT & USER RULES ===\n{}\n===================================", rules));
+                                            }
+                                            updated = true;
+                                            break;
+                                        }
+                                    }
+                                    if !updated {
+                                        messages.insert(0, Message {
+                                            role: "system".to_string(),
+                                            content: format!("=== ACTIVE PROJECT & USER RULES ===\n{}\n===================================", rules),
+                                            tool_calls: None,
+                                            images: None,
+                                        });
+                                    }
+                                    println!("{}", "✅ Active project rules reloaded into context.".green());
+                                }
+                                None => {
+                                    println!("{}", "⚠️  No project rules found. Create .zyrules, .zy/rules.md, or zy.toml in your workspace.".yellow());
+                                }
+                            }
+                            continue;
+                        }
+                        "/map" => {
+                            let target_path = if parts.len() > 1 { parts[1] } else { "." };
+                            println!("{} Scanning codebase `{}`...", "🗺️  Repository Map Engine:".cyan().bold(), target_path.yellow());
+                            let repo_map = build_repo_map(std::path::Path::new(target_path), 2048);
+                            println!("\n{}\n", repo_map);
+                            messages.push(Message {
+                                role: "system".to_string(),
+                                content: format!("Repository Symbol Map:\n{}", repo_map),
+                                tool_calls: None,
+                                images: None,
+                            });
+                            println!("{}", "🗺️  Repository map injected into conversation context.".green());
+                            continue;
+                        }
+                        "/test" => {
+                            let custom_cmd = if parts.len() > 1 { Some(parts[1..].join(" ")) } else { None };
+                            let cmd_ref = custom_cmd.as_deref();
+                            println!("{} Executing test suite...", "🧪 TDD Test Engine:".cyan().bold());
+                            match run_project_tests(std::path::Path::new("."), cmd_ref) {
+                                Ok(report) => {
+                                    println!("\n{}", format_test_report_for_terminal(&report));
+                                    if report.success {
+                                        println!("{}", "🎉 All tests PASSED!".green().bold());
+                                    } else {
+                                        println!("{}", "⚠️  Tests Failed! Initiating Autonomous TDD Auto-Repair Loop...".red().bold());
+                                        
+                                        let failure_summary = if !report.failure_details.is_empty() {
+                                            report.failure_details.join("\n")
+                                        } else {
+                                            report.stderr.clone()
+                                        };
+                                        
+                                        let repair_prompt = format!(
+                                            "Autonomous TDD Auto-Repair Request:\nThe test suite failed (runner: {}).\n\nFailures:\n{}\n\nSTDOUT:\n{}\nSTDERR:\n{}\n\nPlease analyze the test failure above, inspect source files, fix the bugs using patch_file or write_file, and re-run tests using run_tests until all tests pass.",
+                                            report.runner, failure_summary, report.stdout, report.stderr
+                                        );
+                                        
+                                        messages.push(Message {
+                                            role: "user".to_string(),
+                                            content: repair_prompt,
+                                            tool_calls: None,
+                                            images: None,
+                                        });
+                                        
+                                        let _ = agent_loop(client, &active_model, &mut messages, markdown, &tuner.opts, force, format_schema.as_ref(), sandbox).await;
+                                        
+                                        if let Ok(after_report) = run_project_tests(std::path::Path::new("."), cmd_ref) {
+                                            println!("\n{}", format_test_report_for_terminal(&after_report));
+                                            if after_report.success {
+                                                println!("{}", "🎉 Auto-Repair Successful! Codebase is now GREEN.".green().bold());
+                                            } else {
+                                                println!("{}", "⚠️  Auto-Repair finished cycle. Tests still have remaining failures.".yellow().bold());
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("{} {}", "❌ Error executing tests:".red(), e);
+                                }
+                            }
+                            continue;
+                        }
+                        "/checkpoint" => {
+                            let label = if parts.len() > 1 { Some(parts[1..].join(" ")) } else { None };
+                            match create_git_checkpoint_with_label(label.as_deref()) {
+                                Ok(chk_id) => {
+                                    println!("{} Checkpoint ID: `{}` ({})", "💾 Micro-Checkpoint Created:".green().bold(), chk_id.cyan(), label.as_deref().unwrap_or("manual"));
+                                }
+                                Err(e) => {
+                                    println!("{} {}", "❌ Checkpoint Error:".red(), e);
+                                }
+                            }
+                            continue;
+                        }
+                        "/rollback" => {
+                            let target_id = if parts.len() > 1 { Some(parts[1]) } else { None };
+                            match rollback_git_checkpoint_to(target_id) {
+                                Ok(msg) => {
+                                    println!("{} {}", "⏪ Rollback Succeeded:".yellow().bold(), msg.green());
+                                }
+                                Err(e) => {
+                                    println!("{} {}", "❌ Rollback Failed:".red(), e);
+                                }
+                            }
+                            continue;
+                        }
+                        "/sandbox" => {
+                            if parts.len() > 1 {
+                                let mode = parts[1].to_lowercase();
+                                if mode == "on" || mode == "1" || mode == "true" {
+                                    sandbox = true;
+                                    println!("{}", "🐳 Ephemeral Sandbox Container Engine: ON (wrapping bash in container)".green().bold());
+                                } else if mode == "off" || mode == "0" || mode == "false" {
+                                    sandbox = false;
+                                    println!("{}", "🐳 Ephemeral Sandbox Container Engine: OFF (direct host execution)".yellow().bold());
+                                } else {
+                                    println!("{}", "Usage: /sandbox <on|off>".red());
+                                }
+                            } else {
+                                sandbox = !sandbox;
+                                println!("{} {}", "🐳 Ephemeral Sandbox Container Engine:".cyan().bold(), if sandbox { "ON".green().bold() } else { "OFF".yellow() });
+                            }
                             continue;
                         }
                         "/lsp" => {
@@ -1597,7 +2390,7 @@ pub async fn interactive_chat(
                             });
                             
                             if agent {
-                                let _ = agent_loop(client, &active_model, &mut messages, markdown, &tuner.opts, force, format_schema.as_ref()).await;
+                                let _ = agent_loop(client, &active_model, &mut messages, markdown, &tuner.opts, force, format_schema.as_ref(), sandbox).await;
                             } else {
                                 if let Ok(response_text) = fetch_full_response(client, &active_model, &messages, &tuner.opts, format_schema.as_ref()).await {
                                     if markdown {
@@ -1791,7 +2584,7 @@ except Exception as e:
                                         let prompt = format!("Fix this issue autonomously using your tools:\n\n{}", issue_text);
                                         
                                         messages.push(Message { role: "user".to_string(), content: prompt, tool_calls: None, images: None });
-                                        let _ = agent_loop(client, &active_model, &mut messages, markdown, &tuner.opts, true, format_schema.as_ref()).await;
+                                        let _ = agent_loop(client, &active_model, &mut messages, markdown, &tuner.opts, true, format_schema.as_ref(), sandbox).await;
                                         
                                         println!("{}", "✅ Issue Processed!".green());
                                         break;
@@ -1894,9 +2687,9 @@ except Exception as e:
                     
                     println!("\n{} {}", "⚡ Swarm Executor Working...".yellow().bold(), exec);
                     messages.push(Message { role: "user".to_string(), content: format!("Execute this plan using tools:\n{}", plan), tool_calls: None, images: None });
-                    agent_loop(client, exec, &mut messages, markdown, &tuner.opts, force, format_schema.as_ref()).await?;
+                    agent_loop(client, exec, &mut messages, markdown, &tuner.opts, force, format_schema.as_ref(), sandbox).await?;
                 } else if agent {
-                    agent_loop(client, &active_model, &mut messages, markdown, &tuner.opts, force, format_schema.as_ref()).await?;
+                    agent_loop(client, &active_model, &mut messages, markdown, &tuner.opts, force, format_schema.as_ref(), sandbox).await?;
                 } else {
                     if markdown {
                         let response_text = fetch_full_response(client, &active_model, &messages, &tuner.opts, format_schema.as_ref()).await?;
@@ -2051,6 +2844,34 @@ pub fn get_tools() -> serde_json::Value {
         {
             "type": "function",
             "function": {
+                "name": "get_repo_map",
+                "description": "Generate a compact ASCII symbol outline map of the codebase (functions, structs, classes, interfaces).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Root directory path to scan (defaults to '.')" },
+                        "max_tokens": { "type": "integer", "description": "Maximum token budget for the repository map (default 1500)" }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_tests",
+                "description": "Execute project test suite (cargo test, pytest, npm test, go test, or custom command). Returns structured pass/fail results, counts, and failure error traces.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "Optional test command (e.g. 'cargo test --test integration_tests')" },
+                        "path": { "type": "string", "description": "Project directory path (defaults to '.')" }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "lsp_diagnostics",
                 "description": "Run native compiler and linter diagnostics on a file or workspace (Rust/cargo, Python/py_compile, TypeScript/tsc, JavaScript/node, C/C++/gcc, Go/go vet). Returns structured JSON diagnostics with file, line, column, severity, and message.",
                 "parameters": {
@@ -2181,255 +3002,353 @@ pub async fn agent_loop(
     options: &OllamaOptions, 
     force: bool,
     format_schema: Option<&serde_json::Value>,
+    sandbox: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let req_body = ChatRequest {
             model: model.to_string(),
             messages: messages.to_vec(),
-            stream: false,
+            stream: true,
             tools: Some(get_tools()),
             format: format_schema.cloned(),
             options: Some(options.clone()),
             keep_alive: Some(-1),
         };
 
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(ProgressStyle::default_spinner().tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]).template("{spinner:.magenta} {msg}").unwrap());
-        spinner.set_message("zy agent is working...");
-        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-
         let res = client.post(format!("{}/api/chat", OLLAMA_URL)).json(&req_body).send().await?;
-        spinner.finish_and_clear();
 
         if !res.status().is_success() {
-            println!("{}", "Error: Failed to get response from Ollama.".red());
+            println!("{}", format!("Error: Failed to get response from Ollama for model '{}'.", model).red());
             break;
         }
 
-        let parsed: ChatResponse = res.json().await?;
-        if let Some(msg) = parsed.message {
-            if let Some(calls) = &msg.tool_calls {
-                messages.push(msg.clone());
+        let mut full_response = String::new();
+        let mut accumulated_tool_calls: Vec<ToolCall> = Vec::new();
+        let mut in_think_block = false;
+        let mut stream = res.bytes_stream();
+        let mut printed_tokens = false;
 
-                for call in calls {
-                    let fn_name = &call.function.name;
-                    let args = &call.function.arguments;
-                    let mut tool_result = String::new();
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result?;
+            let chunk_str = String::from_utf8_lossy(&chunk);
 
-                    let arg_str = args.to_string();
-                    let preview = if arg_str.len() > 30 { format!("{}...", &arg_str[0..27]) } else { arg_str };
-                    print!("{} {} {} ", "⚙️ ".magenta(), fn_name.cyan().bold(), preview.dimmed());
-                    io::stdout().flush()?;
-
-                    if fn_name == "run_bash" {
-                        if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                            let mut proceed = force;
-                            if !force {
-                                println!();
-                                proceed = ask_confirmation(&format!("zy wants to execute: `{}`. Allow?", cmd));
+            for line in chunk_str.lines() {
+                let line_trim = line.trim();
+                if line_trim.is_empty() { continue; }
+                if let Ok(parsed) = serde_json::from_str::<ChatResponse>(line_trim) {
+                    if let Some(msg) = parsed.message {
+                        if !msg.content.is_empty() {
+                            if !printed_tokens && !msg.content.starts_with('{') {
+                                print!("{}", "zy ❯ ".green().bold());
+                                printed_tokens = true;
                             }
-                            
-                            if proceed {
+                            full_response.push_str(&msg.content);
+
+                            if msg.content.contains("<think>") { in_think_block = true; }
+                            if msg.content.contains("</think>") {
+                                print!("{}", "</think>".dimmed());
+                                in_think_block = false;
+                                io::stdout().flush()?;
+                                continue;
+                            }
+
+                            if in_think_block {
+                                print!("{}", msg.content.dimmed());
+                            } else {
+                                print!("{}", msg.content);
+                            }
+                            io::stdout().flush()?;
+                        }
+
+                        if let Some(calls) = msg.tool_calls {
+                            accumulated_tool_calls.extend(calls);
+                        }
+                    }
+                    if let Some(err) = parsed.error {
+                        println!("\nOllama error: {}", err);
+                    }
+                }
+            }
+        }
+
+        if printed_tokens {
+            println!();
+        }
+
+        // Fallback JSON parser if model responded with raw JSON tool call
+        if accumulated_tool_calls.is_empty() && full_response.trim().starts_with('{') {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(full_response.trim()) {
+                if let Some(action) = val.get("action").or_else(|| val.get("name")).and_then(|v| v.as_str()) {
+                    let arguments = val.get("action_input").or_else(|| val.get("arguments")).cloned().unwrap_or(serde_json::json!({}));
+                    accumulated_tool_calls.push(ToolCall {
+                        function: ToolCallFunction {
+                            name: action.to_string(),
+                            arguments,
+                        }
+                    });
+                }
+            }
+        }
+
+        if !accumulated_tool_calls.is_empty() {
+            let assistant_msg = Message {
+                role: "assistant".to_string(),
+                content: full_response.clone(),
+                tool_calls: Some(accumulated_tool_calls.clone()),
+                images: None,
+            };
+            messages.push(assistant_msg);
+
+            for call in &accumulated_tool_calls {
+                let fn_name = &call.function.name;
+                let args = &call.function.arguments;
+                let mut tool_result = String::new();
+
+                let arg_str = args.to_string();
+                let preview = if arg_str.len() > 30 { format!("{}...", &arg_str[0..27]) } else { arg_str };
+                print!("{} {} {} ", "⚙️ ".magenta(), fn_name.cyan().bold(), preview.dimmed());
+                io::stdout().flush()?;
+
+                // Automatic Git Micro-Checkpoint before executing agent actions
+                let _ = create_git_checkpoint_with_label(Some(&format!("pre-tool-{}", fn_name)));
+
+                if fn_name == "run_bash" {
+                    if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                        let mut proceed = force;
+                        if !force {
+                            println!();
+                            proceed = ask_confirmation(&format!("zy wants to execute: `{}`. Allow?", cmd));
+                        }
+                        
+                        if proceed {
+                            let output = if sandbox {
+                                println!("{} Executing in Docker sandbox (alpine:latest)...", "🐳".cyan());
+                                let (prog, s_args) = build_sandbox_command(cmd, std::path::Path::new("."), None);
+                                std::process::Command::new(prog).args(&s_args).output()
+                            } else {
                                 #[cfg(windows)]
-                                let output = std::process::Command::new("cmd").arg("/C").arg(cmd).output();
+                                { std::process::Command::new("cmd").arg("/C").arg(cmd).output() }
                                 #[cfg(not(windows))]
-                                let output = std::process::Command::new("sh").arg("-c").arg(cmd).output();
-                                match output {
-                                    Ok(out) => {
-                                        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                                        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                                        tool_result = format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr);
-                                        println!("{}", "✔️".green());
-                                    }
-                                    Err(e) => {
-                                        tool_result = format!("Failed to execute: {}", e);
-                                        println!("{}", "❌".red());
-                                    }
-                                }
-                            } else {
-                                tool_result = "Execution denied by user.".to_string();
-                                println!("{}", "⛔ Denied".red());
-                            }
-                        } else {
-                            tool_result = "Error: Missing command parameter".to_string();
-                            println!("{}", "❌ Error".red());
-                        }
-                    } else if fn_name == "lsp_diagnostics" {
-                        if let Some(target) = args.get("file_or_cmd").and_then(|v| v.as_str()) {
-                            let report = run_lsp_diagnostics(target);
-                            println!("\n{}", format_diagnostic_report_for_terminal(&report));
-                            tool_result = serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.summary.clone());
-                            println!("{}", if report.success { "✔️ Diagnostics Clean".green() } else { "⚠️ Issues Found".yellow() });
-                        } else {
-                            tool_result = "Error: Missing file_or_cmd parameter".to_string();
-                            println!("{}", "❌ Error".red());
-                        }
-                    } else if fn_name == "mcp_execute" {
-                        if let (Some(server_cmd), Some(tool)) = (args.get("server_command").and_then(|v| v.as_str()), args.get("tool_name").and_then(|v| v.as_str())) {
-                            let empty_args = serde_json::json!({});
-                            let mcp_args = args.get("arguments").unwrap_or(&empty_args);
-                            println!("{} Calling MCP tool `{}` on `{}`...", "🔌".blue(), tool.cyan(), server_cmd.dimmed());
-                            match execute_mcp_call(server_cmd, tool, mcp_args).await {
-                                Ok(res) => {
-                                    tool_result = res;
-                                    println!("{}", "✔️ MCP Call Complete".green());
+                                { std::process::Command::new("sh").arg("-c").arg(cmd).output() }
+                            };
+                            match output {
+                                Ok(out) => {
+                                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                                    tool_result = format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr);
+                                    println!("{}", "✔️".green());
                                 }
                                 Err(e) => {
-                                    tool_result = format!("MCP execution failed: {}", e);
-                                    println!("{} {}", "❌ MCP Error:".red(), e);
-                                }
-                            }
-                        } else {
-                            tool_result = "Error: Missing server_command or tool_name parameter".to_string();
-                            println!("{}", "❌ Error".red());
-                        }
-                    } else if fn_name == "write_file" {
-                        if let (Some(path), Some(content)) = (args.get("path").and_then(|v| v.as_str()), args.get("content").and_then(|v| v.as_str())) {
-                            let old_content = fs::read_to_string(path).unwrap_or_default();
-                            let diff_output = render_terminal_diff(path, &old_content, content);
-                            println!("\n{}", diff_output);
-
-                            let mut proceed = force;
-                            if !force {
-                                proceed = ask_confirmation(&format!("zy wants to write to file: `{}`. Allow?", path));
-                            }
-
-                            if proceed {
-                                auto_git_backup(path);
-                                match fs::write(path, content) {
-                                    Ok(_) => {
-                                        tool_result = format!("Successfully wrote to {}", path);
-                                        println!("{}", "✔️".green());
-                                    }
-                                    Err(e) => {
-                                        tool_result = format!("Failed to write file: {}", e);
-                                        println!("{}", "❌".red());
-                                    }
-                                }
-                            } else {
-                                tool_result = "File write denied by user.".to_string();
-                                println!("{}", "⛔ Denied".red());
-                            }
-                        } else {
-                            tool_result = "Error: Missing path or content parameter".to_string();
-                            println!("{}", "❌ Error".red());
-                        }
-                    } else if fn_name == "patch_file" {
-                        if let (Some(path), Some(old_t), Some(new_t)) = (args.get("path").and_then(|v| v.as_str()), args.get("old_text").and_then(|v| v.as_str()), args.get("new_text").and_then(|v| v.as_str())) {
-                            match fs::read_to_string(path) {
-                                Ok(content) => {
-                                    if content.contains(old_t) {
-                                        let updated = content.replace(old_t, new_t);
-                                        let diff_output = render_terminal_diff(path, &content, &updated);
-                                        println!("\n{}", diff_output);
-
-                                        let mut proceed = force;
-                                        if !force {
-                                            proceed = ask_confirmation(&format!("zy wants to PATCH file: `{}`. Allow?", path));
-                                        }
-                                        if proceed {
-                                            auto_git_backup(path);
-                                            if fs::write(path, updated).is_ok() {
-                                                tool_result = format!("Successfully patched {}", path);
-                                                println!("{}", "✔️".green());
-                                            } else {
-                                                tool_result = "Failed to write patched file".to_string();
-                                                println!("{}", "❌".red());
-                                            }
-                                        } else {
-                                            tool_result = "Patch denied by user.".to_string();
-                                            println!("{}", "⛔ Denied".red());
-                                        }
-                                    } else {
-                                        tool_result = "Error: old_text not found in file".to_string();
-                                        println!("{}", "❌ Not Found".red());
-                                    }
-                                }
-                                Err(e) => {
-                                    tool_result = format!("Error: Could not read file: {}", e);
-                                    println!("{}", "❌ Error".red());
-                                }
-                            }
-                        } else {
-                            tool_result = "Missing parameters".to_string();
-                            println!("{}", "❌ Error".red());
-                        }
-                    } else if fn_name == "fetch_url" {
-                        if let Some(url) = args.get("url").and_then(|v| v.as_str()) {
-                            match client.get(url).send().await {
-                                Ok(res) => {
-                                    if let Ok(text) = res.text().await {
-                                        let mut safe_text = text;
-                                        if safe_text.len() > 4000 { safe_text.truncate(4000); }
-                                        tool_result = safe_text;
-                                        println!("{}", "✔️".green());
-                                    } else {
-                                        tool_result = "Failed to read body".to_string();
-                                        println!("{}", "❌".red());
-                                    }
-                                }
-                                Err(e) => {
-                                    tool_result = format!("HTTP error: {}", e);
+                                    tool_result = format!("Failed to execute (sandbox={}): {}", sandbox, e);
                                     println!("{}", "❌".red());
                                 }
                             }
                         } else {
-                            tool_result = "Error: Missing URL parameter".to_string();
-                            println!("{}", "❌ Error".red());
-                        }
-                    } else if fn_name == "browser_action" {
-                        if let (Some(url), Some(js)) = (args.get("url").and_then(|v| v.as_str()), args.get("javascript_to_execute").and_then(|v| v.as_str())) {
-                            let script = format!("const puppeteer = require('puppeteer'); (async () => {{ const browser = await puppeteer.launch(); const page = await browser.newPage(); await page.goto('{}'); const result = await page.evaluate(() => {{ {} }}); console.log(result); await browser.close(); }})();", url, js);
-                            let _ = fs::write(".zy_puppeteer.js", script);
-                            let output = std::process::Command::new("node").arg(".zy_puppeteer.js").output();
-                            match output {
-                                Ok(out) => {
-                                    tool_result = String::from_utf8_lossy(&out.stdout).to_string();
-                                    println!("{}", "✔️".green());
-                                }
-                                Err(_) => {
-                                    tool_result = "Node/Puppeteer not installed on system.".to_string();
-                                    println!("{}", "❌ Error".red());
-                                }
-                            }
-                        }
-                    } else if fn_name == "send_webhook" {
-                        if let Some(msg_text) = args.get("message").and_then(|v| v.as_str()) {
-                            if let Ok(url) = fs::read_to_string(".zy_webhook.txt") {
-                                let payload = serde_json::json!({ "content": msg_text });
-                                let _ = client.post(url.trim()).json(&payload).send().await;
-                                tool_result = "Webhook sent successfully.".to_string();
-                                println!("{}", "✔️ Notification Sent".green());
-                            } else {
-                                tool_result = "Error: No webhook URL configured. Tell the user to use /webhook <url>".to_string();
-                                println!("{}", "❌ No Webhook configured".red());
-                            }
-                        } else {
-                            tool_result = "Missing message".to_string();
-                            println!("{}", "❌ Error".red());
+                            tool_result = "Execution denied by user.".to_string();
+                            println!("{}", "⛔ Denied".red());
                         }
                     } else {
-                        tool_result = format!("Unknown function: {}", fn_name);
-                        println!("{}", "❓ Unknown".red());
+                        tool_result = "Error: Missing command parameter".to_string();
+                        println!("{}", "❌ Error".red());
                     }
+                } else if fn_name == "get_repo_map" {
+                    let root_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                    let max_tokens = args.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(1500) as usize;
+                    let repo_map = build_repo_map(std::path::Path::new(root_path), max_tokens);
+                    println!("\n{}", "🗺️  Generated Repository Symbol Map".cyan().bold());
+                    tool_result = repo_map;
+                    println!("{}", "✔️".green());
+                } else if fn_name == "run_tests" {
+                    let cmd_opt = args.get("command").and_then(|v| v.as_str());
+                    let p_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                    match run_project_tests(std::path::Path::new(p_str), cmd_opt) {
+                        Ok(report) => {
+                            println!("\n{}", format_test_report_for_terminal(&report));
+                            tool_result = serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.summary.clone());
+                            println!("{}", if report.success { "✔️ Tests Passed".green() } else { "❌ Tests Failed".red() });
+                        }
+                        Err(e) => {
+                            tool_result = format!("Error running tests: {}", e);
+                            println!("{}", "❌ Error".red());
+                        }
+                    }
+                } else if fn_name == "lsp_diagnostics" {
+                    if let Some(target) = args.get("file_or_cmd").and_then(|v| v.as_str()) {
+                        let report = run_lsp_diagnostics(target);
+                        println!("\n{}", format_diagnostic_report_for_terminal(&report));
+                        tool_result = serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.summary.clone());
+                        println!("{}", if report.success { "✔️ Diagnostics Clean".green() } else { "⚠️ Issues Found".yellow() });
+                    } else {
+                        tool_result = "Error: Missing file_or_cmd parameter".to_string();
+                        println!("{}", "❌ Error".red());
+                    }
+                } else if fn_name == "mcp_execute" {
+                    if let (Some(server_cmd), Some(tool)) = (args.get("server_command").and_then(|v| v.as_str()), args.get("tool_name").and_then(|v| v.as_str())) {
+                        let empty_args = serde_json::json!({});
+                        let mcp_args = args.get("arguments").unwrap_or(&empty_args);
+                        println!("{} Calling MCP tool `{}` on `{}`...", "🔌".blue(), tool.cyan(), server_cmd.dimmed());
+                        match execute_mcp_call(server_cmd, tool, mcp_args).await {
+                            Ok(res) => {
+                                tool_result = res;
+                                println!("{}", "✔️ MCP Call Complete".green());
+                            }
+                            Err(e) => {
+                                tool_result = format!("MCP execution failed: {}", e);
+                                println!("{} {}", "❌ MCP Error:".red(), e);
+                            }
+                        }
+                    } else {
+                        tool_result = "Error: Missing server_command or tool_name parameter".to_string();
+                        println!("{}", "❌ Error".red());
+                    }
+                } else if fn_name == "write_file" {
+                    if let (Some(path), Some(content)) = (args.get("path").and_then(|v| v.as_str()), args.get("content").and_then(|v| v.as_str())) {
+                        let old_content = fs::read_to_string(path).unwrap_or_default();
+                        let diff_output = render_terminal_diff(path, &old_content, content);
+                        println!("\n{}", diff_output);
 
-                    messages.push(Message {
-                        role: "tool".to_string(),
-                        content: tool_result,
-                        tool_calls: None,
-                        images: None,
-                    });
-                }
-            } else {
-                if markdown {
-                    print_text(&msg.content);
+                        let mut proceed = force;
+                        if !force {
+                            proceed = ask_confirmation(&format!("zy wants to write to file: `{}`. Allow?", path));
+                        }
+
+                        if proceed {
+                            auto_git_backup(path);
+                            match fs::write(path, content) {
+                                Ok(_) => {
+                                    tool_result = format!("Successfully wrote to {}", path);
+                                    println!("{}", "✔️".green());
+                                }
+                                Err(e) => {
+                                    tool_result = format!("Failed to write file: {}", e);
+                                    println!("{}", "❌".red());
+                                }
+                            }
+                        } else {
+                            tool_result = "File write denied by user.".to_string();
+                            println!("{}", "⛔ Denied".red());
+                        }
+                    } else {
+                        tool_result = "Error: Missing path or content parameter".to_string();
+                        println!("{}", "❌ Error".red());
+                    }
+                } else if fn_name == "patch_file" {
+                    if let (Some(path), Some(old_t), Some(new_t)) = (args.get("path").and_then(|v| v.as_str()), args.get("old_text").and_then(|v| v.as_str()), args.get("new_text").and_then(|v| v.as_str())) {
+                        match fs::read_to_string(path) {
+                            Ok(content) => {
+                                if content.contains(old_t) {
+                                    let updated = content.replace(old_t, new_t);
+                                    let diff_output = render_terminal_diff(path, &content, &updated);
+                                    println!("\n{}", diff_output);
+
+                                    let mut proceed = force;
+                                    if !force {
+                                        proceed = ask_confirmation(&format!("zy wants to PATCH file: `{}`. Allow?", path));
+                                    }
+                                    if proceed {
+                                        auto_git_backup(path);
+                                        if fs::write(path, updated).is_ok() {
+                                            tool_result = format!("Successfully patched {}", path);
+                                            println!("{}", "✔️".green());
+                                        } else {
+                                            tool_result = "Failed to write patched file".to_string();
+                                            println!("{}", "❌".red());
+                                        }
+                                    } else {
+                                        tool_result = "Patch denied by user.".to_string();
+                                        println!("{}", "⛔ Denied".red());
+                                    }
+                                } else {
+                                    tool_result = "Error: old_text not found in file".to_string();
+                                    println!("{}", "❌ Not Found".red());
+                                }
+                            }
+                            Err(e) => {
+                                tool_result = format!("Error: Could not read file: {}", e);
+                                println!("{}", "❌ Error".red());
+                            }
+                        }
+                    } else {
+                        tool_result = "Missing parameters".to_string();
+                        println!("{}", "❌ Error".red());
+                    }
+                } else if fn_name == "fetch_url" {
+                    if let Some(url) = args.get("url").and_then(|v| v.as_str()) {
+                        match client.get(url).send().await {
+                            Ok(res) => {
+                                if let Ok(text) = res.text().await {
+                                    let mut safe_text = text;
+                                    if safe_text.len() > 4000 { safe_text.truncate(4000); }
+                                    tool_result = safe_text;
+                                    println!("{}", "✔️".green());
+                                } else {
+                                    tool_result = "Failed to read body".to_string();
+                                    println!("{}", "❌".red());
+                                }
+                            }
+                            Err(e) => {
+                                tool_result = format!("HTTP error: {}", e);
+                                println!("{}", "❌".red());
+                            }
+                        }
+                    } else {
+                        tool_result = "Error: Missing URL parameter".to_string();
+                        println!("{}", "❌ Error".red());
+                    }
+                } else if fn_name == "browser_action" {
+                    if let (Some(url), Some(js)) = (args.get("url").and_then(|v| v.as_str()), args.get("javascript_to_execute").and_then(|v| v.as_str())) {
+                        let script = format!("const puppeteer = require('puppeteer'); (async () => {{ const browser = await puppeteer.launch(); const page = await browser.newPage(); await page.goto('{}'); const result = await page.evaluate(() => {{ {} }}); console.log(result); await browser.close(); }})();", url, js);
+                        let _ = fs::write(".zy_puppeteer.js", script);
+                        let output = std::process::Command::new("node").arg(".zy_puppeteer.js").output();
+                        match output {
+                            Ok(out) => {
+                                tool_result = String::from_utf8_lossy(&out.stdout).to_string();
+                                println!("{}", "✔️".green());
+                            }
+                            Err(_) => {
+                                tool_result = "Node/Puppeteer not installed on system.".to_string();
+                                println!("{}", "❌ Error".red());
+                            }
+                        }
+                    }
+                } else if fn_name == "send_webhook" {
+                    if let Some(msg_text) = args.get("message").and_then(|v| v.as_str()) {
+                        if let Ok(url) = fs::read_to_string(".zy_webhook.txt") {
+                            let payload = serde_json::json!({ "content": msg_text });
+                            let _ = client.post(url.trim()).json(&payload).send().await;
+                            tool_result = "Webhook sent successfully.".to_string();
+                            println!("{}", "✔️ Notification Sent".green());
+                        } else {
+                            tool_result = "Error: No webhook URL configured. Tell the user to use /webhook <url>".to_string();
+                            println!("{}", "❌ No Webhook configured".red());
+                        }
+                    } else {
+                        tool_result = "Missing message".to_string();
+                        println!("{}", "❌ Error".red());
+                    }
                 } else {
-                    println!("{} {}", "zy ❯".green().bold(), msg.content);
+                    tool_result = format!("Unknown function: {}", fn_name);
+                    println!("{}", "❓ Unknown".red());
                 }
-                messages.push(msg.clone());
-                break;
+
+                messages.push(Message {
+                    role: "tool".to_string(),
+                    content: tool_result,
+                    tool_calls: None,
+                    images: None,
+                });
             }
         } else {
+            let assistant_msg = Message {
+                role: "assistant".to_string(),
+                content: full_response,
+                tool_calls: None,
+                images: None,
+            };
+            if markdown {
+                print_text(&assistant_msg.content);
+            }
+            messages.push(assistant_msg);
             break;
         }
     }
