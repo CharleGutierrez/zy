@@ -1,1 +1,5 @@
 /target
+.zy/
+.zy_*.json
+.zy_*.txt
+.zy_train.py

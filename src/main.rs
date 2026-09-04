@@ -671,7 +671,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("  Security Rating:  {:.1}%", metrics.security);
                     println!("  Performance:      {:.1}%", metrics.performance);
                     println!("  Documentation:    {:.1}%", metrics.documentation);
-                    println!("  Overall Rating:   {:.1}%", metrics.overall_score.to_string().green().bold());
+                    println!("  Overall Rating:   {}", format!("{:.1}%", metrics.overall_score).green().bold());
                 }
                 "dag" => {
                     let dag = DagLayout::build_swarm_workflow_dag(target, &[
