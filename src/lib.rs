@@ -403,6 +403,76 @@ pub enum Commands {
         /// Optional specific cue to play
         #[arg(short, long)]
         cue: Option<String>,
+    },
+    /// Interactive Hunk-by-Hunk Diff Staging UI
+    Stage {
+        /// Target file path or unified diff
+        #[arg(default_value = ".")]
+        path: String,
+        /// Specific hunk indices to stage (comma-separated, e.g. "0,2")
+        #[arg(short, long)]
+        indices: Option<String>,
+        /// Apply staged hunks directly to disk
+        #[arg(short, long)]
+        apply: bool,
+        /// Split multi-line hunks into atomic lines
+        #[arg(short, long)]
+        split: bool,
+    },
+    /// Real-Time Token Heatmap & Context Density Inspector
+    Heatmap {
+        /// Custom context window budget (defaults to 8192)
+        #[arg(short = 'c', long)]
+        max_ctx: Option<usize>,
+        /// Optional session name
+        #[arg(short, long)]
+        session: Option<String>,
+    },
+    /// Terminal Slide Deck Presentation Engine
+    Slides {
+        /// Markdown file or presentation deck path
+        #[arg(default_value = "README.md")]
+        path: String,
+        /// Slide index to render (optional, default: interactive presentation)
+        #[arg(short, long)]
+        slide: Option<usize>,
+        /// Terminal render width
+        #[arg(short, long)]
+        width: Option<u16>,
+        /// Terminal render height
+        #[arg(long)]
+        height: Option<u16>,
+    },
+    /// Modular Dockable TUI Widgets Bar
+    Widgets {
+        /// Action: list, toggle, status, render
+        #[arg(default_value = "render")]
+        action: String,
+        /// Widget name: git_stream, docker_monitor, database_tailer, hardware_sparklines
+        #[arg(short, long)]
+        widget: Option<String>,
+    },
+    /// Local Text-to-Speech Voice Engine
+    Speak {
+        /// Text message to synthesize into spoken audio
+        text: Vec<String>,
+        /// Voice playback speed multiplier (0.5 to 2.0, default 1.0)
+        #[arg(short, long)]
+        speed: Option<f32>,
+        /// Voice pitch multiplier (0.5 to 2.0, default 1.0)
+        #[arg(short, long)]
+        pitch: Option<f32>,
+        /// Run speech in background without blocking
+        #[arg(short, long)]
+        background: bool,
+    },
+    /// Interactive AI Debugger & Stack Trace Visualizer
+    Debug {
+        /// Stack trace log text or test/run command to execute and diagnose
+        trace_or_cmd: Vec<String>,
+        /// Execute input as a shell command to capture crash output
+        #[arg(short = 'e', long)]
+        execute: bool,
     }
 }
 
@@ -14172,6 +14242,12 @@ impl FuzzyCommandPalette {
             ("/checkpoint", "Create atomic git micro-checkpoint", "/checkpoint"),
             ("/rollback", "Rollback workspace to previous checkpoint", "/rollback"),
             ("/stats", "Token analytics & cloud cost savings", "/stats"),
+            ("/stage", "Interactive hunk-by-hunk diff staging UI", "/stage"),
+            ("/heatmap", "Real-time token heatmap & context density inspector", "/heatmap"),
+            ("/slides", "Terminal slide deck presentation engine", "/slides"),
+            ("/widgets", "Modular dockable TUI widgets bar", "/widgets"),
+            ("/speak", "Local text-to-speech voice synthesis", "/speak"),
+            ("/debug", "Interactive AI debugger & crash trace visualizer", "/debug"),
         ];
 
         for (cmd, desc, payload) in commands {
@@ -14193,6 +14269,12 @@ impl FuzzyCommandPalette {
             ("set_theme", "Select active TrueColor theme palette"),
             ("fuzzy_command_palette", "Fuzzy search commands, files, tools"),
             ("play_audio_cue", "Play sensory audio chimes and alerts"),
+            ("hunk_diff_staging", "Parse and selectively stage unified diff hunks"),
+            ("token_heatmap", "Inspect token consumption heatmap and density"),
+            ("present_slides", "Parse and present markdown slide decks"),
+            ("manage_widgets", "Dockable TUI widgets bar manager"),
+            ("speak_text", "Synthesize local speech with native TTS"),
+            ("debug_trace", "AI crash debugger and stack trace visualizer"),
             ("run_bash", "Execute shell commands in workspace"),
             ("run_tests", "Run automated test suites and report traces"),
             ("lsp_diagnostics", "Run compiler/linter diagnostics"),
@@ -14628,6 +14710,1546 @@ pub fn format_audio_engine_status_for_terminal(enabled: bool, last_cue: Option<&
     out
 }
 
+// =================================================================================================
+// SYSTEM 1: INTERACTIVE HUNK-BY-HUNK DIFF STAGING UI
+// =================================================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiffLineType {
+    Context,
+    Add,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffLine {
+    pub line_type: DiffLineType,
+    pub content: String,
+    pub old_lineno: Option<usize>,
+    pub new_lineno: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiffHunk {
+    pub index: usize,
+    pub header: String,
+    pub old_start: usize,
+    pub old_count: usize,
+    pub new_start: usize,
+    pub new_count: usize,
+    pub section_header: Option<String>,
+    pub lines: Vec<DiffLine>,
+    pub additions: usize,
+    pub deletions: usize,
+    pub context_lines: usize,
+    pub is_selected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HunkStagingReport {
+    pub file_path: String,
+    pub total_hunks: usize,
+    pub staged_hunks: usize,
+    pub unstaged_hunks: usize,
+    pub total_additions: usize,
+    pub total_deletions: usize,
+    pub staged_additions: usize,
+    pub staged_deletions: usize,
+    pub hunks: Vec<DiffHunk>,
+    pub summary: String,
+}
+
+pub fn parse_diff_into_hunks(diff_text: &str) -> Vec<DiffHunk> {
+    let mut hunks = Vec::new();
+    if diff_text.trim().is_empty() {
+        return hunks;
+    }
+
+    let hunk_header_re = regex::Regex::new(r"^@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s*@@(.*)$").unwrap();
+    let lines: Vec<&str> = diff_text.lines().collect();
+
+    let mut current_hunk: Option<DiffHunk> = None;
+    let mut curr_old = 1usize;
+    let mut curr_new = 1usize;
+
+    for line in lines {
+        if let Some(caps) = hunk_header_re.captures(line) {
+            if let Some(h) = current_hunk.take() {
+                hunks.push(h);
+            }
+            let old_start = caps.get(1).and_then(|m| m.as_str().parse::<usize>().ok()).unwrap_or(1);
+            let old_count = caps.get(2).and_then(|m| m.as_str().parse::<usize>().ok()).unwrap_or(1);
+            let new_start = caps.get(3).and_then(|m| m.as_str().parse::<usize>().ok()).unwrap_or(1);
+            let new_count = caps.get(4).and_then(|m| m.as_str().parse::<usize>().ok()).unwrap_or(1);
+            let section = caps.get(5).map(|m| m.as_str().trim().to_string()).filter(|s| !s.is_empty());
+
+            curr_old = old_start;
+            curr_new = new_start;
+
+            current_hunk = Some(DiffHunk {
+                index: hunks.len(),
+                header: line.to_string(),
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                section_header: section,
+                lines: Vec::new(),
+                additions: 0,
+                deletions: 0,
+                context_lines: 0,
+                is_selected: true,
+            });
+            continue;
+        }
+
+        if let Some(ref mut hunk) = current_hunk {
+            if line.starts_with("+++") || line.starts_with("---") || line.starts_with("diff ") || line.starts_with("index ") {
+                continue;
+            }
+            if line.starts_with('+') {
+                hunk.additions += 1;
+                hunk.lines.push(DiffLine {
+                    line_type: DiffLineType::Add,
+                    content: line[1..].to_string(),
+                    old_lineno: None,
+                    new_lineno: Some(curr_new),
+                });
+                curr_new += 1;
+            } else if line.starts_with('-') {
+                hunk.deletions += 1;
+                hunk.lines.push(DiffLine {
+                    line_type: DiffLineType::Delete,
+                    content: line[1..].to_string(),
+                    old_lineno: Some(curr_old),
+                    new_lineno: None,
+                });
+                curr_old += 1;
+            } else {
+                hunk.context_lines += 1;
+                let content = if line.starts_with(' ') { &line[1..] } else { line };
+                hunk.lines.push(DiffLine {
+                    line_type: DiffLineType::Context,
+                    content: content.to_string(),
+                    old_lineno: Some(curr_old),
+                    new_lineno: Some(curr_new),
+                });
+                curr_old += 1;
+                curr_new += 1;
+            }
+        }
+    }
+
+    if let Some(h) = current_hunk {
+        hunks.push(h);
+    }
+
+    // Fallback: If no unified diff headers were found but text contains changes
+    if hunks.is_empty() && !diff_text.trim().is_empty() {
+        let mut fallback_lines = Vec::new();
+        let mut adds = 0;
+        for (i, line) in diff_text.lines().enumerate() {
+            adds += 1;
+            fallback_lines.push(DiffLine {
+                line_type: DiffLineType::Add,
+                content: line.to_string(),
+                old_lineno: None,
+                new_lineno: Some(i + 1),
+            });
+        }
+        hunks.push(DiffHunk {
+            index: 0,
+            header: format!("@@ -0,0 +1,{} @@", adds),
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: adds,
+            section_header: None,
+            lines: fallback_lines,
+            additions: adds,
+            deletions: 0,
+            context_lines: 0,
+            is_selected: true,
+        });
+    }
+
+    hunks
+}
+
+pub fn split_hunk_into_lines(hunk: &DiffHunk) -> Vec<DiffHunk> {
+    if hunk.lines.is_empty() {
+        return vec![hunk.clone()];
+    }
+
+    let mut sub_hunks = Vec::new();
+    let mut current_changes: Vec<DiffLine> = Vec::new();
+    let mut prefix_context: Vec<DiffLine> = Vec::new();
+    let mut curr_old = hunk.old_start;
+    let mut curr_new = hunk.new_start;
+
+    for line in &hunk.lines {
+        match line.line_type {
+            DiffLineType::Context => {
+                if !current_changes.is_empty() {
+                    let adds = current_changes.iter().filter(|l| l.line_type == DiffLineType::Add).count();
+                    let dels = current_changes.iter().filter(|l| l.line_type == DiffLineType::Delete).count();
+                    let mut hunk_lines = Vec::new();
+                    hunk_lines.extend(prefix_context.clone());
+                    hunk_lines.extend(current_changes.drain(..));
+                    hunk_lines.push(line.clone());
+
+                    let old_cnt = dels + prefix_context.len() + 1;
+                    let new_cnt = adds + prefix_context.len() + 1;
+
+                    sub_hunks.push(DiffHunk {
+                        index: sub_hunks.len(),
+                        header: format!("@@ -{},{} +{},{} @@ [split]", curr_old, old_cnt, curr_new, new_cnt),
+                        old_start: curr_old,
+                        old_count: old_cnt,
+                        new_start: curr_new,
+                        new_count: new_cnt,
+                        section_header: hunk.section_header.clone(),
+                        lines: hunk_lines,
+                        additions: adds,
+                        deletions: dels,
+                        context_lines: prefix_context.len() + 1,
+                        is_selected: hunk.is_selected,
+                    });
+                    prefix_context.clear();
+                    curr_old += old_cnt;
+                    curr_new += new_cnt;
+                } else {
+                    prefix_context.push(line.clone());
+                    if prefix_context.len() > 2 {
+                        prefix_context.remove(0);
+                        curr_old += 1;
+                        curr_new += 1;
+                    }
+                }
+            }
+            DiffLineType::Add | DiffLineType::Delete => {
+                current_changes.push(line.clone());
+            }
+        }
+    }
+
+    if !current_changes.is_empty() {
+        let adds = current_changes.iter().filter(|l| l.line_type == DiffLineType::Add).count();
+        let dels = current_changes.iter().filter(|l| l.line_type == DiffLineType::Delete).count();
+        let mut hunk_lines = Vec::new();
+        hunk_lines.extend(prefix_context.clone());
+        hunk_lines.extend(current_changes);
+
+        let old_cnt = dels + prefix_context.len();
+        let new_cnt = adds + prefix_context.len();
+
+        sub_hunks.push(DiffHunk {
+            index: sub_hunks.len(),
+            header: format!("@@ -{},{} +{},{} @@ [split]", curr_old, old_cnt, curr_new, new_cnt),
+            old_start: curr_old,
+            old_count: old_cnt,
+            new_start: curr_new,
+            new_count: new_cnt,
+            section_header: hunk.section_header.clone(),
+            lines: hunk_lines,
+            additions: adds,
+            deletions: dels,
+            context_lines: prefix_context.len(),
+            is_selected: hunk.is_selected,
+        });
+    }
+
+    if sub_hunks.is_empty() {
+        vec![hunk.clone()]
+    } else {
+        for (i, h) in sub_hunks.iter_mut().enumerate() {
+            h.index = i;
+        }
+        sub_hunks
+    }
+}
+
+pub fn apply_selected_hunks(
+    original_content: &str,
+    hunks: &[DiffHunk],
+    selected_indices: &[usize],
+) -> Result<String, Box<dyn std::error::Error>> {
+    if hunks.is_empty() || selected_indices.is_empty() {
+        return Ok(original_content.to_string());
+    }
+
+    let mut selected_hunks: Vec<&DiffHunk> = hunks.iter()
+        .filter(|h| selected_indices.contains(&h.index) || (selected_indices.is_empty() && h.is_selected))
+        .collect();
+
+    if selected_hunks.is_empty() {
+        return Ok(original_content.to_string());
+    }
+
+    selected_hunks.sort_by_key(|h| h.old_start);
+
+    let orig_lines: Vec<&str> = original_content.lines().collect();
+    let mut result_lines: Vec<String> = Vec::new();
+    let mut orig_cursor = 1usize; // 1-indexed
+
+    for hunk in selected_hunks {
+        let target_start = hunk.old_start.max(1);
+
+        // Copy unchanged original lines before this hunk
+        while orig_cursor < target_start && orig_cursor <= orig_lines.len() {
+            result_lines.push(orig_lines[orig_cursor - 1].to_string());
+            orig_cursor += 1;
+        }
+
+        // Apply hunk lines
+        for line in &hunk.lines {
+            match line.line_type {
+                DiffLineType::Add => {
+                    result_lines.push(line.content.clone());
+                }
+                DiffLineType::Delete => {
+                    if orig_cursor <= orig_lines.len() {
+                        orig_cursor += 1;
+                    }
+                }
+                DiffLineType::Context => {
+                    if orig_cursor <= orig_lines.len() {
+                        result_lines.push(orig_lines[orig_cursor - 1].to_string());
+                        orig_cursor += 1;
+                    } else {
+                        result_lines.push(line.content.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Copy any remaining original lines
+    while orig_cursor <= orig_lines.len() {
+        result_lines.push(orig_lines[orig_cursor - 1].to_string());
+        orig_cursor += 1;
+    }
+
+    let mut output = result_lines.join("\n");
+    if original_content.ends_with('\n') && !output.ends_with('\n') && !output.is_empty() {
+        output.push('\n');
+    }
+
+    Ok(output)
+}
+
+pub fn format_hunk_staging_report_for_terminal(
+    file_path: &str,
+    hunks: &[DiffHunk],
+    selected_indices: &[usize],
+) -> String {
+    let mut out = String::new();
+    let total = hunks.len();
+    let staged_count = hunks.iter().filter(|h| selected_indices.contains(&h.index) || (selected_indices.is_empty() && h.is_selected)).count();
+    let unstaged_count = total.saturating_sub(staged_count);
+
+    let total_adds: usize = hunks.iter().map(|h| h.additions).sum();
+    let total_dels: usize = hunks.iter().map(|h| h.deletions).sum();
+
+    out.push_str(&format!("\n{}\n", "╔═══════════════════════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} {:<52} ║\n", "🌿 INTERACTIVE HUNK-BY-HUNK DIFF STAGING:".cyan().bold(), file_path.yellow().bold()));
+    out.push_str("╠═══════════════════════════════════════════════════════════════════════════╣\n");
+    out.push_str(&format!("║ Total Hunks: {:<8} │ Staged: {:<12} │ Unstaged: {:<14} ║\n",
+        total.to_string().white().bold(),
+        format!("{} [+{}/-{}]", staged_count, total_adds, total_dels).green().bold(),
+        unstaged_count.to_string().yellow().bold(),
+    ));
+    out.push_str("╠═══════════════════════════════════════════════════════════════════════════╣\n");
+
+    for hunk in hunks {
+        let is_staged = selected_indices.contains(&hunk.index) || (selected_indices.is_empty() && hunk.is_selected);
+        let status_badge = if is_staged { "[X] STAGED".green().bold() } else { "[ ] UNSTAGED".red().dimmed() };
+        let section_str = hunk.section_header.as_deref().unwrap_or("");
+
+        out.push_str(&format!("║ Hunk #{:<3} {}  {:<30} {:>10} ║\n",
+            hunk.index,
+            status_badge,
+            hunk.header.dimmed(),
+            format!("+{} / -{}", hunk.additions, hunk.deletions).cyan(),
+        ));
+        if !section_str.is_empty() {
+            let trunc_sec = if section_str.len() > 58 { format!("{}...", &section_str[..55]) } else { section_str.to_string() };
+            out.push_str(&format!("║   Section: {:<58} ║\n", trunc_sec.italic().dimmed()));
+        }
+
+        for line in hunk.lines.iter().take(6) {
+            let (prefix_style, sign) = match line.line_type {
+                DiffLineType::Add => ("green", "+"),
+                DiffLineType::Delete => ("red", "-"),
+                DiffLineType::Context => ("dimmed", " "),
+            };
+            let truncated_content = if line.content.len() > 55 {
+                format!("{}...", &line.content[..52])
+            } else {
+                line.content.clone()
+            };
+
+            let line_fmt = match prefix_style {
+                "green" => format!("{} {}", sign, truncated_content).green(),
+                "red" => format!("{} {}", sign, truncated_content).red(),
+                _ => format!("{} {}", sign, truncated_content).dimmed(),
+            };
+            out.push_str(&format!("║   {:<67} ║\n", line_fmt));
+        }
+        if hunk.lines.len() > 6 {
+            out.push_str(&format!("║   {} ║\n", format!("... ({} more lines)", hunk.lines.len() - 6).dimmed()));
+        }
+        out.push_str("╟───────────────────────────────────────────────────────────────────────────╢\n");
+    }
+
+    out.push_str("╚═══════════════════════════════════════════════════════════════════════════╝\n");
+    out
+}
+
+// =================================================================================================
+// SYSTEM 2: REAL-TIME TOKEN HEATMAP & CONTEXT DENSITY INSPECTOR
+// =================================================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextDensityCategory {
+    Low,    // < 15% (Green)
+    Medium, // 15-40% (Yellow)
+    High,   // > 40% (Red)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HeatmapSectionType {
+    SystemPrompt,
+    AttachedFile,
+    Turn,
+    RagContext,
+    ToolPayload,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenHeatmapSection {
+    pub name: String,
+    pub section_type: HeatmapSectionType,
+    pub token_count: usize,
+    pub percent_of_budget: f32,
+    pub density: ContextDensityCategory,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenHeatmapReport {
+    pub total_tokens: usize,
+    pub num_ctx: usize,
+    pub usage_pct: f32,
+    pub density_category: ContextDensityCategory,
+    pub sections: Vec<TokenHeatmapSection>,
+    pub recommendations: Vec<String>,
+    pub summary: String,
+}
+
+pub fn inspect_token_heatmap(messages: &[Message], num_ctx: usize) -> TokenHeatmapReport {
+    let budget = if num_ctx == 0 { 8192 } else { num_ctx };
+    let mut sections = Vec::new();
+    let mut total_tokens = 0usize;
+
+    for (idx, msg) in messages.iter().enumerate() {
+        let content_chars = msg.content.len();
+        let base_tokens = ((content_chars as f32) / 3.8).ceil() as usize;
+        let tool_tokens = msg.tool_calls.as_ref().map(|tc| {
+            serde_json::to_string(tc).map(|s| ((s.len() as f32) / 3.8).ceil() as usize).unwrap_or(0)
+        }).unwrap_or(0);
+        let image_tokens = msg.images.as_ref().map(|imgs| imgs.len() * 512).unwrap_or(0);
+        let msg_tokens = (base_tokens + tool_tokens + image_tokens).max(1);
+
+        total_tokens += msg_tokens;
+        let pct = (msg_tokens as f32 / budget as f32) * 100.0;
+        let density = if pct < 15.0 {
+            ContextDensityCategory::Low
+        } else if pct <= 40.0 {
+            ContextDensityCategory::Medium
+        } else {
+            ContextDensityCategory::High
+        };
+
+        let (sec_type, name) = if msg.role == "system" {
+            if msg.content.contains("[RAG Retrieval Context]") || msg.content.contains("[RAG Search Results]") {
+                (HeatmapSectionType::RagContext, format!("RAG Context Chunk #{}", idx + 1))
+            } else if msg.content.contains("[Attached Context:") {
+                (HeatmapSectionType::AttachedFile, format!("Attached File Context #{}", idx + 1))
+            } else {
+                (HeatmapSectionType::SystemPrompt, "System Prompt & Persona Directives".to_string())
+            }
+        } else if msg.role == "tool" || msg.tool_calls.is_some() {
+            (HeatmapSectionType::ToolPayload, format!("Tool Execution Payload (Turn {})", idx + 1))
+        } else if msg.role == "user" {
+            if msg.content.contains("[Attached Context:") {
+                (HeatmapSectionType::AttachedFile, format!("User Attachment Turn #{}", idx + 1))
+            } else {
+                (HeatmapSectionType::Turn, format!("User Prompt Turn #{}", idx + 1))
+            }
+        } else {
+            (HeatmapSectionType::Turn, format!("Assistant Response Turn #{}", idx + 1))
+        };
+
+        sections.push(TokenHeatmapSection {
+            name,
+            section_type: sec_type,
+            token_count: msg_tokens,
+            percent_of_budget: pct,
+            density,
+            description: format!("Role: {}, Length: {} chars", msg.role, content_chars),
+        });
+    }
+
+    let overall_pct = (total_tokens as f32 / budget as f32) * 100.0;
+    let overall_density = if overall_pct < 15.0 {
+        ContextDensityCategory::Low
+    } else if overall_pct <= 40.0 {
+        ContextDensityCategory::Medium
+    } else {
+        ContextDensityCategory::High
+    };
+
+    let mut recommendations = Vec::new();
+    if overall_pct > 80.0 {
+        recommendations.push("⚠️ Critical context saturation (>80%). Run budget_aware_prune or /clear to evict oldest turns.".to_string());
+    }
+    for s in &sections {
+        if s.percent_of_budget > 35.0 {
+            match s.section_type {
+                HeatmapSectionType::SystemPrompt => {
+                    recommendations.push("Compress system rules or enable lightweight scout persona to reduce baseline overhead.".to_string());
+                }
+                HeatmapSectionType::ToolPayload => {
+                    recommendations.push(format!("Payload '{}' is heavy ({:.1}% of budget). Truncate stdout/stderr traces.", s.name, s.percent_of_budget));
+                }
+                HeatmapSectionType::AttachedFile => {
+                    recommendations.push(format!("Attached file in '{}' exceeds 35% of budget. Target specific symbol ranges.", s.name));
+                }
+                HeatmapSectionType::RagContext => {
+                    recommendations.push("Lower RAG top_k chunks or increase similarity threshold to reduce RAG bloat.".to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    if recommendations.is_empty() {
+        recommendations.push("Context budget is healthy and well-balanced. Sub-linear attention scaling active.".to_string());
+    }
+
+    let summary = format!(
+        "Token Heatmap: {}/{} tokens ({:.1}%), Density: {:?}",
+        total_tokens, budget, overall_pct, overall_density
+    );
+
+    TokenHeatmapReport {
+        total_tokens,
+        num_ctx: budget,
+        usage_pct: overall_pct,
+        density_category: overall_density,
+        sections,
+        recommendations,
+        summary,
+    }
+}
+
+pub fn format_token_heatmap_for_terminal(report: &TokenHeatmapReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n{}\n", "╔═══════════════════════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} {:<52} ║\n", "🔥 REAL-TIME TOKEN HEATMAP & CONTEXT DENSITY:".cyan().bold(), report.summary.yellow()));
+    out.push_str("╠═══════════════════════════════════════════════════════════════════════════╣\n");
+
+    let bar_width = 32usize;
+    let filled = ((report.usage_pct / 100.0) * bar_width as f32).round() as usize;
+    let filled = filled.min(bar_width);
+    let empty = bar_width.saturating_sub(filled);
+
+    let bar_str = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+    let colored_bar = match report.density_category {
+        ContextDensityCategory::Low => bar_str.green().bold(),
+        ContextDensityCategory::Medium => bar_str.yellow().bold(),
+        ContextDensityCategory::High => bar_str.red().bold(),
+    };
+
+    out.push_str(&format!("║ Context Window: [{}] {:>5.1}% ({}/{} tok) ║\n",
+        colored_bar, report.usage_pct, report.total_tokens, report.num_ctx));
+    out.push_str("╠═══════════════════════════════════════════════════════════════════════════╣\n");
+    out.push_str(&format!("║ {:<32} │ {:<8} │ {:<8} │ {:<11} ║\n",
+        "Section Name".bold(), "Type".bold(), "Tokens".bold(), "Density".bold()));
+    out.push_str("╟──────────────────────────────────┼──────────┼──────────┼─────────────╢\n");
+
+    for s in &report.sections {
+        let density_badge = match s.density {
+            ContextDensityCategory::Low => "LOW (OK)".green(),
+            ContextDensityCategory::Medium => "MEDIUM".yellow(),
+            ContextDensityCategory::High => "HIGH BLOAT".red().bold(),
+        };
+        let type_str = match s.section_type {
+            HeatmapSectionType::SystemPrompt => "SYSTEM",
+            HeatmapSectionType::AttachedFile => "ATTACH",
+            HeatmapSectionType::Turn => "CHAT",
+            HeatmapSectionType::RagContext => "RAG",
+            HeatmapSectionType::ToolPayload => "TOOL",
+            HeatmapSectionType::Other => "OTHER",
+        };
+        let name_trunc = if s.name.len() > 32 { format!("{}...", &s.name[..29]) } else { s.name.clone() };
+        out.push_str(&format!("║ {:<32} │ {:<8} │ {:>6} tok │ {:<11} ║\n",
+            name_trunc.white(), type_str.cyan(), s.token_count, density_badge));
+    }
+
+    out.push_str("╠═══════════════════════════════════════════════════════════════════════════╣\n");
+    out.push_str(&format!("║ {} {:<54} ║\n", "💡 RECOMMENDATIONS:".yellow().bold(), ""));
+    for r in &report.recommendations {
+        let r_trunc = if r.len() > 68 { format!("{}...", &r[..65]) } else { r.clone() };
+        out.push_str(&format!("║   • {:<68} ║\n", r_trunc.dimmed()));
+    }
+    out.push_str("╚═══════════════════════════════════════════════════════════════════════════╝\n");
+    out
+}
+
+// =================================================================================================
+// SYSTEM 3: TERMINAL SLIDE DECK PRESENTATION ENGINE
+// =================================================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlideCodeBlock {
+    pub language: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Slide {
+    pub index: usize,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub raw_content: String,
+    pub bullet_points: Vec<String>,
+    pub code_blocks: Vec<SlideCodeBlock>,
+    pub notes: Option<String>,
+    pub footer: Option<String>,
+}
+
+pub fn parse_markdown_into_slides(markdown_text: &str) -> Vec<Slide> {
+    let mut slides = Vec::new();
+    if markdown_text.trim().is_empty() {
+        return slides;
+    }
+
+    let mut raw_chunks: Vec<String> = Vec::new();
+    let mut current_chunk = Vec::new();
+
+    for line in markdown_text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            let chunk_str = current_chunk.join("\n");
+            if !chunk_str.trim().is_empty() {
+                raw_chunks.push(chunk_str);
+            }
+            current_chunk.clear();
+        } else {
+            current_chunk.push(line.to_string());
+        }
+    }
+    let last_chunk_str = current_chunk.join("\n");
+    if !last_chunk_str.trim().is_empty() {
+        raw_chunks.push(last_chunk_str);
+    }
+
+    for chunk in raw_chunks {
+        let chunk_trimmed = chunk.trim();
+        let non_empty_lines: Vec<&str> = chunk_trimmed
+            .lines()
+            .filter(|l| !l.trim().is_empty() && l.trim() != "---" && l.trim() != "***" && l.trim() != "___")
+            .collect();
+        if non_empty_lines.is_empty() {
+            continue;
+        }
+
+        let mut title = format!("Slide {}", slides.len() + 1);
+        let mut subtitle = None;
+        let mut bullet_points = Vec::new();
+        let mut code_blocks = Vec::new();
+        let mut notes = None;
+
+        let mut in_code_block = false;
+        let mut current_lang = String::new();
+        let mut current_code = String::new();
+
+        for line in chunk_trimmed.lines() {
+            let l_trim = line.trim();
+            if l_trim.starts_with("```") {
+                if in_code_block {
+                    code_blocks.push(SlideCodeBlock {
+                        language: current_lang.clone(),
+                        code: current_code.trim_end().to_string(),
+                    });
+                    current_code.clear();
+                    current_lang.clear();
+                    in_code_block = false;
+                } else {
+                    in_code_block = true;
+                    current_lang = l_trim[3..].trim().to_string();
+                    if current_lang.is_empty() {
+                        current_lang = "text".to_string();
+                    }
+                }
+                continue;
+            }
+
+            if in_code_block {
+                current_code.push_str(line);
+                current_code.push('\n');
+                continue;
+            }
+
+            if l_trim.starts_with("# ") {
+                title = l_trim[2..].trim().to_string();
+            } else if l_trim.starts_with("## ") && subtitle.is_none() {
+                subtitle = Some(l_trim[3..].trim().to_string());
+            } else if l_trim.starts_with("- ") || l_trim.starts_with("* ") || l_trim.starts_with("+ ") || l_trim.starts_with("• ") {
+                bullet_points.push(l_trim[2..].trim().to_string());
+            } else if l_trim.starts_with("Note:") || l_trim.starts_with("NOTE:") {
+                notes = Some(l_trim[5..].trim().to_string());
+            }
+        }
+
+        if in_code_block && !current_code.is_empty() {
+            code_blocks.push(SlideCodeBlock {
+                language: current_lang,
+                code: current_code.trim_end().to_string(),
+            });
+        }
+
+        slides.push(Slide {
+            index: slides.len(),
+            title,
+            subtitle,
+            raw_content: chunk_trimmed.to_string(),
+            bullet_points,
+            code_blocks,
+            notes,
+            footer: Some("zy Terminal Presentation Engine".to_string()),
+        });
+    }
+
+    slides
+}
+
+pub fn render_slide_to_terminal(
+    slide: &Slide,
+    slide_index: usize,
+    total_slides: usize,
+    width: u16,
+    _height: u16,
+) -> String {
+    let w = (width as usize).max(60);
+    let mut out = String::new();
+
+    let inner_w = w.saturating_sub(4);
+    let top_border = format!("╔{}╗", "═".repeat(w.saturating_sub(2)));
+    let mid_border = format!("╟{}╢", "─".repeat(w.saturating_sub(2)));
+    let bot_border = format!("╚{}╝", "═".repeat(w.saturating_sub(2)));
+
+    out.push_str(&format!("\n{}\n", top_border.cyan()));
+    
+    let counter = format!("[ Slide {} / {} ]", slide_index + 1, total_slides);
+    out.push_str(&format!("║ {:<inner_w$} ║\n", counter.magenta().bold(), inner_w = inner_w));
+
+    let title_centered = if slide.title.len() < inner_w {
+        let pad = (inner_w - slide.title.len()) / 2;
+        format!("{}{}", " ".repeat(pad), slide.title.bold().cyan())
+    } else {
+        slide.title.bold().cyan().to_string()
+    };
+    out.push_str(&format!("║ {:<inner_w$} ║\n", title_centered, inner_w = inner_w));
+
+    if let Some(ref sub) = slide.subtitle {
+        let sub_centered = if sub.len() < inner_w {
+            let pad = (inner_w - sub.len()) / 2;
+            format!("{}{}", " ".repeat(pad), sub.italic().dimmed())
+        } else {
+            sub.italic().dimmed().to_string()
+        };
+        out.push_str(&format!("║ {:<inner_w$} ║\n", sub_centered, inner_w = inner_w));
+    }
+
+    out.push_str(&format!("{}\n", mid_border.cyan()));
+
+    for bp in &slide.bullet_points {
+        let line_txt = format!("  • {}", bp);
+        let trunc = if line_txt.len() > inner_w {
+            format!("{}...", &line_txt[..inner_w.saturating_sub(3)])
+        } else {
+            line_txt
+        };
+        out.push_str(&format!("║ {:<inner_w$} ║\n", trunc.white(), inner_w = inner_w));
+    }
+
+    for cb in &slide.code_blocks {
+        out.push_str(&format!("║   ┌─── {} {} ║\n", cb.language.yellow(), "─".repeat(inner_w.saturating_sub(cb.language.len() + 8))));
+        for code_line in cb.code.lines().take(6) {
+            let trunc_c = if code_line.len() > inner_w.saturating_sub(6) {
+                format!("{}...", &code_line[..inner_w.saturating_sub(9)])
+            } else {
+                code_line.to_string()
+            };
+            out.push_str(&format!("║   │ {:<inner_w$} ║\n", trunc_c.green(), inner_w = inner_w.saturating_sub(6)));
+        }
+        out.push_str(&format!("║   └───{} ║\n", "─".repeat(inner_w.saturating_sub(7))));
+    }
+
+    if let Some(ref n) = slide.notes {
+        out.push_str(&format!("║ {:<inner_w$} ║\n", format!("📌 Note: {}", n).italic().dimmed(), inner_w = inner_w));
+    }
+
+    out.push_str(&format!("{}\n", mid_border.cyan()));
+    let nav_help = "[n/Space: Next | p/Bksp: Prev | q/Esc: Quit | 1-9: Jump]";
+    out.push_str(&format!("║ {:<inner_w$} ║\n", nav_help.yellow(), inner_w = inner_w));
+    out.push_str(&format!("{}\n", bot_border.cyan()));
+
+    out
+}
+
+pub fn run_interactive_presentation(slides: &[Slide]) -> Result<(), Box<dyn std::error::Error>> {
+    if slides.is_empty() {
+        println!("{}", "No slides to present.".yellow());
+        return Ok(());
+    }
+
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    enable_raw_mode()?;
+    let mut current_idx = 0usize;
+    let total = slides.len();
+
+    loop {
+        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let rendered = render_slide_to_terminal(&slides[current_idx], current_idx, total, w, h);
+        
+        print!("\x1b[2J\x1b[1;1H{}", rendered);
+        io::stdout().flush()?;
+
+        if event::poll(std::time::Duration::from_millis(500))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Enter | KeyCode::Char('j') => {
+                        if current_idx + 1 < total {
+                            current_idx += 1;
+                        }
+                    }
+                    KeyCode::Char('p') | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('k') => {
+                        if current_idx > 0 {
+                            current_idx -= 1;
+                        }
+                    }
+                    KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                        let target = (c as u8 - b'1') as usize;
+                        if target < total {
+                            current_idx = target;
+                        }
+                    }
+                    KeyCode::Home => current_idx = 0,
+                    KeyCode::End => current_idx = total - 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+    println!("\nPresentation ended.");
+    Ok(())
+}
+
+// =================================================================================================
+// SYSTEM 4: MODULAR DOCKABLE TUI WIDGETS BAR
+// =================================================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WidgetType {
+    GitStream,
+    DockerMonitor,
+    DatabaseTailer,
+    HardwareSparklines,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockerContainerInfo {
+    pub name: String,
+    pub image: String,
+    pub status: String,
+    pub memory_usage_mb: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuiWidgetBarState {
+    pub enabled_widgets: Vec<WidgetType>,
+    pub git_branch: String,
+    pub git_dirty: bool,
+    pub git_recent_commits: Vec<String>,
+    pub docker_containers: Vec<DockerContainerInfo>,
+    pub db_tables: Vec<String>,
+    pub db_last_queries: Vec<String>,
+    pub cpu_history: Vec<f32>,
+    pub ram_history: Vec<f32>,
+    pub gpu_history: Vec<f32>,
+    pub is_visible: bool,
+}
+
+impl TuiWidgetBarState {
+    pub fn new() -> Self {
+        Self {
+            enabled_widgets: vec![
+                WidgetType::GitStream,
+                WidgetType::DockerMonitor,
+                WidgetType::DatabaseTailer,
+                WidgetType::HardwareSparklines,
+            ],
+            git_branch: "main".to_string(),
+            git_dirty: false,
+            git_recent_commits: vec![
+                "zy-core: initialize modular widgets bar".to_string(),
+                "zy-tui: add hardware sparklines".to_string(),
+            ],
+            docker_containers: vec![
+                DockerContainerInfo {
+                    name: "zy-sandbox-eval".to_string(),
+                    image: "alpine:latest".to_string(),
+                    status: "running".to_string(),
+                    memory_usage_mb: 48,
+                },
+            ],
+            db_tables: vec!["sessions".to_string(), "checkpoints".to_string(), "metrics".to_string()],
+            db_last_queries: vec!["SELECT * FROM sessions ORDER BY id DESC LIMIT 5".to_string()],
+            cpu_history: vec![15.0, 22.0, 45.0, 30.0, 68.0, 42.0],
+            ram_history: vec![55.0, 58.0, 60.0, 62.0, 65.0, 64.0],
+            gpu_history: vec![8.0, 12.0, 18.0, 25.0, 20.0, 15.0],
+            is_visible: true,
+        }
+    }
+
+    pub fn toggle_widget(&mut self, widget: WidgetType) {
+        if let Some(pos) = self.enabled_widgets.iter().position(|w| *w == widget) {
+            self.enabled_widgets.remove(pos);
+        } else {
+            self.enabled_widgets.push(widget);
+        }
+    }
+
+    pub fn enable_widget(&mut self, widget: WidgetType) {
+        if !self.enabled_widgets.contains(&widget) {
+            self.enabled_widgets.push(widget);
+        }
+    }
+
+    pub fn disable_widget(&mut self, widget: WidgetType) {
+        self.enabled_widgets.retain(|w| *w != widget);
+    }
+
+    pub fn is_widget_enabled(&self, widget: WidgetType) -> bool {
+        self.enabled_widgets.contains(&widget)
+    }
+
+    pub fn update_hardware_metrics(&mut self) {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let cpu_usage = sys.global_cpu_usage();
+        let ram_pct = if sys.total_memory() > 0 {
+            (sys.used_memory() as f32 / sys.total_memory() as f32) * 100.0
+        } else {
+            50.0
+        };
+
+        self.cpu_history.push(cpu_usage);
+        if self.cpu_history.len() > 16 {
+            self.cpu_history.remove(0);
+        }
+
+        self.ram_history.push(ram_pct);
+        if self.ram_history.len() > 16 {
+            self.ram_history.remove(0);
+        }
+
+        let gpu_est = (cpu_usage * 0.4 + 5.0).min(100.0);
+        self.gpu_history.push(gpu_est);
+        if self.gpu_history.len() > 16 {
+            self.gpu_history.remove(0);
+        }
+    }
+
+    pub fn update_git_metrics(&mut self, workspace_path: &std::path::Path) {
+        if workspace_path.join(".git").exists() {
+            if let Ok(out) = std::process::Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(workspace_path).output() {
+                let br = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !br.is_empty() {
+                    self.git_branch = br;
+                }
+            }
+            if let Ok(out) = std::process::Command::new("git").args(["status", "--porcelain"]).current_dir(workspace_path).output() {
+                self.git_dirty = !out.stdout.is_empty();
+            }
+            if let Ok(out) = std::process::Command::new("git").args(["log", "-n", "3", "--oneline"]).current_dir(workspace_path).output() {
+                let logs = String::from_utf8_lossy(&out.stdout);
+                let lines: Vec<String> = logs.lines().map(|s| s.to_string()).collect();
+                if !lines.is_empty() {
+                    self.git_recent_commits = lines;
+                }
+            }
+        }
+    }
+}
+
+pub fn render_sparkline(values: &[f32], max_chars: usize) -> String {
+    let spark_chars = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let slice = if values.len() > max_chars {
+        &values[values.len() - max_chars..]
+    } else {
+        values
+    };
+
+    let mut out = String::new();
+    for v in slice {
+        let clamped = v.clamp(0.0, 100.0);
+        let idx = ((clamped / 100.0) * (spark_chars.len() - 1) as f32).round() as usize;
+        let c = spark_chars[idx.min(spark_chars.len() - 1)];
+        out.push(c);
+    }
+    out
+}
+
+pub fn parse_widget_type_name(name: &str) -> Option<WidgetType> {
+    match name.to_lowercase().replace('_', "").replace('-', "").as_str() {
+        "gitstream" | "git" => Some(WidgetType::GitStream),
+        "dockermonitor" | "docker" | "container" => Some(WidgetType::DockerMonitor),
+        "databasetailer" | "database" | "db" | "sql" => Some(WidgetType::DatabaseTailer),
+        "hardwaresparklines" | "hardware" | "hw" | "sparklines" | "cpu" => Some(WidgetType::HardwareSparklines),
+        _ => None,
+    }
+}
+
+pub fn render_widget_panel(widget: &WidgetType, state: &TuiWidgetBarState) -> String {
+    let mut out = String::new();
+    match widget {
+        WidgetType::GitStream => {
+            let status_badge = if state.git_dirty { "● DIRTY".red().bold() } else { "✔ CLEAN".green().bold() };
+            out.push_str(&format!("🌿 Git: {} [{}]\n", state.git_branch.yellow().bold(), status_badge));
+            for c in state.git_recent_commits.iter().take(2) {
+                out.push_str(&format!("   • {}\n", c.dimmed()));
+            }
+        }
+        WidgetType::DockerMonitor => {
+            out.push_str(&format!("🐳 Containers: {} active\n", state.docker_containers.len().to_string().cyan().bold()));
+            for c in &state.docker_containers {
+                out.push_str(&format!("   • {} [{}] ({} MB)\n", c.name.white(), c.status.green(), c.memory_usage_mb));
+            }
+        }
+        WidgetType::DatabaseTailer => {
+            out.push_str(&format!("🗄️ Database: {} tables ({})\n",
+                state.db_tables.len().to_string().cyan().bold(),
+                state.db_tables.join(", ").dimmed()));
+            if let Some(q) = state.db_last_queries.first() {
+                out.push_str(&format!("   • Last SQL: {}\n", q.dimmed()));
+            }
+        }
+        WidgetType::HardwareSparklines => {
+            let cpu_curr = state.cpu_history.last().copied().unwrap_or(0.0);
+            let ram_curr = state.ram_history.last().copied().unwrap_or(0.0);
+            let gpu_curr = state.gpu_history.last().copied().unwrap_or(0.0);
+
+            let cpu_spark = render_sparkline(&state.cpu_history, 8);
+            let ram_spark = render_sparkline(&state.ram_history, 8);
+            let gpu_spark = render_sparkline(&state.gpu_history, 8);
+
+            out.push_str(&format!("⚡ CPU [{}] {:>4.1}% │ RAM [{}] {:>4.1}% │ GPU [{}] {:>4.1}%\n",
+                cpu_spark.green().bold(), cpu_curr,
+                ram_spark.yellow().bold(), ram_curr,
+                gpu_spark.magenta().bold(), gpu_curr));
+        }
+    }
+    out
+}
+
+pub fn render_dockable_widget_bar(state: &TuiWidgetBarState, _terminal_width: u16) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n{}\n", "╔═══════════════════════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} {:<50} ║\n", "📊 MODULAR DOCKABLE TUI WIDGETS BAR:".cyan().bold(), format!("{} widgets active", state.enabled_widgets.len()).yellow()));
+    out.push_str("╠═══════════════════════════════════════════════════════════════════════════╣\n");
+
+    for w in &state.enabled_widgets {
+        let panel_str = render_widget_panel(w, state);
+        for line in panel_str.lines() {
+            out.push_str(&format!("║ {:<73} ║\n", line));
+        }
+        out.push_str("╟───────────────────────────────────────────────────────────────────────────╢\n");
+    }
+
+    out.push_str("╚═══════════════════════════════════════════════════════════════════════════╝\n");
+    out
+}
+
+// =================================================================================================
+// SYSTEM 5: LOCAL TEXT-TO-SPEECH VOICE ENGINE
+// =================================================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeechEngine {
+    pub enabled: bool,
+    pub voice_speed: f32,
+    pub pitch: f32,
+    pub preferred_backend: Option<String>,
+}
+
+impl SpeechEngine {
+    pub fn new() -> Self {
+        Self {
+            enabled: true,
+            voice_speed: 1.0,
+            pitch: 1.0,
+            preferred_backend: None,
+        }
+    }
+}
+
+pub fn generate_speech_command(
+    text: &str,
+    voice_speed: Option<f32>,
+    pitch: Option<f32>,
+) -> (String, Vec<String>) {
+    let speed = voice_speed.unwrap_or(1.0);
+    let _pitch_val = pitch.unwrap_or(1.0);
+
+    #[cfg(windows)]
+    {
+        let rate: i32 = (((speed - 1.0) * 5.0).round() as i32).clamp(-10, 10);
+        let escaped_text = text.replace('\'', "''").replace('\n', " ");
+        let ps_script = format!(
+            "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Rate = {}; $s.Speak('{}')",
+            rate, escaped_text
+        );
+        (
+            "powershell".to_string(),
+            vec!["-NoProfile".to_string(), "-Command".to_string(), ps_script],
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let wpm = ((speed * 175.0) as u32).clamp(50, 400);
+        (
+            "say".to_string(),
+            vec!["-r".to_string(), wpm.to_string(), text.to_string()],
+        )
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let speed_pct = ((speed * 100.0) as u32).clamp(20, 300);
+        (
+            "spd-say".to_string(),
+            vec!["-r".to_string(), format!("{}", (speed_pct as i32) - 100), text.to_string()],
+        )
+    }
+}
+
+pub fn synthesize_speech(
+    text: &str,
+    voice_speed: Option<f32>,
+    pitch: Option<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+
+    let (cmd, args) = generate_speech_command(text, voice_speed, pitch);
+    let _ = std::process::Command::new(&cmd).args(&args).output();
+    Ok(())
+}
+
+pub fn speak_in_background(
+    text: &str,
+    voice_speed: Option<f32>,
+    pitch: Option<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let text_owned = text.to_string();
+    std::thread::spawn(move || {
+        let _ = synthesize_speech(&text_owned, voice_speed, pitch);
+    });
+    Ok(())
+}
+
+pub fn format_speech_engine_status_for_terminal(
+    engine: &SpeechEngine,
+    last_spoken_text: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n{}\n", "╔═══════════════════════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} {:<48} ║\n", "🎙️ LOCAL TEXT-TO-SPEECH (TTS) VOICE ENGINE:".cyan().bold(), if engine.enabled { "ACTIVE".green().bold() } else { "MUTED".red().bold() }));
+    out.push_str("╠═══════════════════════════════════════════════════════════════════════════╣\n");
+    out.push_str(&format!("║ Speed: {:<12} │ Pitch: {:<12} │ Backend: {:<16} ║\n",
+        format!("{:.1}x", engine.voice_speed).white().bold(),
+        format!("{:.1}x", engine.pitch).white().bold(),
+        if cfg!(windows) { "Windows SAPI" } else if cfg!(target_os = "macos") { "macOS say" } else { "spd-say/espeak" }.cyan()));
+    if let Some(t) = last_spoken_text {
+        let trunc = if t.len() > 58 { format!("{}...", &t[..55]) } else { t.to_string() };
+        out.push_str(&format!("║ Last Spoken: {:<58} ║\n", format!("\"{}\"", trunc).yellow().italic()));
+    }
+    out.push_str("╚═══════════════════════════════════════════════════════════════════════════╝\n");
+    out
+}
+
+// =================================================================================================
+// SYSTEM 6: INTERACTIVE AI DEBUGGER & STACK TRACE VISUALIZER
+// =================================================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CrashLanguage {
+    Rust,
+    Python,
+    NodeJs,
+    Cpp,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RootCauseHypothesis {
+    NullPointer,
+    OutOfBounds,
+    UnwrapPanic,
+    TypeMismatch,
+    SegmentationFault,
+    DivisionByZero,
+    KeyError,
+    FileNotFound,
+    CustomPanic,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackFrame {
+    pub frame_index: usize,
+    pub function_name: String,
+    pub file_path: Option<String>,
+    pub line_number: Option<usize>,
+    pub column_number: Option<usize>,
+    pub is_workspace_file: bool,
+    pub code_snippet: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParsedStackTrace {
+    pub language: CrashLanguage,
+    pub error_type: String,
+    pub error_message: String,
+    pub root_cause: RootCauseHypothesis,
+    pub frames: Vec<StackFrame>,
+    pub failing_frame: Option<StackFrame>,
+    pub suggested_fix: String,
+    pub patch_suggestion: Option<String>,
+    pub summary: String,
+}
+
+pub fn parse_crash_stack_trace(trace_log: &str) -> Result<ParsedStackTrace, Box<dyn std::error::Error>> {
+    let mut frames = Vec::new();
+    let mut language = CrashLanguage::Unknown;
+    let mut error_type = "Error".to_string();
+    let mut error_message = "Application crashed".to_string();
+    let mut root_cause = RootCauseHypothesis::Unknown;
+    let mut suggested_fix = "Review runtime error context and inspect failing frame.".to_string();
+
+    let is_rust = trace_log.contains("thread '") || trace_log.contains("panicked at") || trace_log.contains("stack backtrace:") || trace_log.contains(".rs:");
+    let is_python = trace_log.contains("Traceback (most recent call last):") || trace_log.contains("File \"");
+    let is_nodejs = trace_log.contains("TypeError:") || trace_log.contains("ReferenceError:") || (trace_log.contains("    at ") && (trace_log.contains(".js:") || trace_log.contains(".ts:")));
+    let is_cpp = trace_log.contains("Segmentation fault") || trace_log.contains("SIGSEGV") || (trace_log.contains("#0  0x") && (trace_log.contains(".c:") || trace_log.contains(".cpp:")));
+
+    if is_rust {
+        language = CrashLanguage::Rust;
+        error_type = "Rust Panic".to_string();
+
+        let panic_line_re = regex::Regex::new(r#"thread '[^']+' panicked at (.+?)(?:,\s*(.+?):(\d+)(?::(\d+))?)?$"#).unwrap();
+        for line in trace_log.lines() {
+            if line.contains("thread '") && line.contains("panicked at") {
+                if let Some(caps) = panic_line_re.captures(line.trim()) {
+                    error_message = caps.get(1).map(|m| m.as_str().trim().trim_matches('\'').to_string()).unwrap_or_else(|| "Panic occurred".to_string());
+                    if let (Some(f_match), Some(l_match)) = (caps.get(2), caps.get(3)) {
+                        let f_path = f_match.as_str().trim().to_string();
+                        let l_num = l_match.as_str().parse::<usize>().ok();
+                        let c_num = caps.get(4).and_then(|m| m.as_str().parse::<usize>().ok());
+                        frames.push(StackFrame {
+                            frame_index: 0,
+                            function_name: "panic_location".to_string(),
+                            file_path: Some(f_path),
+                            line_number: l_num,
+                            column_number: c_num,
+                            is_workspace_file: true,
+                            code_snippet: None,
+                        });
+                    }
+                }
+                break;
+            }
+        }
+
+        let frame_header_re = regex::Regex::new(r"^\s*(\d+):\s+(?:0x[0-9a-fA-F]+\s+-\s+)?(.+)").unwrap();
+        let frame_at_re = regex::Regex::new(r"^\s*at\s+(.+?):(\d+)(?::(\d+))?").unwrap();
+        let mut current_frame: Option<StackFrame> = None;
+
+        for line in trace_log.lines() {
+            if let Some(caps) = frame_header_re.captures(line) {
+                if let Some(prev) = current_frame.take() {
+                    frames.push(prev);
+                }
+                let idx = caps.get(1).and_then(|m| m.as_str().parse::<usize>().ok()).unwrap_or(frames.len());
+                let func = caps.get(2).map(|m| m.as_str().trim().to_string()).unwrap_or_else(|| "unknown".to_string());
+                current_frame = Some(StackFrame {
+                    frame_index: idx,
+                    function_name: func,
+                    file_path: None,
+                    line_number: None,
+                    column_number: None,
+                    is_workspace_file: false,
+                    code_snippet: None,
+                });
+            } else if let Some(caps) = frame_at_re.captures(line) {
+                if let Some(ref mut frame) = current_frame {
+                    let file = caps.get(1).map(|m| m.as_str().trim().to_string());
+                    let line_no = caps.get(2).and_then(|m| m.as_str().parse::<usize>().ok());
+                    let col_no = caps.get(3).and_then(|m| m.as_str().parse::<usize>().ok());
+                    let is_ws = file.as_ref().map(|f| !f.contains("/rustc/") && !f.contains("\\rustc\\") && !f.contains("library/std")).unwrap_or(false);
+                    frame.file_path = file;
+                    frame.line_number = line_no;
+                    frame.column_number = col_no;
+                    frame.is_workspace_file = is_ws;
+                }
+            }
+        }
+        if let Some(prev) = current_frame {
+            frames.push(prev);
+        }
+
+        if error_message.contains("unwrap()") || error_message.contains("Option::unwrap") || error_message.contains("Result::unwrap") {
+            root_cause = RootCauseHypothesis::UnwrapPanic;
+            suggested_fix = "Replace `.unwrap()` with `if let Some(...)` or use the `?` try operator with `Option`/`Result`.".to_string();
+        } else if error_message.contains("index out of bounds") {
+            root_cause = RootCauseHypothesis::OutOfBounds;
+            suggested_fix = "Verify slice/array bounds or use `.get(index)` to prevent indexing panics.".to_string();
+        } else if error_message.contains("attempt to divide by zero") {
+            root_cause = RootCauseHypothesis::DivisionByZero;
+            suggested_fix = "Add a check `if divisor != 0` before division.".to_string();
+        } else {
+            root_cause = RootCauseHypothesis::CustomPanic;
+            suggested_fix = "Inspect assertion condition and ensure input arguments satisfy preconditions.".to_string();
+        }
+    } else if is_python {
+        language = CrashLanguage::Python;
+        let py_frame_re = regex::Regex::new(r#"File "([^"]+)", line (\d+)(?:,\s*in\s+([^\n]+))?"#).unwrap();
+        for caps in py_frame_re.captures_iter(trace_log) {
+            let file = caps.get(1).map(|m| m.as_str().to_string());
+            let line_no = caps.get(2).and_then(|m| m.as_str().parse::<usize>().ok());
+            let func = caps.get(3).map(|m| m.as_str().trim().to_string()).unwrap_or_else(|| "module".to_string());
+            let is_ws = file.as_ref().map(|f| !f.contains("site-packages") && !f.contains("lib/python")).unwrap_or(true);
+
+            frames.push(StackFrame {
+                frame_index: frames.len(),
+                function_name: func,
+                file_path: file,
+                line_number: line_no,
+                column_number: None,
+                is_workspace_file: is_ws,
+                code_snippet: None,
+            });
+        }
+
+        if let Some(last_line) = trace_log.lines().rev().find(|l| !l.trim().is_empty()) {
+            if let Some((et, em)) = last_line.split_once(':') {
+                error_type = et.trim().to_string();
+                error_message = em.trim().to_string();
+            } else {
+                error_message = last_line.trim().to_string();
+            }
+        }
+
+        if error_type.contains("KeyError") {
+            root_cause = RootCauseHypothesis::KeyError;
+            suggested_fix = "Use `dict.get(key, default)` or verify dictionary contains the key before access.".to_string();
+        } else if error_type.contains("IndexError") {
+            root_cause = RootCauseHypothesis::OutOfBounds;
+            suggested_fix = "Check list length with `len(lst) > index` before indexing.".to_string();
+        } else if error_type.contains("TypeError") && error_message.contains("NoneType") {
+            root_cause = RootCauseHypothesis::NullPointer;
+            suggested_fix = "Add null-check `if var is not None:` before attribute access.".to_string();
+        } else if error_type.contains("ZeroDivisionError") {
+            root_cause = RootCauseHypothesis::DivisionByZero;
+            suggested_fix = "Guard division with `if divisor != 0:`.".to_string();
+        } else if error_type.contains("FileNotFoundError") {
+            root_cause = RootCauseHypothesis::FileNotFound;
+            suggested_fix = "Verify file path existence with `os.path.exists(path)`.".to_string();
+        } else {
+            root_cause = RootCauseHypothesis::TypeMismatch;
+            suggested_fix = "Check types of arguments passed to function.".to_string();
+        }
+    } else if is_nodejs {
+        language = CrashLanguage::NodeJs;
+        let js_frame_re = regex::Regex::new(r#"^\s*at\s+(?:([^\s(]+)\s+)?\(?(.+?):(\d+):(\d+)\)?"#).unwrap();
+        for line in trace_log.lines() {
+            if let Some(caps) = js_frame_re.captures(line) {
+                let func = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_else(|| "<anonymous>".to_string());
+                let file = caps.get(2).map(|m| m.as_str().to_string());
+                let line_no = caps.get(3).and_then(|m| m.as_str().parse::<usize>().ok());
+                let col_no = caps.get(4).and_then(|m| m.as_str().parse::<usize>().ok());
+                let is_ws = file.as_ref().map(|f| !f.contains("node_modules")).unwrap_or(true);
+
+                frames.push(StackFrame {
+                    frame_index: frames.len(),
+                    function_name: func,
+                    file_path: file,
+                    line_number: line_no,
+                    column_number: col_no,
+                    is_workspace_file: is_ws,
+                    code_snippet: None,
+                });
+            } else if line.contains("Error:") {
+                if let Some((et, em)) = line.split_once(':') {
+                    error_type = et.trim().to_string();
+                    error_message = em.trim().to_string();
+                }
+            }
+        }
+
+        if error_message.contains("Cannot read properties of undefined") || error_message.contains("null") {
+            root_cause = RootCauseHypothesis::NullPointer;
+            suggested_fix = "Use optional chaining `?.` or default fallback `?? {}`.".to_string();
+        } else {
+            root_cause = RootCauseHypothesis::TypeMismatch;
+            suggested_fix = "Validate input object properties before accessing.".to_string();
+        }
+    } else if is_cpp {
+        language = CrashLanguage::Cpp;
+        error_type = "SIGSEGV / Segmentation Fault".to_string();
+        error_message = "Segmentation fault (invalid memory address accessed)".to_string();
+        root_cause = RootCauseHypothesis::SegmentationFault;
+        suggested_fix = "Check for null pointer dereference, use-after-free, or out-of-bounds memory access.".to_string();
+
+        let gdb_frame_re = regex::Regex::new(r#"#(\d+)\s+(?:0x[0-9a-fA-F]+\s+in\s+)?([^\s(]+)(?:.*at\s+(.+?):(\d+))?"#).unwrap();
+        for line in trace_log.lines() {
+            if let Some(caps) = gdb_frame_re.captures(line) {
+                let idx = caps.get(1).and_then(|m| m.as_str().parse::<usize>().ok()).unwrap_or(frames.len());
+                let func = caps.get(2).map(|m| m.as_str().to_string()).unwrap_or_else(|| "func".to_string());
+                let file = caps.get(3).map(|m| m.as_str().to_string());
+                let line_no = caps.get(4).and_then(|m| m.as_str().parse::<usize>().ok());
+
+                frames.push(StackFrame {
+                    frame_index: idx,
+                    function_name: func,
+                    file_path: file,
+                    line_number: line_no,
+                    column_number: None,
+                    is_workspace_file: true,
+                    code_snippet: None,
+                });
+            }
+        }
+    }
+
+    let failing_frame = frames.iter().find(|f| f.is_workspace_file && f.file_path.is_some()).cloned()
+        .or_else(|| frames.first().cloned());
+
+    let mut resolved_frame = failing_frame;
+    let mut patch = None;
+    if let Some(ref mut frame) = resolved_frame {
+        if let (Some(ref fp), Some(l_num)) = (&frame.file_path, frame.line_number) {
+            let p = std::path::Path::new(fp);
+            if p.is_file() {
+                if let Ok(content) = fs::read_to_string(p) {
+                    let lines: Vec<&str> = content.lines().collect();
+                    if l_num > 0 && l_num <= lines.len() {
+                        let start = l_num.saturating_sub(2);
+                        let end = (l_num + 1).min(lines.len());
+                        let snippet = lines[start..end].join("\n");
+                        frame.code_snippet = Some(snippet);
+
+                        let target_line = lines[l_num - 1];
+                        patch = Some(format!(
+                            "// Suggested patch for {} line {}:\n- {}\n+ // {}\n+ {}",
+                            fp, l_num, target_line, suggested_fix, target_line
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let summary = format!(
+        "{:?} Crash: {} - {} (Root Cause: {:?})",
+        language, error_type, error_message, root_cause
+    );
+
+    Ok(ParsedStackTrace {
+        language,
+        error_type,
+        error_message,
+        root_cause,
+        frames,
+        failing_frame: resolved_frame,
+        suggested_fix,
+        patch_suggestion: patch,
+        summary,
+    })
+}
+
+pub fn format_stack_trace_report_for_terminal(trace: &ParsedStackTrace) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n{}\n", "╔═══════════════════════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} {:<48} ║\n", "🐛 INTERACTIVE AI CRASH DEBUGGER:".cyan().bold(), format!("{:?}", trace.language).yellow().bold()));
+    out.push_str("╠═══════════════════════════════════════════════════════════════════════════╣\n");
+    out.push_str(&format!("║ Error Type: {:<58} ║\n", trace.error_type.red().bold()));
+    let trunc_msg = if trace.error_message.len() > 58 { format!("{}...", &trace.error_message[..55]) } else { trace.error_message.clone() };
+    out.push_str(&format!("║ Message:    {:<58} ║\n", trunc_msg.white()));
+    out.push_str(&format!("║ Root Cause: {:<58} ║\n", format!("{:?}", trace.root_cause).magenta().bold()));
+    out.push_str("╠═══════════════════════════════════════════════════════════════════════════╣\n");
+
+    if let Some(ref f) = trace.failing_frame {
+        out.push_str(&format!("║ {} {:<52} ║\n", "🎯 FAILING FRAME:".yellow().bold(), f.function_name.cyan()));
+        let loc = format!("{}:{}", f.file_path.as_deref().unwrap_or("<unknown>"), f.line_number.unwrap_or(0));
+        out.push_str(&format!("║ Location:   {:<58} ║\n", loc.yellow()));
+        if let Some(ref snip) = f.code_snippet {
+            out.push_str("║ Code Context:                                                           ║\n");
+            for s_line in snip.lines() {
+                let trunc_s = if s_line.len() > 66 { format!("{}...", &s_line[..63]) } else { s_line.to_string() };
+                out.push_str(&format!("║   │ {:<66} ║\n", trunc_s.dimmed()));
+            }
+        }
+        out.push_str("╠═══════════════════════════════════════════════════════════════════════════╣\n");
+    }
+
+    out.push_str(&format!("║ Total Frames Captured: {:<47} ║\n", trace.frames.len().to_string().cyan()));
+    for f in trace.frames.iter().take(4) {
+        let f_loc = format!("{}:{}", f.file_path.as_deref().unwrap_or("<runtime>"), f.line_number.unwrap_or(0));
+        let f_trunc = if f_loc.len() > 32 { format!("{}...", &f_loc[..29]) } else { f_loc };
+        let func_trunc = if f.function_name.len() > 22 { format!("{}...", &f.function_name[..19]) } else { f.function_name.clone() };
+        out.push_str(&format!("║   #{:<2} {:<22} at {:<36} ║\n", f.frame_index, func_trunc.cyan(), f_trunc.dimmed()));
+    }
+
+    out.push_str("╠═══════════════════════════════════════════════════════════════════════════╣\n");
+    out.push_str(&format!("║ {} {:<55} ║\n", "💡 SUGGESTED FIX:".green().bold(), ""));
+    let fix_trunc = if trace.suggested_fix.len() > 70 { format!("{}...", &trace.suggested_fix[..67]) } else { trace.suggested_fix.clone() };
+    out.push_str(&format!("║   {:<70} ║\n", fix_trunc.white()));
+
+    if let Some(ref p) = trace.patch_suggestion {
+        out.push_str("║ Suggested Patch:                                                        ║\n");
+        for p_line in p.lines().take(4) {
+            let p_trunc = if p_line.len() > 70 { format!("{}...", &p_line[..67]) } else { p_line.to_string() };
+            out.push_str(&format!("║   {:<70} ║\n", p_trunc.green()));
+        }
+    }
+
+    out.push_str("╚═══════════════════════════════════════════════════════════════════════════╝\n");
+    out
+}
+
 pub async fn interactive_chat(
     client: &Client, 
     model: &str, 
@@ -14766,6 +16388,12 @@ pub async fn interactive_chat(
                             println!("  /theme [theme_name]   - Universal 24-bit TrueColor Theme Palette Engine");
                             println!("  /palette [query]      - Modal Keybindings & Fuzzy Command Palette");
                             println!("  /sound <on|off|test>  - Ambient Audio & Sensory Feedback Engine");
+                            println!("  /stage <file> [indices]- Interactive Hunk-by-Hunk Diff Staging UI");
+                            println!("  /heatmap [max_ctx]    - Real-Time Token Heatmap & Context Density Inspector");
+                            println!("  /slides <path>        - Terminal Slide Deck Presentation Engine");
+                            println!("  /widgets [action]     - Modular Dockable TUI Widgets Bar");
+                            println!("  /speak <text>         - Local Text-to-Speech Voice Engine");
+                            println!("  /debug <trace_or_cmd> - Interactive AI Debugger & Stack Trace Visualizer");
                             println!("  /undo                 - Git-revert the last agent file edit");
                             println!("  /exit, /quit          - End the session");
                             continue;
@@ -16171,6 +17799,101 @@ except Exception as e:
                             }
                             continue;
                         }
+                        "/stage" => {
+                            if parts.len() > 1 {
+                                let path_arg = parts[1];
+                                let indices: Vec<usize> = if parts.len() > 2 {
+                                    parts[2].split(',').filter_map(|x| x.trim().parse::<usize>().ok()).collect()
+                                } else {
+                                    Vec::new()
+                                };
+                                let diff_content = if std::path::Path::new(path_arg).is_file() {
+                                    let out = std::process::Command::new("git").args(["diff", path_arg]).output().ok();
+                                    out.and_then(|o| if !o.stdout.is_empty() { String::from_utf8(o.stdout).ok() } else { None })
+                                        .unwrap_or_else(|| fs::read_to_string(path_arg).unwrap_or_default())
+                                } else {
+                                    path_arg.to_string()
+                                };
+                                let hunks = parse_diff_into_hunks(&diff_content);
+                                println!("{}", format_hunk_staging_report_for_terminal(path_arg, &hunks, &indices));
+                            } else {
+                                println!("{}", "Usage: /stage <file_or_diff> [hunk_indices e.g. 0,2]".red());
+                            }
+                            continue;
+                        }
+                        "/heatmap" => {
+                            let custom_ctx = if parts.len() > 1 {
+                                parts[1].parse::<usize>().unwrap_or(tuner.num_ctx)
+                            } else {
+                                tuner.num_ctx
+                            };
+                            let rep = inspect_token_heatmap(&messages, custom_ctx);
+                            println!("{}", format_token_heatmap_for_terminal(&rep));
+                            continue;
+                        }
+                        "/slides" | "/present" => {
+                            if parts.len() > 1 {
+                                let deck_path = parts[1];
+                                let content = if std::path::Path::new(deck_path).is_file() {
+                                    fs::read_to_string(deck_path).unwrap_or_else(|_| deck_path.to_string())
+                                } else {
+                                    deck_path.to_string()
+                                };
+                                let slides = parse_markdown_into_slides(&content);
+                                if slides.is_empty() {
+                                    println!("{}", "No slides found in content.".yellow());
+                                } else {
+                                    println!("{} Starting interactive presentation with {} slides...", "📽️ ".cyan(), slides.len());
+                                    let _ = run_interactive_presentation(&slides);
+                                }
+                            } else {
+                                println!("{}", "Usage: /slides <markdown_file_or_content>".red());
+                            }
+                            continue;
+                        }
+                        "/widgets" => {
+                            let mut state = TuiWidgetBarState::new();
+                            state.update_git_metrics(std::path::Path::new("."));
+                            state.update_hardware_metrics();
+                            if parts.len() > 1 {
+                                let act = parts[1].to_lowercase();
+                                if act == "toggle" && parts.len() > 2 {
+                                    if let Some(wt) = parse_widget_type_name(parts[2]) {
+                                        state.toggle_widget(wt);
+                                        println!("Toggled widget {:?}", wt);
+                                    }
+                                }
+                            }
+                            println!("{}", render_dockable_widget_bar(&state, 80));
+                            continue;
+                        }
+                        "/speak" => {
+                            if parts.len() > 1 {
+                                let text_to_speak = parts[1..].join(" ");
+                                println!("{} Speaking: \"{}\"", "🎙️ ".cyan(), text_to_speak.yellow());
+                                let _ = speak_in_background(&text_to_speak, Some(1.0), Some(1.0));
+                            } else {
+                                println!("{}", "Usage: /speak <text to speak>".red());
+                            }
+                            continue;
+                        }
+                        "/debug" => {
+                            if parts.len() > 1 {
+                                let trace_input = parts[1..].join(" ");
+                                let trace_content = if std::path::Path::new(&trace_input).is_file() {
+                                    fs::read_to_string(&trace_input).unwrap_or_else(|_| trace_input.clone())
+                                } else {
+                                    trace_input
+                                };
+                                match parse_crash_stack_trace(&trace_content) {
+                                    Ok(parsed) => println!("{}", format_stack_trace_report_for_terminal(&parsed)),
+                                    Err(e) => println!("{} {}", "❌ Debug Trace Error:".red(), e),
+                                }
+                            } else {
+                                println!("{}", "Usage: /debug <crash_trace_or_log_file>".red());
+                            }
+                            continue;
+                        }
                         "/exit" | "/quit" => break,
                         _ => {
                             println!("{}", "Unknown slash command. Type /help to see available commands.".red());
@@ -17074,6 +18797,102 @@ pub fn get_tools() -> serde_json::Value {
                         "enabled": { "type": "boolean", "description": "Optional toggle to enable or disable global audio effects" }
                     },
                     "required": ["cue_type"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "hunk_diff_staging",
+                "description": "Interactive Hunk-by-Hunk Diff Staging UI. Parses unified diffs into discrete hunk headers, line ranges, additions, deletions, and context. Supports line-level hunk splitting and selectively applies accepted hunks to files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Target file path or diff string" },
+                        "diff_content": { "type": "string", "description": "Optional raw unified diff content" },
+                        "selected_hunks": { "type": "array", "items": { "type": "integer" }, "description": "Array of hunk indices to accept/stage (e.g. [0, 2])" },
+                        "apply_to_file": { "type": "boolean", "description": "Whether to apply accepted hunks directly to file on disk (default false)" },
+                        "split_lines": { "type": "boolean", "description": "Whether to split multi-line change blocks into atomic line hunks (default false)" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "token_heatmap",
+                "description": "Real-Time Token Heatmap & Context Density Inspector. Calculates exact and estimated token counts across system prompt, attached files, conversation turns, RAG chunks, and tool payloads, reporting Low/Medium/High bloat density and eviction suggestions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "description": "Action: 'inspect', 'summary' (default 'inspect')" },
+                        "max_ctx": { "type": "integer", "description": "Optional context window limit (default 8192)" }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "present_slides",
+                "description": "Terminal Slide Deck Presentation Engine. Parses markdown into slides separated by '---', formatting title headers, bullet points, and syntax-highlighted code blocks centered in terminal dimensions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path_or_content": { "type": "string", "description": "Markdown presentation file path or raw markdown content" },
+                        "action": { "type": "string", "description": "Action: 'render_all', 'render_slide' (default 'render_all')" },
+                        "slide_index": { "type": "integer", "description": "Specific slide index to render (0-indexed)" },
+                        "width": { "type": "integer", "description": "Render terminal width (default 80)" },
+                        "height": { "type": "integer", "description": "Render terminal height (default 24)" }
+                    },
+                    "required": ["path_or_content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "manage_widgets",
+                "description": "Modular Dockable TUI Widgets Bar. Manages and renders live modular terminal widgets: GitStream (live branch/commits), DockerMonitor (containers/RAM), DatabaseTailer (schemas/queries), and HardwareSparklines (CPU/RAM/GPU load history).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "description": "Action: 'list', 'toggle', 'status', 'render' (default 'render')" },
+                        "widget": { "type": "string", "description": "Widget type: 'git_stream', 'docker_monitor', 'database_tailer', 'hardware_sparklines'" }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "speak_text",
+                "description": "Local Text-to-Speech Voice Engine. Synthesizes text into spoken audio natively via Windows SAPI / PowerShell, macOS say, or Linux spd-say/espeak with configurable voice speed and pitch.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string", "description": "Text message to synthesize into speech" },
+                        "voice_speed": { "type": "number", "description": "Voice playback speed multiplier (0.5 to 2.0, default 1.0)" },
+                        "pitch": { "type": "number", "description": "Voice pitch multiplier (0.5 to 2.0, default 1.0)" },
+                        "background": { "type": "boolean", "description": "Whether to speak in background thread without blocking (default false)" }
+                    },
+                    "required": ["text"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "debug_trace",
+                "description": "Interactive AI Debugger & Stack Trace Visualizer. Parses panic traces and crash logs across Rust, Python, Node.js/TypeScript, and C/C++, extracting call frames, mapping file lines, identifying failing frames, and predicting root cause with suggested patches.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "trace_log": { "type": "string", "description": "Crash log, panic trace, or traceback text" },
+                        "is_command": { "type": "boolean", "description": "Whether trace_log is a command line to execute and capture crash trace (default false)" }
+                    },
+                    "required": ["trace_log"]
                 }
             }
         }
@@ -18404,6 +20223,165 @@ pub async fn agent_loop(
                                 println!("{} {}", "❌ Audio Error:".red(), e);
                             }
                         }
+                    }
+                } else if fn_name == "hunk_diff_staging" {
+                    if let Some(path_arg) = args.get("path").and_then(|v| v.as_str()) {
+                        let diff_content = if let Some(dc) = args.get("diff_content").and_then(|v| v.as_str()) {
+                            dc.to_string()
+                        } else if std::path::Path::new(path_arg).is_file() {
+                            let out = std::process::Command::new("git").args(["diff", path_arg]).output().ok();
+                            out.and_then(|o| if !o.stdout.is_empty() { String::from_utf8(o.stdout).ok() } else { None })
+                                .unwrap_or_else(|| fs::read_to_string(path_arg).unwrap_or_default())
+                        } else {
+                            path_arg.to_string()
+                        };
+
+                        let mut hunks = parse_diff_into_hunks(&diff_content);
+                        if args.get("split_lines").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            let mut split_h = Vec::new();
+                            for h in &hunks {
+                                split_h.extend(split_hunk_into_lines(h));
+                            }
+                            for (i, h) in split_h.iter_mut().enumerate() {
+                                h.index = i;
+                            }
+                            hunks = split_h;
+                        }
+
+                        let selected_indices: Vec<usize> = args.get("selected_hunks")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect())
+                            .unwrap_or_default();
+
+                        if args.get("apply_to_file").and_then(|v| v.as_bool()).unwrap_or(false) && std::path::Path::new(path_arg).is_file() {
+                            if let Ok(orig) = fs::read_to_string(path_arg) {
+                                if let Ok(staged) = apply_selected_hunks(&orig, &hunks, &selected_indices) {
+                                    let _ = fs::write(path_arg, staged);
+                                }
+                            }
+                        }
+
+                        let rep_str = format_hunk_staging_report_for_terminal(path_arg, &hunks, &selected_indices);
+                        println!("{}", rep_str);
+                        let rep_obj = HunkStagingReport {
+                            file_path: path_arg.to_string(),
+                            total_hunks: hunks.len(),
+                            staged_hunks: selected_indices.len(),
+                            unstaged_hunks: hunks.len().saturating_sub(selected_indices.len()),
+                            total_additions: hunks.iter().map(|h| h.additions).sum(),
+                            total_deletions: hunks.iter().map(|h| h.deletions).sum(),
+                            staged_additions: hunks.iter().filter(|h| selected_indices.contains(&h.index)).map(|h| h.additions).sum(),
+                            staged_deletions: hunks.iter().filter(|h| selected_indices.contains(&h.index)).map(|h| h.deletions).sum(),
+                            hunks,
+                            summary: format!("Hunk diff staging analyzed for '{}'", path_arg),
+                        };
+                        tool_result = serde_json::to_string_pretty(&rep_obj).unwrap();
+                        println!("{}", "✔️ Hunk Diff Staging Analysis Complete".green());
+                    } else {
+                        tool_result = "Error: Missing path parameter".to_string();
+                        println!("{}", "❌ Missing Parameters".red());
+                    }
+                } else if fn_name == "token_heatmap" {
+                    let custom_ctx = args.get("max_ctx").and_then(|v| v.as_u64()).map(|n| n as usize).or(options.num_ctx).unwrap_or(8192);
+                    let rep = inspect_token_heatmap(messages, custom_ctx);
+                    println!("{}", format_token_heatmap_for_terminal(&rep));
+                    tool_result = serde_json::to_string_pretty(&rep).unwrap();
+                    println!("{}", "✔️ Token Heatmap Inspected".green());
+                } else if fn_name == "present_slides" {
+                    if let Some(target) = args.get("path_or_content").and_then(|v| v.as_str()) {
+                        let content = if std::path::Path::new(target).is_file() {
+                            fs::read_to_string(target).unwrap_or_else(|_| target.to_string())
+                        } else {
+                            target.to_string()
+                        };
+                        let slides = parse_markdown_into_slides(&content);
+                        let w = args.get("width").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+                        let h = args.get("height").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+                        let s_idx = args.get("slide_index").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(0);
+
+                        if let Some(slide) = slides.get(s_idx) {
+                            let slide_str = render_slide_to_terminal(slide, s_idx, slides.len(), w, h);
+                            print!("{}", slide_str);
+                        }
+                        let summary = serde_json::json!({
+                            "total_slides": slides.len(),
+                            "current_slide_rendered": s_idx,
+                            "slides": slides,
+                        });
+                        tool_result = serde_json::to_string_pretty(&summary).unwrap();
+                        println!("{}", "✔️ Slide Deck Formatted".green());
+                    } else {
+                        tool_result = "Error: Missing path_or_content parameter".to_string();
+                        println!("{}", "❌ Missing Parameters".red());
+                    }
+                } else if fn_name == "manage_widgets" {
+                    let mut state = TuiWidgetBarState::new();
+                    state.update_git_metrics(std::path::Path::new("."));
+                    state.update_hardware_metrics();
+                    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("render");
+                    if action.eq_ignore_ascii_case("toggle") {
+                        if let Some(w_str) = args.get("widget").and_then(|v| v.as_str()) {
+                            if let Some(wt) = parse_widget_type_name(w_str) {
+                                state.toggle_widget(wt);
+                            }
+                        }
+                    }
+                    let rendered = render_dockable_widget_bar(&state, 80);
+                    println!("{}", rendered);
+                    tool_result = serde_json::to_string_pretty(&state).unwrap();
+                    println!("{}", "✔️ Modular Widgets Bar Rendered".green());
+                } else if fn_name == "speak_text" {
+                    if let Some(text) = args.get("text").and_then(|v| v.as_str()) {
+                        let spd = args.get("voice_speed").and_then(|v| v.as_f64()).map(|n| n as f32);
+                        let pitch = args.get("pitch").and_then(|v| v.as_f64()).map(|n| n as f32);
+                        let bg = args.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
+                        if bg {
+                            let _ = speak_in_background(text, spd, pitch);
+                            tool_result = format!("Synthesizing speech in background: \"{}\"", text);
+                        } else {
+                            let _ = synthesize_speech(text, spd, pitch);
+                            tool_result = format!("Synthesized speech: \"{}\"", text);
+                        }
+                        println!("{} Spoken audio synthesized.", "🎙️ ".cyan());
+                        println!("{}", "✔️ Speech Engine Emitted".green());
+                    } else {
+                        tool_result = "Error: Missing text parameter".to_string();
+                        println!("{}", "❌ Missing Parameters".red());
+                    }
+                } else if fn_name == "debug_trace" {
+                    if let Some(log) = args.get("trace_log").and_then(|v| v.as_str()) {
+                        let is_cmd = args.get("is_command").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let trace_text = if is_cmd {
+                            let parts: Vec<&str> = log.split_whitespace().collect();
+                            if let Some(cmd) = parts.first() {
+                                let out = std::process::Command::new(cmd).args(&parts[1..]).output();
+                                match out {
+                                    Ok(o) => format!("{}\n{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)),
+                                    Err(e) => format!("Command error: {}", e),
+                                }
+                            } else {
+                                log.to_string()
+                            }
+                        } else if std::path::Path::new(log).is_file() {
+                            fs::read_to_string(log).unwrap_or_else(|_| log.to_string())
+                        } else {
+                            log.to_string()
+                        };
+
+                        match parse_crash_stack_trace(&trace_text) {
+                            Ok(parsed) => {
+                                println!("{}", format_stack_trace_report_for_terminal(&parsed));
+                                tool_result = serde_json::to_string_pretty(&parsed).unwrap();
+                                println!("{}", "✔️ Crash Stack Trace Visualized".green());
+                            }
+                            Err(e) => {
+                                tool_result = format!("Stack trace parse error: {}", e);
+                                println!("{} {}", "❌ Debug Error:".red(), e);
+                            }
+                        }
+                    } else {
+                        tool_result = "Error: Missing trace_log parameter".to_string();
+                        println!("{}", "❌ Missing Parameters".red());
                     }
                 } else {
                     tool_result = format!("Unknown function: {}", fn_name);

@@ -380,6 +380,124 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Some(Commands::Stage { path, indices, apply, split }) => {
+            let hunk_indices: Vec<usize> = indices.as_deref()
+                .map(|s| s.split(',').filter_map(|x| x.trim().parse::<usize>().ok()).collect())
+                .unwrap_or_default();
+            let diff_content = if std::path::Path::new(path).is_file() {
+                let out = std::process::Command::new("git").args(["diff", path]).output().ok();
+                out.and_then(|o| if !o.stdout.is_empty() { String::from_utf8(o.stdout).ok() } else { None })
+                    .unwrap_or_else(|| std::fs::read_to_string(path).unwrap_or_default())
+            } else {
+                path.clone()
+            };
+            let mut hunks = parse_diff_into_hunks(&diff_content);
+            if *split {
+                let mut split_hunks = Vec::new();
+                for h in &hunks {
+                    split_hunks.extend(split_hunk_into_lines(h));
+                }
+                for (i, h) in split_hunks.iter_mut().enumerate() {
+                    h.index = i;
+                }
+                hunks = split_hunks;
+            }
+            if *apply && std::path::Path::new(path).is_file() {
+                let orig = std::fs::read_to_string(path)?;
+                let staged = apply_selected_hunks(&orig, &hunks, &hunk_indices)?;
+                std::fs::write(path, staged)?;
+                println!("Applied {} staged hunk(s) to {}", hunk_indices.len(), path);
+            }
+            println!("{}", format_hunk_staging_report_for_terminal(path, &hunks, &hunk_indices));
+        }
+        Some(Commands::Heatmap { max_ctx, session }) => {
+            let messages = load_session(session.as_deref());
+            let ctx = max_ctx.unwrap_or(8192);
+            let rep = inspect_token_heatmap(&messages, ctx);
+            println!("{}", format_token_heatmap_for_terminal(&rep));
+        }
+        Some(Commands::Slides { path, slide, width, height }) => {
+            let content = if std::path::Path::new(path).is_file() {
+                std::fs::read_to_string(path)?
+            } else {
+                path.clone()
+            };
+            let slides = parse_markdown_into_slides(&content);
+            if let Some(idx) = slide {
+                let s_idx = (*idx).min(slides.len().saturating_sub(1));
+                if let Some(s) = slides.get(s_idx) {
+                    let w = width.unwrap_or(80);
+                    let h = height.unwrap_or(24);
+                    println!("{}", render_slide_to_terminal(s, s_idx, slides.len(), w, h));
+                }
+            } else {
+                run_interactive_presentation(&slides)?;
+            }
+        }
+        Some(Commands::Widgets { action, widget }) => {
+            let mut state = TuiWidgetBarState::new();
+            state.update_git_metrics(std::path::Path::new("."));
+            state.update_hardware_metrics();
+            match action.to_lowercase().as_str() {
+                "toggle" => {
+                    if let Some(w_name) = widget {
+                        if let Some(w_type) = parse_widget_type_name(w_name) {
+                            state.toggle_widget(w_type);
+                            println!("Toggled widget {:?}", w_type);
+                        }
+                    }
+                    println!("{}", render_dockable_widget_bar(&state, 80));
+                }
+                "list" | "status" => {
+                    println!("\n{}", "Modular TUI Widgets Status:".cyan().bold());
+                    for w in &[WidgetType::GitStream, WidgetType::DockerMonitor, WidgetType::DatabaseTailer, WidgetType::HardwareSparklines] {
+                        let enabled = state.is_widget_enabled(*w);
+                        println!("  • {:<20} [{}]", format!("{:?}", w).bold(), if enabled { "ENABLED".green().bold() } else { "DISABLED".dimmed() });
+                    }
+                    println!();
+                }
+                _ => {
+                    println!("{}", render_dockable_widget_bar(&state, 80));
+                }
+            }
+        }
+        Some(Commands::Speak { text, speed, pitch, background }) => {
+            let text_to_speak = if text.is_empty() { "zy intelligent voice engine ready.".to_string() } else { text.join(" ") };
+            if *background {
+                speak_in_background(&text_to_speak, *speed, *pitch)?;
+                println!("Synthesizing speech in background: \"{}\"", text_to_speak.cyan());
+            } else {
+                synthesize_speech(&text_to_speak, *speed, *pitch)?;
+                println!("Spoken: \"{}\"", text_to_speak.cyan());
+            }
+        }
+        Some(Commands::Debug { trace_or_cmd, execute }) => {
+            let input = trace_or_cmd.join(" ");
+            let trace_content = if *execute && !input.is_empty() {
+                println!("{} Executing command to capture crash: `{}`", "🐛".cyan(), input.yellow());
+                let parts: Vec<&str> = input.split_whitespace().collect();
+                if let Some(cmd) = parts.first() {
+                    let out = std::process::Command::new(cmd).args(&parts[1..]).output();
+                    match out {
+                        Ok(o) => {
+                            let mut full = String::from_utf8_lossy(&o.stdout).to_string();
+                            full.push_str("\n");
+                            full.push_str(&String::from_utf8_lossy(&o.stderr));
+                            full
+                        }
+                        Err(e) => format!("Execution failure: {}", e),
+                    }
+                } else {
+                    input
+                }
+            } else if std::path::Path::new(&input).is_file() {
+                std::fs::read_to_string(&input)?
+            } else {
+                input
+            };
+            let parsed = parse_crash_stack_trace(&trace_content)?;
+            println!("{}", format_stack_trace_report_for_terminal(&parsed));
+        }
         None => {
             if cli.tui {
                 let tuner = run_ai_tuner(0.1, true);

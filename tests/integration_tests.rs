@@ -4509,3 +4509,562 @@ async fn test_brutal_edge_cases_across_6_ux_ui_systems() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+// ============================================================================
+// SYSTEM 22: INTERACTIVE HUNK-BY-HUNK DIFF STAGING UI TESTS
+// ============================================================================
+
+#[test]
+fn test_interactive_hunk_by_hunk_diff_staging_ui() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_test_stage_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    let original_file = temp_dir.join("sample.rs");
+    let original_content = "fn alpha() {\n    println!(\"alpha 1\");\n    println!(\"alpha 2\");\n}\n\nfn beta() {\n    println!(\"beta 1\");\n}\n";
+    std::fs::write(&original_file, original_content).unwrap();
+
+    let diff_text = r#"--- a/sample.rs
++++ b/sample.rs
+@@ -1,5 +1,5 @@ fn alpha()
+ fn alpha() {
+-    println!("alpha 1");
++    println!("alpha MODIFIED");
+     println!("alpha 2");
+ }
+@@ -6,3 +6,4 @@ fn beta()
+ fn beta() {
+     println!("beta 1");
++    println!("beta NEW LINE");
+ }
+"#;
+
+    // 1. Parse unified diff into discrete hunks
+    let hunks = parse_diff_into_hunks(diff_text);
+    assert_eq!(hunks.len(), 2);
+
+    assert_eq!(hunks[0].index, 0);
+    assert_eq!(hunks[0].old_start, 1);
+    assert_eq!(hunks[0].additions, 1);
+    assert_eq!(hunks[0].deletions, 1);
+    assert!(hunks[0].section_header.as_ref().unwrap().contains("fn alpha()"));
+
+    assert_eq!(hunks[1].index, 1);
+    assert_eq!(hunks[1].old_start, 6);
+    assert_eq!(hunks[1].additions, 1);
+    assert_eq!(hunks[1].deletions, 0);
+    assert!(hunks[1].section_header.as_ref().unwrap().contains("fn beta()"));
+
+    // 2. Test selective staging: Stage ONLY Hunk 0 (alpha modified, beta untouched)
+    let staged_hunk0 = apply_selected_hunks(original_content, &hunks, &[0]).expect("Apply hunk 0 failed");
+    assert!(staged_hunk0.contains("alpha MODIFIED"));
+    assert!(!staged_hunk0.contains("alpha 1"));
+    assert!(staged_hunk0.contains("beta 1"));
+    assert!(!staged_hunk0.contains("beta NEW LINE"));
+
+    // 3. Test selective staging: Stage ONLY Hunk 1 (beta new line, alpha untouched)
+    let staged_hunk1 = apply_selected_hunks(original_content, &hunks, &[1]).expect("Apply hunk 1 failed");
+    assert!(staged_hunk1.contains("alpha 1"));
+    assert!(!staged_hunk1.contains("alpha MODIFIED"));
+    assert!(staged_hunk1.contains("beta 1"));
+    assert!(staged_hunk1.contains("beta NEW LINE"));
+
+    // 4. Test selective staging: Stage ALL Hunks ([0, 1])
+    let staged_all = apply_selected_hunks(original_content, &hunks, &[0, 1]).expect("Apply all hunks failed");
+    assert!(staged_all.contains("alpha MODIFIED"));
+    assert!(staged_all.contains("beta NEW LINE"));
+
+    // 5. Test selective staging: Stage NO Hunks (empty slice) -> returns unmodified content
+    let staged_none = apply_selected_hunks(original_content, &hunks, &[]).expect("Apply no hunks failed");
+    assert_eq!(staged_none, original_content);
+
+    // 6. Test Line-level hunk splitting (split_hunk_into_lines)
+    let multi_change_diff = r#"@@ -1,10 +1,10 @@
+ line 1
+-line 2
++line 2 mod
+ line 3
+ line 4
+-line 5
++line 5 mod
+ line 6
+"#;
+    let multi_hunks = parse_diff_into_hunks(multi_change_diff);
+    assert_eq!(multi_hunks.len(), 1);
+    let split = split_hunk_into_lines(&multi_hunks[0]);
+    assert!(split.len() >= 2);
+    assert_eq!(split[0].index, 0);
+    assert_eq!(split[1].index, 1);
+
+    // 7. Test Terminal Report Formatting
+    let rep_str = format_hunk_staging_report_for_terminal("sample.rs", &hunks, &[0]);
+    assert!(rep_str.contains("INTERACTIVE HUNK-BY-HUNK DIFF STAGING"));
+    assert!(rep_str.contains("sample.rs"));
+    assert!(rep_str.contains("Hunk #0"));
+    assert!(rep_str.contains("STAGED"));
+
+    // 8. Verify hunk_diff_staging in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("hunk_diff_staging"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 23: REAL-TIME TOKEN HEATMAP & CONTEXT DENSITY INSPECTOR TESTS
+// ============================================================================
+
+#[test]
+fn test_realtime_token_heatmap_and_context_density_inspector() {
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: "You are zy, a lethal AI pair programming assistant with strict rules.".to_string(),
+            tool_calls: None,
+            images: None,
+        },
+        Message {
+            role: "system".to_string(),
+            content: "[RAG Retrieval Context]\nChunk 1: fn optimize_cache() { ... }\nChunk 2: fn hash_table() { ... }".to_string(),
+            tool_calls: None,
+            images: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: "[Attached Context: src/main.rs]\nfn main() { println!(\"hello\"); }".to_string(),
+            tool_calls: None,
+            images: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: "Refactor the memory allocator to use slab allocation.".to_string(),
+            tool_calls: None,
+            images: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: "Here is the slab allocator design with zero runtime overhead.".to_string(),
+            tool_calls: None,
+            images: None,
+        },
+        Message {
+            role: "tool".to_string(),
+            content: "{\"status\": \"success\", \"allocations\": 1024}".to_string(),
+            tool_calls: None,
+            images: None,
+        },
+    ];
+
+    // 1. Inspect token heatmap with 8192 budget
+    let report = inspect_token_heatmap(&messages, 8192);
+    assert_eq!(report.num_ctx, 8192);
+    assert!(report.total_tokens > 0);
+    assert_eq!(report.sections.len(), 6);
+    assert_eq!(report.density_category, ContextDensityCategory::Low);
+
+    // Verify section types
+    assert_eq!(report.sections[0].section_type, HeatmapSectionType::SystemPrompt);
+    assert_eq!(report.sections[1].section_type, HeatmapSectionType::RagContext);
+    assert_eq!(report.sections[2].section_type, HeatmapSectionType::AttachedFile);
+    assert_eq!(report.sections[3].section_type, HeatmapSectionType::Turn);
+    assert_eq!(report.sections[4].section_type, HeatmapSectionType::Turn);
+    assert_eq!(report.sections[5].section_type, HeatmapSectionType::ToolPayload);
+
+    // 2. Test High Density Bloat triggers
+    let huge_content = "X".repeat(4000);
+    let heavy_messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: format!("RULES:\n{}", huge_content),
+            tool_calls: None,
+            images: None,
+        },
+    ];
+    let heavy_report = inspect_token_heatmap(&heavy_messages, 2000);
+    assert!(heavy_report.usage_pct > 40.0);
+    assert_eq!(heavy_report.density_category, ContextDensityCategory::High);
+    assert!(heavy_report.recommendations.iter().any(|r| r.contains("Compress system rules") || r.contains("Critical context")));
+
+    // 3. Test Terminal Report Formatting
+    let term_out = format_token_heatmap_for_terminal(&report);
+    assert!(term_out.contains("REAL-TIME TOKEN HEATMAP"));
+    assert!(term_out.contains("Context Window:"));
+    assert!(term_out.contains("SYSTEM"));
+    assert!(term_out.contains("RAG"));
+    assert!(term_out.contains("ATTACH"));
+    assert!(term_out.contains("RECOMMENDATIONS:"));
+
+    // 4. Verify token_heatmap in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("token_heatmap"));
+}
+
+// ============================================================================
+// SYSTEM 24: TERMINAL SLIDE DECK PRESENTATION ENGINE TESTS
+// ============================================================================
+
+#[test]
+fn test_terminal_slide_deck_presentation_engine() {
+    let markdown_presentation = r#"
+# Welcome to zy 2.0
+## The Ultimate Local AI Coding Agent
+- Autonomous TDD auto-repair loop
+- Zero-latency background indexing
+- Cross-platform hardware telemetry
+Note: Introduce the agent's core capabilities.
+
+---
+
+# Architecture Overview
+## Modular Multi-Agent Swarm
+- Architect: high-level design and OODA loops
+- Coder: precision code synthesis
+- Auditor: SARIF security and a11y checks
+- QA: test suite execution
+
+```rust
+pub fn launch_agent() {
+    println!("Agent running in high-performance mode");
+}
+```
+
+---
+
+# Key Metrics & ROI
+- 100% offline & local Ollama execution
+- $0 cloud API token cost
+- Sub-50ms latency
+"#;
+
+    // 1. Parse markdown into slides
+    let slides = parse_markdown_into_slides(markdown_presentation);
+    assert_eq!(slides.len(), 3);
+
+    // Slide 1 checks
+    assert_eq!(slides[0].index, 0);
+    assert_eq!(slides[0].title, "Welcome to zy 2.0");
+    assert_eq!(slides[0].subtitle.as_deref(), Some("The Ultimate Local AI Coding Agent"));
+    assert_eq!(slides[0].bullet_points.len(), 3);
+    assert_eq!(slides[0].notes.as_deref(), Some("Introduce the agent's core capabilities."));
+
+    // Slide 2 checks
+    assert_eq!(slides[1].index, 1);
+    assert_eq!(slides[1].title, "Architecture Overview");
+    assert_eq!(slides[1].code_blocks.len(), 1);
+    assert_eq!(slides[1].code_blocks[0].language, "rust");
+    assert!(slides[1].code_blocks[0].code.contains("pub fn launch_agent()"));
+
+    // Slide 3 checks
+    assert_eq!(slides[2].index, 2);
+    assert_eq!(slides[2].title, "Key Metrics & ROI");
+    assert_eq!(slides[2].bullet_points.len(), 3);
+
+    // 2. Render Slide to Terminal
+    let rendered_s1 = render_slide_to_terminal(&slides[0], 0, 3, 80, 24);
+    assert!(rendered_s1.contains("Welcome to zy 2.0"));
+    assert!(rendered_s1.contains("The Ultimate Local AI Coding Agent"));
+    assert!(rendered_s1.contains("[ Slide 1 / 3 ]"));
+    assert!(rendered_s1.contains("Autonomous TDD auto-repair loop"));
+    assert!(rendered_s1.contains("Note: Introduce the agent's core capabilities."));
+    assert!(rendered_s1.contains("[n/Space: Next"));
+
+    let rendered_s2 = render_slide_to_terminal(&slides[1], 1, 3, 80, 24);
+    assert!(rendered_s2.contains("Architecture Overview"));
+    assert!(rendered_s2.contains("pub fn launch_agent()"));
+    assert!(rendered_s2.contains("[ Slide 2 / 3 ]"));
+
+    // 3. Verify present_slides in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("present_slides"));
+}
+
+// ============================================================================
+// SYSTEM 25: MODULAR DOCKABLE TUI WIDGETS BAR TESTS
+// ============================================================================
+
+#[test]
+fn test_modular_dockable_tui_widgets_bar() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_test_widgets_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Initial State
+    let mut state = TuiWidgetBarState::new();
+    assert_eq!(state.enabled_widgets.len(), 4);
+    assert!(state.is_widget_enabled(WidgetType::GitStream));
+    assert!(state.is_widget_enabled(WidgetType::DockerMonitor));
+    assert!(state.is_widget_enabled(WidgetType::DatabaseTailer));
+    assert!(state.is_widget_enabled(WidgetType::HardwareSparklines));
+
+    // 2. Toggle and Disable
+    state.toggle_widget(WidgetType::DockerMonitor);
+    assert!(!state.is_widget_enabled(WidgetType::DockerMonitor));
+    assert_eq!(state.enabled_widgets.len(), 3);
+
+    state.enable_widget(WidgetType::DockerMonitor);
+    assert!(state.is_widget_enabled(WidgetType::DockerMonitor));
+
+    state.disable_widget(WidgetType::GitStream);
+    assert!(!state.is_widget_enabled(WidgetType::GitStream));
+
+    // 3. Render Sparklines
+    let history = vec![0.0, 20.0, 40.0, 60.0, 80.0, 100.0];
+    let spark = render_sparkline(&history, 6);
+    assert_eq!(spark.chars().count(), 6);
+    assert!(spark.contains("█"));
+    assert!(spark.contains(" "));
+
+    // 4. Render individual widget panels
+    let git_panel = render_widget_panel(&WidgetType::GitStream, &state);
+    assert!(git_panel.contains("Git:"));
+
+    let docker_panel = render_widget_panel(&WidgetType::DockerMonitor, &state);
+    assert!(docker_panel.contains("Containers:"));
+
+    let db_panel = render_widget_panel(&WidgetType::DatabaseTailer, &state);
+    assert!(db_panel.contains("Database:"));
+
+    let hw_panel = render_widget_panel(&WidgetType::HardwareSparklines, &state);
+    assert!(hw_panel.contains("CPU ["));
+    assert!(hw_panel.contains("RAM ["));
+    assert!(hw_panel.contains("GPU ["));
+
+    // 5. Render Full Dock Bar
+    let dock_bar = render_dockable_widget_bar(&state, 80);
+    assert!(dock_bar.contains("MODULAR DOCKABLE TUI WIDGETS BAR"));
+    assert!(dock_bar.contains("Containers:"));
+    assert!(dock_bar.contains("Database:"));
+    assert!(dock_bar.contains("CPU ["));
+
+    // 6. Name parsing
+    assert_eq!(parse_widget_type_name("git_stream"), Some(WidgetType::GitStream));
+    assert_eq!(parse_widget_type_name("docker"), Some(WidgetType::DockerMonitor));
+    assert_eq!(parse_widget_type_name("db"), Some(WidgetType::DatabaseTailer));
+    assert_eq!(parse_widget_type_name("cpu"), Some(WidgetType::HardwareSparklines));
+    assert_eq!(parse_widget_type_name("invalid"), None);
+
+    // 7. Verify manage_widgets in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("manage_widgets"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 26: LOCAL TEXT-TO-SPEECH VOICE ENGINE TESTS
+// ============================================================================
+
+#[test]
+fn test_local_text_to_speech_voice_engine() {
+    // 1. Initial State
+    let engine = SpeechEngine::new();
+    assert!(engine.enabled);
+    assert_eq!(engine.voice_speed, 1.0);
+    assert_eq!(engine.pitch, 1.0);
+
+    // 2. Test command generation across platforms
+    let (cmd, args) = generate_speech_command("Task completed successfully.", Some(1.2), Some(1.0));
+    assert!(!cmd.is_empty());
+    assert!(!args.is_empty());
+
+    #[cfg(windows)]
+    {
+        assert_eq!(cmd, "powershell");
+        assert!(args.iter().any(|a| a.contains("System.Speech")));
+        assert!(args.iter().any(|a| a.contains("Task completed successfully.")));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(cmd, "say");
+        assert!(args.contains(&"-r".to_string()));
+    }
+
+    // 3. Empty text handling
+    let res = synthesize_speech("", None, None);
+    assert!(res.is_ok());
+
+    // 4. Background voice execution test
+    let bg_res = speak_in_background("Test background speech synthesis", Some(1.0), Some(1.0));
+    assert!(bg_res.is_ok());
+
+    // 5. Terminal Status Report
+    let rep_str = format_speech_engine_status_for_terminal(&engine, Some("All systems operational."));
+    assert!(rep_str.contains("LOCAL TEXT-TO-SPEECH (TTS) VOICE ENGINE"));
+    assert!(rep_str.contains("ACTIVE"));
+    assert!(rep_str.contains("All systems operational."));
+
+    // 6. Verify speak_text in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("speak_text"));
+}
+
+// ============================================================================
+// SYSTEM 27: INTERACTIVE AI DEBUGGER & STACK TRACE VISUALIZER TESTS
+// ============================================================================
+
+#[test]
+fn test_interactive_ai_debugger_and_stack_trace_visualizer() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_test_debug_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // Create a real file for snippet resolution
+    let test_file = temp_dir.join("calc.rs");
+    let test_src = "pub fn divide(a: i32, b: i32) -> i32 {\n    let res = a / b;\n    res\n}\n";
+    std::fs::write(&test_file, test_src).unwrap();
+
+    // 1. Rust Panic Trace (Option::unwrap on None)
+    let rust_trace = r#"
+thread 'main' panicked at 'called `Option::unwrap()` on a `None` value', src/lib.rs:142:10
+stack backtrace:
+   0: std::panicking::begin_panic
+   1: zy::execute_task
+             at ./src/lib.rs:142:10
+   2: zy::main
+             at ./src/main.rs:25:5
+"#;
+    let parsed_rust = parse_crash_stack_trace(rust_trace).expect("Failed to parse Rust trace");
+    assert_eq!(parsed_rust.language, CrashLanguage::Rust);
+    assert_eq!(parsed_rust.root_cause, RootCauseHypothesis::UnwrapPanic);
+    assert!(parsed_rust.error_message.contains("Option::unwrap"));
+    assert!(parsed_rust.suggested_fix.contains("unwrap()"));
+    assert!(!parsed_rust.frames.is_empty());
+
+    // 2. Python KeyError Traceback
+    let python_trace = r#"
+Traceback (most recent call last):
+  File "server.py", line 45, in handle_request
+    user = authenticate(token)
+  File "auth.py", line 12, in authenticate
+    return session_cache[token]
+KeyError: 'expired_token_123'
+"#;
+    let parsed_py = parse_crash_stack_trace(python_trace).expect("Failed to parse Python trace");
+    assert_eq!(parsed_py.language, CrashLanguage::Python);
+    assert_eq!(parsed_py.root_cause, RootCauseHypothesis::KeyError);
+    assert_eq!(parsed_py.error_type, "KeyError");
+    assert!(parsed_py.error_message.contains("expired_token_123"));
+    assert!(parsed_py.suggested_fix.contains("dict.get"));
+    assert_eq!(parsed_py.frames.len(), 2);
+
+    // 3. Node.js TypeError Trace
+    let node_trace = r#"
+TypeError: Cannot read properties of undefined (reading 'map')
+    at renderList (/app/src/components/List.ts:18:25)
+    at App (/app/src/App.ts:32:10)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5)
+"#;
+    let parsed_node = parse_crash_stack_trace(node_trace).expect("Failed to parse Node trace");
+    assert_eq!(parsed_node.language, CrashLanguage::NodeJs);
+    assert_eq!(parsed_node.root_cause, RootCauseHypothesis::NullPointer);
+    assert!(parsed_node.error_message.contains("Cannot read properties of undefined"));
+    assert!(parsed_node.suggested_fix.contains("?."));
+    assert!(parsed_node.frames.iter().any(|f| f.function_name == "renderList"));
+
+    // 4. C/C++ Segmentation Fault GDB Trace
+    let cpp_trace = r#"
+Program received signal SIGSEGV, Segmentation fault.
+#0  0x0000555555555149 in compute_hash (ptr=0x0) at src/hash.c:34
+#1  0x0000555555555180 in main () at src/main.c:12
+"#;
+    let parsed_cpp = parse_crash_stack_trace(cpp_trace).expect("Failed to parse C++ trace");
+    assert_eq!(parsed_cpp.language, CrashLanguage::Cpp);
+    assert_eq!(parsed_cpp.root_cause, RootCauseHypothesis::SegmentationFault);
+    assert_eq!(parsed_cpp.frames.len(), 2);
+    assert_eq!(parsed_cpp.frames[0].function_name, "compute_hash");
+    assert_eq!(parsed_cpp.frames[0].line_number, Some(34));
+
+    // 5. Code context snippet extraction from real file on disk
+    let file_trace = format!(
+        "thread 'main' panicked at 'attempt to divide by zero', {}:2:15\n",
+        test_file.display()
+    );
+    let parsed_file = parse_crash_stack_trace(&file_trace).expect("Failed to parse file trace");
+    assert_eq!(parsed_file.root_cause, RootCauseHypothesis::DivisionByZero);
+    assert!(parsed_file.failing_frame.is_some());
+    let frame = parsed_file.failing_frame.unwrap();
+    assert!(frame.code_snippet.is_some());
+    assert!(frame.code_snippet.unwrap().contains("let res = a / b"));
+    assert!(parsed_file.patch_suggestion.is_some());
+
+    // 6. Terminal Stack Trace Formatting
+    let term_out = format_stack_trace_report_for_terminal(&parsed_rust);
+    assert!(term_out.contains("INTERACTIVE AI CRASH DEBUGGER"));
+    assert!(term_out.contains("Rust"));
+    assert!(term_out.contains("UnwrapPanic"));
+    assert!(term_out.contains("SUGGESTED FIX:"));
+
+    // 7. Verify debug_trace in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("debug_trace"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 28: BRUTAL EDGE CASES ACROSS ALL 6 NEW UX/UI SYSTEMS
+// ============================================================================
+
+#[test]
+fn test_brutal_edge_cases_across_6_new_uxui_systems() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_brutal_new6_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Hunk diff staging: Empty string and invalid index
+    let empty_hunks = parse_diff_into_hunks("");
+    assert!(empty_hunks.is_empty());
+    let apply_invalid = apply_selected_hunks("sample content", &empty_hunks, &[999]).unwrap();
+    assert_eq!(apply_invalid, "sample content");
+
+    let malformed_diff = "not a diff at all\njust random text\n+++ none\n--- none";
+    let fallback_hunk = parse_diff_into_hunks(malformed_diff);
+    assert!(!fallback_hunk.is_empty());
+
+    // 2. Token heatmap: Zero messages and 0 budget
+    let zero_report = inspect_token_heatmap(&[], 0);
+    assert_eq!(zero_report.total_tokens, 0);
+    assert_eq!(zero_report.num_ctx, 8192);
+    assert_eq!(zero_report.usage_pct, 0.0);
+
+    // 3. Slides: Empty markdown and consecutive dividers
+    let empty_slides = parse_markdown_into_slides("");
+    assert!(empty_slides.is_empty());
+
+    let divider_only = "---\n---\n---";
+    let div_slides = parse_markdown_into_slides(divider_only);
+    assert!(div_slides.is_empty());
+
+    // 4. Widgets: Extreme and zero load values
+    let extreme_history = vec![0.0, 150.0, -20.0, 50.0];
+    let extreme_spark = render_sparkline(&extreme_history, 10);
+    assert_eq!(extreme_spark.chars().count(), 4);
+
+    // Empty state dock bar rendering
+    let mut empty_state = TuiWidgetBarState::new();
+    empty_state.enabled_widgets.clear();
+    let empty_dock = render_dockable_widget_bar(&empty_state, 80);
+    assert!(empty_dock.contains("0 widgets active"));
+
+    // 5. Speech: Multiline text with quotes
+    let quote_text = "He said: 'zy is lethal' & \"extremely fast\"!\nLine 2.";
+    let (cmd, args) = generate_speech_command(quote_text, Some(2.5), Some(0.5));
+    assert!(!cmd.is_empty());
+    assert!(!args.is_empty());
+
+    // 6. Debugger: Completely empty and unknown crash logs
+    let empty_trace = parse_crash_stack_trace("").unwrap();
+    assert_eq!(empty_trace.language, CrashLanguage::Unknown);
+    assert_eq!(empty_trace.root_cause, RootCauseHypothesis::Unknown);
+
+    let unknown_log = "Fatal system anomaly in subsystem XYZ without recognizable stack trace";
+    let unknown_trace = parse_crash_stack_trace(unknown_log).unwrap();
+    assert_eq!(unknown_trace.language, CrashLanguage::Unknown);
+    assert!(unknown_trace.frames.is_empty());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
