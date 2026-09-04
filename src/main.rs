@@ -1,12 +1,11 @@
 use clap::Parser;
 use colored::Colorize;
-use reqwest::Client;
 use zy::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let client = Client::new();
+    let client = create_optimized_ollama_client();
 
     match &cli.command {
         Some(Commands::List) => {
@@ -701,6 +700,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("  5. Universal Editor Sidecar: Ready (Port 8098)");
                 }
             }
+        }
+        Some(Commands::Bench { model }) => {
+            let target_model = model.as_deref().unwrap_or(&cli.model);
+            println!("{}", format!("⚡ Benchmarking Ollama execution speed for '{}'...", target_model).cyan().bold());
+            let report = OllamaBenchmarkEngine::run_benchmark(&client, target_model).await?;
+            println!("\n{}", "🚀 OLLAMA EXECUTION BENCHMARK RESULTS:".green().bold());
+            println!("  Model:                  {}", report.model.yellow().bold());
+            println!("  Generation Speed:       {:.2} tokens/sec", report.generation_tps);
+            println!("  Prompt Eval Bandwidth:  {:.2} tokens/sec", report.prompt_eval_tps);
+            println!("  Time-To-First-Token:    {} ms", report.time_to_first_token_ms);
+            println!("  Total Latency:          {} ms", report.total_latency_ms);
+            println!("  Status:                 {}", report.status.cyan());
         }
         None => {
             if cli.tui {

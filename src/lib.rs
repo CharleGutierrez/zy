@@ -26,6 +26,8 @@ pub mod tier3_ux;
 pub use tier3_ux::*;
 pub mod ux_stack;
 pub use ux_stack::*;
+pub mod ollama_optimizer;
+pub use ollama_optimizer::*;
 
 pub const OLLAMA_URL: &str = "http://localhost:11434";
 
@@ -600,6 +602,12 @@ pub enum Commands {
         #[arg(default_value = ".")]
         target: String,
     },
+    /// Benchmark Ollama execution speed (TPS, TTFT, latency, KV-cache)
+    Bench {
+        /// Target model to benchmark (defaults to cli.model or llama3.2)
+        #[arg(short, long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -632,6 +640,38 @@ pub struct OllamaOptions {
     pub num_thread: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_gpu: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub f16_kv: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_mmap: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_predict: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+}
+
+impl Default for OllamaOptions {
+    fn default() -> Self {
+        Self {
+            temperature: 0.1,
+            num_ctx: Some(4096),
+            num_thread: None,
+            num_gpu: Some(999),
+            top_k: Some(40),
+            top_p: Some(0.9),
+            repeat_penalty: Some(1.1),
+            f16_kv: Some(true),
+            use_mmap: Some(true),
+            num_predict: Some(4096),
+            stop: None,
+        }
+    }
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -1379,6 +1419,7 @@ pub async fn classify_query_route(
             num_ctx: Some(1024),
             num_thread: options.num_thread,
             num_gpu: options.num_gpu,
+            ..Default::default()
         }),
         keep_alive: Some(-1),
     };
@@ -2006,37 +2047,48 @@ pub fn build_sandbox_command(cmd: &str, workspace: &std::path::Path, image: Opti
 // -------------------------------------------------------------------------------------------------
 
 pub fn run_ai_tuner(base_temp: f32, quiet: bool) -> AiTunerState {
-    let mut sys = System::new_all();
-    sys.refresh_memory();
-    let cpu_cores = sys.cpus().len();
-    let total_mem_gb = sys.total_memory() / 1_073_741_824;
+    let prof = OllamaHardwareProfiler::profile();
 
-    if total_mem_gb < 12 || cpu_cores <= 4 {
+    if prof.recommended_mode == "POTATO_ECO" || prof.total_memory_mb < 12288 {
         if !quiet {
-            println!("{} {} RAM, {} Cores. Activating {}...", "⚙️  AiTuner:".cyan().dimmed(), format!("{}GB", total_mem_gb).yellow().dimmed(), cpu_cores.to_string().yellow().dimmed(), "ECO MODE (2048 ctx)".green().dimmed());
+            println!("{} {} RAM, {} Cores. Activating {}...", "⚙️  AiTuner:".cyan().dimmed(), format!("{}MB", prof.total_memory_mb).yellow().dimmed(), prof.physical_cores.to_string().yellow().dimmed(), format!("ECO MODE ({} ctx)", prof.optimal_ctx).green().dimmed());
         }
         AiTunerState {
-            num_ctx: 2048,
+            num_ctx: prof.optimal_ctx,
             profile_name: "ECO".to_string(),
             opts: OllamaOptions {
                 temperature: base_temp,
-                num_ctx: Some(2048),
-                num_thread: Some(std::cmp::max(1, cpu_cores / 2)),
-                num_gpu: Some(1),
+                num_ctx: Some(prof.optimal_ctx),
+                num_thread: Some(prof.optimal_threads),
+                num_gpu: Some(prof.optimal_gpu_layers),
+                top_k: Some(40),
+                top_p: Some(0.9),
+                repeat_penalty: Some(1.1),
+                f16_kv: Some(prof.f16_kv),
+                use_mmap: Some(prof.use_mmap),
+                num_predict: Some(prof.optimal_ctx as i32),
+                stop: None,
             },
         }
     } else {
         if !quiet {
-            println!("{} {} RAM, {} Cores. Activating {}...", "⚙️  AiTuner:".cyan().dimmed(), format!("{}GB", total_mem_gb).yellow().dimmed(), cpu_cores.to_string().yellow().dimmed(), "TURBO MODE (8192 ctx)".magenta().dimmed());
+            println!("{} {} RAM, {} Cores. Activating {}...", "⚙️  AiTuner:".cyan().dimmed(), format!("{}MB", prof.total_memory_mb).yellow().dimmed(), prof.physical_cores.to_string().yellow().dimmed(), format!("TURBO MODE ({} ctx)", prof.optimal_ctx).magenta().dimmed());
         }
         AiTunerState {
-            num_ctx: 8192,
+            num_ctx: prof.optimal_ctx,
             profile_name: "TURBO".to_string(),
             opts: OllamaOptions {
                 temperature: base_temp,
-                num_ctx: Some(8192),
-                num_thread: Some(cpu_cores),
-                num_gpu: Some(999),
+                num_ctx: Some(prof.optimal_ctx),
+                num_thread: Some(prof.optimal_threads),
+                num_gpu: Some(prof.optimal_gpu_layers),
+                top_k: Some(40),
+                top_p: Some(0.9),
+                repeat_penalty: Some(1.1),
+                f16_kv: Some(prof.f16_kv),
+                use_mmap: Some(prof.use_mmap),
+                num_predict: Some(prof.optimal_ctx as i32),
+                stop: None,
             },
         }
     }
@@ -2144,22 +2196,106 @@ pub async fn embed_text(client: &Client, text: &str) -> Result<Vec<f32>, Box<dyn
     }
 }
 
+#[inline(always)]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    let len = a.len().min(b.len());
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    let mut sum3 = 0.0f32;
+    let mut sum4 = 0.0f32;
+    let mut sum5 = 0.0f32;
+    let mut sum6 = 0.0f32;
+    let mut sum7 = 0.0f32;
+
+    let chunks = len / 8;
+    let remainder = len % 8;
+
+    for i in 0..chunks {
+        let idx = i * 8;
+        sum0 += a[idx] * b[idx];
+        sum1 += a[idx + 1] * b[idx + 1];
+        sum2 += a[idx + 2] * b[idx + 2];
+        sum3 += a[idx + 3] * b[idx + 3];
+        sum4 += a[idx + 4] * b[idx + 4];
+        sum5 += a[idx + 5] * b[idx + 5];
+        sum6 += a[idx + 6] * b[idx + 6];
+        sum7 += a[idx + 7] * b[idx + 7];
+    }
+
+    let mut total = (sum0 + sum1) + (sum2 + sum3) + (sum4 + sum5) + (sum6 + sum7);
+    let rem_start = chunks * 8;
+    for i in 0..remainder {
+        total += a[rem_start + i] * b[rem_start + i];
+    }
+    total
 }
 
+#[inline(always)]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.is_empty() || b.is_empty() || a.len() != b.len() {
         return 0.0;
     }
-    let mut dot = 0.0;
-    let mut norm_a = 0.0;
-    let mut norm_b = 0.0;
-    for (x, y) in a.iter().zip(b.iter()) {
+    let len = a.len();
+    let mut dot0 = 0.0f32;
+    let mut dot1 = 0.0f32;
+    let mut dot2 = 0.0f32;
+    let mut dot3 = 0.0f32;
+
+    let mut na0 = 0.0f32;
+    let mut na1 = 0.0f32;
+    let mut na2 = 0.0f32;
+    let mut na3 = 0.0f32;
+
+    let mut nb0 = 0.0f32;
+    let mut nb1 = 0.0f32;
+    let mut nb2 = 0.0f32;
+    let mut nb3 = 0.0f32;
+
+    let chunks = len / 4;
+    let remainder = len % 4;
+
+    for i in 0..chunks {
+        let idx = i * 4;
+        let a0 = a[idx];
+        let b0 = b[idx];
+        let a1 = a[idx + 1];
+        let b1 = b[idx + 1];
+        let a2 = a[idx + 2];
+        let b2 = b[idx + 2];
+        let a3 = a[idx + 3];
+        let b3 = b[idx + 3];
+
+        dot0 += a0 * b0;
+        na0 += a0 * a0;
+        nb0 += b0 * b0;
+
+        dot1 += a1 * b1;
+        na1 += a1 * a1;
+        nb1 += b1 * b1;
+
+        dot2 += a2 * b2;
+        na2 += a2 * a2;
+        nb2 += b2 * b2;
+
+        dot3 += a3 * b3;
+        na3 += a3 * a3;
+        nb3 += b3 * b3;
+    }
+
+    let mut dot = (dot0 + dot1) + (dot2 + dot3);
+    let mut norm_a = (na0 + na1) + (na2 + na3);
+    let mut norm_b = (nb0 + nb1) + (nb2 + nb3);
+
+    let rem_start = chunks * 4;
+    for i in 0..remainder {
+        let x = a[rem_start + i];
+        let y = b[rem_start + i];
         dot += x * y;
         norm_a += x * x;
         norm_b += y * y;
     }
+
     let norm_prod = (norm_a.sqrt()) * (norm_b.sqrt());
     if norm_prod > 0.0 {
         dot / norm_prod
@@ -2168,11 +2304,11 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+#[inline(always)]
 pub fn tokenize_text(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
+    text.split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(|s| s.to_lowercase())
         .collect()
 }
 
@@ -2358,8 +2494,8 @@ pub fn smart_chunk(content: &str, max_len: usize) -> Vec<String> {
 }
 
 pub async fn build_rag_index(client: &Client, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{} {}", "Indexing directory (Smart Chunking & Binary Vector Store):".bold(), path.cyan());
-    let mut chunks = Vec::new();
+    println!("{} {}", "Indexing directory (Batched Parallel & Binary Vector Store):".bold(), path.cyan());
+    let mut raw_pairs = Vec::new();
     
     for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
         let path_str = entry.path().to_string_lossy().to_string();
@@ -2369,24 +2505,16 @@ pub async fn build_rag_index(client: &Client, path: &str) -> Result<(), Box<dyn 
         if entry.file_type().is_file() {
             if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
                 let text_chunks = smart_chunk(&content, 1000);
-                for (i, text) in text_chunks.into_iter().enumerate() {
-                    print!("Embedding {} chunk {} ... ", path_str.blue(), i);
-                    io::stdout().flush()?;
-                    
-                    if let Ok(vector) = embed_text(client, &text).await {
-                        chunks.push(RagChunk {
-                            file: path_str.clone(),
-                            text,
-                            vector,
-                        });
-                        println!("{}", "OK".green());
-                    } else {
-                        println!("{}", "Failed".red());
-                    }
+                for text in text_chunks {
+                    raw_pairs.push((path_str.clone(), text));
                 }
             }
         }
     }
+    
+    println!("Embedding {} chunks concurrently via BatchedEmbeddingEngine...", raw_pairs.len().to_string().yellow().bold());
+    let engine = BatchedEmbeddingEngine::new(client.clone());
+    let chunks = engine.embed_batch(raw_pairs, "nomic-embed-text", 16).await;
     
     let _ = save_binary_vector_index(std::path::Path::new(BINARY_VECTORS_DEFAULT_FILE), &chunks);
     let json_data = serde_json::to_string(&chunks)?;
@@ -2417,15 +2545,13 @@ pub async fn vella_reindex_file(client: &Client, file_path: &std::path::Path) ->
     
     if let Ok(content) = tokio::fs::read_to_string(file_path).await {
         let text_chunks = smart_chunk(&content, 1000);
+        let mut pairs = Vec::new();
         for text in text_chunks {
-            if let Ok(vector) = embed_text(client, &text).await {
-                chunks.push(RagChunk {
-                    file: path_str.clone(),
-                    text,
-                    vector,
-                });
-            }
+            pairs.push((path_str.clone(), text));
         }
+        let engine = BatchedEmbeddingEngine::new(client.clone());
+        let new_chunks = engine.embed_batch(pairs, "nomic-embed-text", 8).await;
+        chunks.extend(new_chunks);
     }
     
     let _ = save_binary_vector_index(bin_path, &chunks);
@@ -11642,6 +11768,7 @@ pub async fn transpile_code_snippet(
             num_ctx: Some(4096),
             num_thread: None,
             num_gpu: None,
+            ..Default::default()
         };
         let final_opts = opts.unwrap_or(&default_opts);
 
