@@ -1,4 +1,5 @@
 use clap::Parser;
+use colored::Colorize;
 use reqwest::Client;
 use zy::*;
 
@@ -242,6 +243,141 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let rep = generate_analytics_report(std::path::Path::new(path));
                 println!("{}", format_analytics_dashboard_for_terminal(&rep));
+            }
+        }
+        Some(Commands::Graphic { path, protocol, max_width, max_height }) => {
+            let proto = protocol.as_deref().unwrap_or("auto");
+            let max_w = max_width.unwrap_or(60);
+            let max_h = max_height.unwrap_or(28);
+            let rendered = render_diagram_or_image(path, proto, max_w, max_h)?;
+            let report = TerminalGraphicReport {
+                format: "auto".to_string(),
+                protocol: proto.to_string(),
+                dimensions: (max_w, max_h),
+                payload_size: path.len(),
+                rendered_output: rendered,
+                summary: format!("Rendered graphic '{}' using protocol '{}'", path, proto),
+            };
+            println!("{}", format_graphic_report_for_terminal(&report));
+        }
+        Some(Commands::Gui { action, port, open_browser }) => {
+            match action.to_lowercase().as_str() {
+                "start" => {
+                    let handle = launch_desktop_companion_gui(*port, *open_browser).await?;
+                    register_active_gui(handle.clone());
+                    println!("{}", format_gui_report_for_terminal(&handle));
+                    println!("Press Ctrl+C to stop the GUI server...");
+                    tokio::signal::ctrl_c().await?;
+                    handle.stop();
+                    stop_active_gui();
+                    println!("Desktop Companion GUI server stopped.");
+                }
+                "stop" => {
+                    stop_active_gui();
+                    println!("Desktop Companion GUI server stopped.");
+                }
+                _ => {
+                    if let Some(h) = get_active_gui() {
+                        println!("{}", format_gui_report_for_terminal(&h));
+                    } else {
+                        println!("No active Desktop Companion GUI server.");
+                    }
+                }
+            }
+        }
+        Some(Commands::Studio { action, port }) => {
+            match action.to_lowercase().as_str() {
+                "start" => {
+                    let handle = start_swarm_studio_server(*port).await?;
+                    register_active_studio(handle.clone());
+                    println!("{}", format_studio_report_for_terminal(&handle));
+                    println!("Press Ctrl+C to stop the Swarm Studio server...");
+                    tokio::signal::ctrl_c().await?;
+                    handle.stop();
+                    stop_active_studio();
+                    println!("Visual Swarm Studio server stopped.");
+                }
+                "stop" => {
+                    stop_active_studio();
+                    println!("Visual Swarm Studio server stopped.");
+                }
+                _ => {
+                    if let Some(h) = get_active_studio() {
+                        println!("{}", format_studio_report_for_terminal(&h));
+                    } else {
+                        println!("No active Visual Swarm Studio server.");
+                    }
+                }
+            }
+        }
+        Some(Commands::Theme { name, list, preview }) => {
+            if *list {
+                println!("\n{}", "Available Built-in TrueColor Themes:".cyan().bold());
+                for t in ThemeManager::list_themes() {
+                    let pal = ThemeManager::get_theme(t).unwrap();
+                    println!("  • {:<18} {}", t.bold(), pal.primary_accent.paint("████████"));
+                }
+                println!();
+            } else if let Some(n) = name {
+                let pal = set_active_theme(n)?;
+                println!("Active theme switched to '{}'.", pal.name.green().bold());
+                println!("{}", format_theme_report_for_terminal(&pal));
+            } else if *preview {
+                let active = ThemeManager::get_active_theme();
+                println!("{}", format_theme_report_for_terminal(&active));
+            } else {
+                let active = ThemeManager::get_active_theme();
+                println!("{}", format_theme_report_for_terminal(&active));
+            }
+        }
+        Some(Commands::Palette { query, category }) => {
+            let items = FuzzyCommandPalette::build_default_items(std::path::Path::new("."), &[]);
+            let filtered: Vec<PaletteItem> = if let Some(cat) = category {
+                let cat_lower = cat.to_lowercase();
+                items.into_iter().filter(|i| match i.category {
+                    PaletteCategory::SlashCommand => cat_lower == "command" || cat_lower == "cmd" || cat_lower == "slash",
+                    PaletteCategory::File => cat_lower == "file",
+                    PaletteCategory::Tool => cat_lower == "tool",
+                    PaletteCategory::SessionHistory => cat_lower == "history" || cat_lower == "hist",
+                    PaletteCategory::Action => cat_lower == "action",
+                }).collect()
+            } else {
+                items
+            };
+            let results = FuzzyCommandPalette::search_palette(query, &filtered);
+            println!("{}", format_palette_results_for_terminal(query, &results));
+        }
+        Some(Commands::Sound { action, cue }) => {
+            match action.to_lowercase().as_str() {
+                "on" | "enable" => {
+                    AudioCueEngine::set_enabled(true);
+                    println!("{}", format_audio_engine_status_for_terminal(true, None));
+                }
+                "off" | "disable" | "mute" => {
+                    AudioCueEngine::set_enabled(false);
+                    println!("{}", format_audio_engine_status_for_terminal(false, None));
+                }
+                "toggle" => {
+                    let enabled = AudioCueEngine::toggle_enabled();
+                    println!("{}", format_audio_engine_status_for_terminal(enabled, None));
+                }
+                "test" => {
+                    let results = AudioCueEngine::test_all_cues();
+                    println!("\n{}", "Synthesized Audio Sensory Feedback Cues:".cyan().bold());
+                    for r in results {
+                        println!("  🔊 {}", r);
+                    }
+                    let _ = play_sound_cue("task_completed");
+                }
+                "status" => {
+                    let enabled = AudioCueEngine::is_enabled();
+                    println!("{}", format_audio_engine_status_for_terminal(enabled, cue.as_deref()));
+                }
+                _ => {
+                    let cue_name = cue.as_deref().unwrap_or(action.as_str());
+                    let _ = play_sound_cue(cue_name)?;
+                    println!("Played audio cue: {}", cue_name.cyan().bold());
+                }
             }
         }
         None => {

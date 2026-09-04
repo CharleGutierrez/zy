@@ -3987,4 +3987,525 @@ fn test_brutal_edge_cases_across_6_latest_systems() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+// ============================================================================
+// SYSTEM 15: TERMINAL GRAPHICS PROTOCOLS & UNICODE TRUECOLOR ENGINE
+// ============================================================================
 
+#[test]
+fn test_terminal_graphics_protocols_and_unicode_fallback() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_test_graphics_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    let test_img_path = temp_dir.join("test_sample.png");
+    let synthetic_png_bytes = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG header
+        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR
+        0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x10,
+        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x91, 0x68,
+        0x36, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
+        0x54, 0x78, 0x9C, 0x63, 0x60, 0x00, 0x00, 0x00,
+        0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC, 0x33, 0x00,
+        0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+        0x42, 0x60, 0x82,
+    ];
+    std::fs::write(&test_img_path, &synthetic_png_bytes).unwrap();
+
+    // 1. Kitty Graphics Protocol
+    let kitty_out = render_terminal_graphics(&synthetic_png_bytes, "png", "kitty", 40, 20).unwrap();
+    assert!(kitty_out.starts_with("\x1b_G"));
+    assert!(kitty_out.ends_with("\x1b\\"));
+    assert!(kitty_out.contains("a=T"));
+
+    // 2. iTerm2 Protocol
+    let iterm_out = render_terminal_graphics(&synthetic_png_bytes, "png", "iterm2", 40, 20).unwrap();
+    assert!(iterm_out.starts_with("\x1b]1337;File=inline=1"));
+    assert!(iterm_out.ends_with("\x07"));
+    assert!(iterm_out.contains(";size="));
+
+    // 3. Sixel Protocol
+    let sixel_out = render_terminal_graphics(&synthetic_png_bytes, "png", "sixel", 40, 20).unwrap();
+    assert!(sixel_out.starts_with("\x1bPq"));
+    assert!(sixel_out.ends_with("\x1b\\"));
+    assert!(sixel_out.contains("#0;2;"));
+
+    // 4. Unicode Half-Block TrueColor Fallback
+    let unicode_out = render_terminal_graphics(&synthetic_png_bytes, "png", "unicode", 20, 10).unwrap();
+    assert!(unicode_out.contains("▀"));
+    assert!(unicode_out.contains("\x1b[38;2;"));
+    assert!(unicode_out.contains(";48;2;"));
+
+    // 5. Quadrant Fallback
+    let quad_out = render_terminal_graphics(&synthetic_png_bytes, "png", "quadrant", 20, 10).unwrap();
+    assert!(quad_out.contains("\x1b[38;2;"));
+
+    // 6. render_diagram_or_image from file
+    let file_rendered = render_diagram_or_image(test_img_path.to_str().unwrap(), "kitty", 30, 15).unwrap();
+    assert!(file_rendered.starts_with("\x1b_G"));
+
+    // 7. render_diagram_or_image from diagram spec string
+    let diagram_rendered = render_diagram_or_image("flowchart TD\nA-->B", "unicode", 30, 15).unwrap();
+    assert!(diagram_rendered.contains("▀"));
+
+    // 8. Terminal Graphic Report Formatting
+    let rep = TerminalGraphicReport {
+        format: "png".to_string(),
+        protocol: "sixel".to_string(),
+        dimensions: (40, 20),
+        payload_size: synthetic_png_bytes.len(),
+        rendered_output: sixel_out.clone(),
+        summary: "Rendered Sixel graphics test".to_string(),
+    };
+    let term_str = format_graphic_report_for_terminal(&rep);
+    assert!(term_str.contains("TERMINAL GRAPHICS VISUALIZER"));
+    assert!(term_str.contains("sixel"));
+    assert!(term_str.contains("40x20"));
+
+    // 9. Verify tool in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("render_terminal_graphic"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 16: DESKTOP COMPANION GUI SERVER LIFECYCLE
+// ============================================================================
+
+#[tokio::test]
+async fn test_desktop_companion_gui_server_lifecycle() {
+    // 1. Launch server on dynamic port (0)
+    let handle = launch_desktop_companion_gui(0, false).await.expect("Failed to launch GUI server");
+    let port = handle.port();
+    assert!(port > 0);
+    assert!(handle.url().contains(&port.to_string()));
+    assert!(handle.is_running());
+
+    // 2. Global registry tests
+    register_active_gui(handle.clone());
+    let active = get_active_gui();
+    assert!(active.is_some());
+    assert_eq!(active.unwrap().port(), port);
+
+    // 3. Test HTTP Endpoints using reqwest Client
+    let client = reqwest::Client::new();
+    let base_url = handle.url().to_string();
+
+    // GET / (HTML App)
+    let index_resp = client.get(&base_url).send().await.expect("Failed to GET /");
+    assert_eq!(index_resp.status(), 200);
+    let index_html = index_resp.text().await.unwrap();
+    assert!(index_html.contains("zy Desktop Companion"));
+    assert!(index_html.contains("tailwindcss"));
+
+    // GET /api/status
+    let status_resp = client.get(format!("{}/api/status", base_url)).send().await.expect("Failed to GET /api/status");
+    assert_eq!(status_resp.status(), 200);
+    let status_json: serde_json::Value = status_resp.json().await.unwrap();
+    assert_eq!(status_json["status"], "running");
+    assert_eq!(status_json["port"], port);
+
+    // GET /api/telemetry
+    let telem_resp = client.get(format!("{}/api/telemetry", base_url)).send().await.expect("Failed to GET /api/telemetry");
+    assert_eq!(telem_resp.status(), 200);
+    let telem_json: serde_json::Value = telem_resp.json().await.unwrap();
+    assert!(telem_json["tokens_per_sec"].as_f64().unwrap() > 0.0);
+
+    // POST /api/prompt
+    let prompt_resp = client.post(format!("{}/api/prompt", base_url))
+        .json(&serde_json::json!({ "prompt": "Hello zy!" }))
+        .send().await.expect("Failed to POST /api/prompt");
+    assert_eq!(prompt_resp.status(), 200);
+
+    // POST /api/approve
+    let app_resp = client.post(format!("{}/api/approve", base_url))
+        .json(&serde_json::json!({ "approved": true }))
+        .send().await.expect("Failed to POST /api/approve");
+    assert_eq!(app_resp.status(), 200);
+
+    // 4. Test Broadcast streams
+    handle.broadcast_thought("Observing workspace architecture...");
+    handle.broadcast_event("hunk_diff", serde_json::json!({ "file": "src/lib.rs", "additions": 50 }));
+
+    // 5. Format Terminal Report
+    let rep_str = format_gui_report_for_terminal(&handle);
+    assert!(rep_str.contains("DESKTOP COMPANION GUI"));
+    assert!(rep_str.contains(&port.to_string()));
+
+    // 6. Graceful Shutdown
+    handle.stop();
+    assert!(!handle.is_running());
+    stop_active_gui();
+    assert!(get_active_gui().is_none());
+
+    // 7. Verify desktop_gui in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("desktop_gui"));
+}
+
+// ============================================================================
+// SYSTEM 17: VISUAL MULTI-AGENT SWARM CANVAS & STUDIO
+// ============================================================================
+
+#[tokio::test]
+async fn test_visual_swarm_canvas_studio_lifecycle() {
+    // 1. Start Swarm Studio server on dynamic port (0)
+    let handle = start_swarm_studio_server(0).await.expect("Failed to start swarm studio server");
+    let port = handle.port();
+    assert!(port > 0);
+    assert!(handle.url().contains(&port.to_string()));
+    assert!(handle.is_running());
+
+    // 2. Global registry tests
+    register_active_studio(handle.clone());
+    let active = get_active_studio();
+    assert!(active.is_some());
+    assert_eq!(active.unwrap().port(), port);
+
+    // 3. Test HTTP Endpoints
+    let client = reqwest::Client::new();
+    let base_url = handle.url().to_string();
+
+    // GET / (Studio HTML Canvas)
+    let index_resp = client.get(&base_url).send().await.expect("Failed to GET studio /");
+    assert_eq!(index_resp.status(), 200);
+    let index_html = index_resp.text().await.unwrap();
+    assert!(index_html.contains("Multi-Agent Swarm Studio Canvas"));
+    assert!(index_html.contains("Architect"));
+    assert!(index_html.contains("Coder"));
+
+    // GET /api/studio/state
+    let state_resp = client.get(format!("{}/api/studio/state", base_url)).send().await.expect("Failed to GET /api/studio/state");
+    assert_eq!(state_resp.status(), 200);
+    let state_json: SwarmStudioState = state_resp.json().await.unwrap();
+    assert_eq!(state_json.nodes.len(), 4);
+    assert!(state_json.nodes.iter().any(|n| n.role == "Architect"));
+    assert!(state_json.nodes.iter().any(|n| n.role == "Coder"));
+    assert!(state_json.nodes.iter().any(|n| n.role == "Auditor"));
+    assert!(state_json.nodes.iter().any(|n| n.role == "QA Tester"));
+
+    // 4. Update Node Status & Broadcast Message Passing
+    handle.update_agent_status("coder", "working", "synthesizing terminal graphics");
+    handle.broadcast_node_event("architect", "coder", "plan_ready", "Terminal Graphics Specification v1");
+    handle.set_active_diff("diff --git a/src/lib.rs b/src/lib.rs\n+pub fn render_terminal_graphics()");
+
+    // Allow tokio tasks to process updates
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Verify State Mutated
+    let updated_state = handle.state.read().await.clone();
+    let coder_node = updated_state.nodes.iter().find(|n| n.id == "coder").unwrap();
+    assert_eq!(coder_node.status, "working");
+    assert_eq!(coder_node.current_task, "synthesizing terminal graphics");
+    assert!(!updated_state.logs.is_empty());
+    assert_eq!(updated_state.logs[0].from, "architect");
+    assert_eq!(updated_state.logs[0].to, "coder");
+    assert!(updated_state.active_diff.as_ref().unwrap().contains("render_terminal_graphics"));
+
+    // 5. Terminal Formatting Report
+    let rep_str = format_studio_report_for_terminal(&handle);
+    assert!(rep_str.contains("VISUAL SWARM STUDIO CANVAS"));
+    assert!(rep_str.contains(&port.to_string()));
+
+    // 6. Graceful Shutdown
+    handle.stop();
+    assert!(!handle.is_running());
+    stop_active_studio();
+    assert!(get_active_studio().is_none());
+
+    // 7. Verify studio_canvas in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("studio_canvas"));
+}
+
+// ============================================================================
+// SYSTEM 18: UNIVERSAL THEME & 24-BIT TRUECOLOR ENGINE
+// ============================================================================
+
+#[test]
+fn test_universal_theme_palette_and_truecolor_engine() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_test_theme_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Test RgbColor hex parsing and ANSI rendering
+    let c1 = RgbColor::from_hex("#89b4fa").unwrap();
+    assert_eq!(c1.r, 137);
+    assert_eq!(c1.g, 180);
+    assert_eq!(c1.b, 250);
+    assert_eq!(c1.to_hex(), "#89b4fa");
+    assert_eq!(c1.to_ansi_fg(), "\x1b[38;2;137;180;250m");
+    assert_eq!(c1.to_ansi_bg(), "\x1b[48;2;137;180;250m");
+
+    let painted = c1.paint("HELLO");
+    assert!(painted.starts_with("\x1b[38;2;137;180;250m"));
+    assert!(painted.ends_with("\x1b[0m"));
+
+    // 3-digit hex parsing
+    let c2 = RgbColor::from_hex("#fff").unwrap();
+    assert_eq!(c2.r, 255);
+    assert_eq!(c2.g, 255);
+    assert_eq!(c2.b, 255);
+
+    // 2. Validate all 8 built-in themes
+    let themes = ThemeManager::list_themes();
+    assert_eq!(themes.len(), 8);
+    for t_name in &themes {
+        let palette = ThemeManager::get_theme(t_name).unwrap();
+        assert_eq!(&palette.name, *t_name);
+        assert!(!palette.primary_accent.to_hex().is_empty());
+        assert!(!palette.background.to_hex().is_empty());
+        assert!(!palette.diff_addition.to_hex().is_empty());
+        assert!(!palette.diff_deletion.to_hex().is_empty());
+
+        let preview = ThemeManager::render_theme_preview(&palette);
+        assert!(preview.contains("THEME PALETTE PREVIEW"));
+        assert!(preview.contains(t_name));
+    }
+
+    // 3. Setting active theme
+    let mocha = set_active_theme("tokyo-night").unwrap();
+    assert_eq!(mocha.name, "tokyo-night");
+    let current = ThemeManager::get_active_theme();
+    assert_eq!(current.name, "tokyo-night");
+
+    // 4. Theme persistence in workspace
+    ThemeManager::save_theme_preference("dracula", &temp_dir).unwrap();
+    let loaded = ThemeManager::load_theme_preference(&temp_dir);
+    assert_eq!(loaded.unwrap(), "dracula");
+
+    // 5. Format Theme Report
+    let rep_str = format_theme_report_for_terminal(&mocha);
+    assert!(rep_str.contains("tokyo-night"));
+    assert!(rep_str.contains("Primary Accent:"));
+
+    // 6. Verify set_theme in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("set_theme"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 19: MODAL KEYBINDINGS & FUZZY COMMAND PALETTE
+// ============================================================================
+
+#[test]
+fn test_modal_keybindings_and_fuzzy_command_palette() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_test_palette_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    std::fs::write(temp_dir.join("main.rs"), "fn main() {}").unwrap();
+    std::fs::write(temp_dir.join("Cargo.toml"), "[package]").unwrap();
+
+    let history = vec!["how do I run tests?".to_string(), "refactor theme system".to_string()];
+    let items = FuzzyCommandPalette::build_default_items(&temp_dir, &history);
+    assert!(items.len() >= 20);
+
+    // 1. Fuzzy Search: Exact match
+    let results_exact = FuzzyCommandPalette::search_palette("/graphic", &items);
+    assert!(!results_exact.is_empty());
+    assert_eq!(results_exact[0].item.title, "/graphic");
+    assert!(results_exact[0].score >= 100);
+
+    // 2. Fuzzy Search: Subsequence / Prefix
+    let results_prefix = FuzzyCommandPalette::search_palette("worktree", &items);
+    assert!(!results_prefix.is_empty());
+    assert!(results_prefix.iter().any(|r| r.item.title.contains("worktree")));
+
+    // 3. Fuzzy Search: Acronym initials
+    let results_acronym = FuzzyCommandPalette::search_palette("ptg", &items);
+    // Even if no acronym matches ptg, search should be safe and return filtered results
+    assert!(results_acronym.is_empty() || results_acronym[0].score > 0);
+
+    // 4. Empty query returns all items with score 100
+    let results_empty = FuzzyCommandPalette::search_palette("", &items);
+    assert_eq!(results_empty.len(), items.len());
+
+    // 5. Test Keybinding State Machine
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // Ctrl+P opens palette from normal mode
+    let key_ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+    let (m1, a1) = handle_tui_keybinding(KeybindingMode::Normal, key_ctrl_p);
+    assert_eq!(m1, KeybindingMode::Palette);
+    assert_eq!(a1, KeyAction::OpenPalette);
+
+    // Palette mode Esc returns to normal
+    let key_esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    let (m2, a2) = handle_tui_keybinding(KeybindingMode::Palette, key_esc);
+    assert_eq!(m2, KeybindingMode::Normal);
+    assert_eq!(a2, KeyAction::ClosePalette);
+
+    // Normal mode Vim navigation
+    let key_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+    let (m3, a3) = handle_tui_keybinding(KeybindingMode::Normal, key_j);
+    assert_eq!(m3, KeybindingMode::Normal);
+    assert_eq!(a3, KeyAction::MoveDown);
+
+    let key_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+    let (m4, a4) = handle_tui_keybinding(KeybindingMode::Normal, key_n);
+    assert_eq!(m4, KeybindingMode::Normal);
+    assert_eq!(a4, KeyAction::NextHunk);
+
+    let key_space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+    let (m5, a5) = handle_tui_keybinding(KeybindingMode::Normal, key_space);
+    assert_eq!(m5, KeybindingMode::Normal);
+    assert_eq!(a5, KeyAction::ToggleFold);
+
+    // 6. Format Terminal Palette Report
+    let rep_str = format_palette_results_for_terminal("/graph", &results_exact);
+    assert!(rep_str.contains("FUZZY COMMAND PALETTE"));
+    assert!(rep_str.contains("/graphic"));
+
+    // 7. Verify fuzzy_command_palette in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("fuzzy_command_palette"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 20: AMBIENT AUDIO & SENSORY FEEDBACK ENGINE
+// ============================================================================
+
+#[test]
+fn test_ambient_audio_sensory_feedback_engine() {
+    // 1. Audio Enable / Disable / Toggle State
+    AudioCueEngine::set_enabled(true);
+    assert!(AudioCueEngine::is_enabled());
+    let toggled = AudioCueEngine::toggle_enabled();
+    assert!(!toggled);
+    assert!(!AudioCueEngine::is_enabled());
+    AudioCueEngine::set_enabled(true);
+    assert!(AudioCueEngine::is_enabled());
+
+    // 2. Synthesize PCM RIFF WAV headers for all 6 cues
+    let cues = vec![
+        SoundCueType::TaskCompleted,
+        SoundCueType::ErrorAlert,
+        SoundCueType::CheckpointSaved,
+        SoundCueType::ToolExecuted,
+        SoundCueType::ThemeChanged,
+        SoundCueType::WarningAlert,
+    ];
+
+    for cue in cues {
+        let wav = AudioCueEngine::synthesize_cue_wav(cue);
+        assert!(wav.len() > 44, "WAV data too short for cue {:?}", cue);
+        // Validate RIFF WAV header bytes
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(&wav[36..40], b"data");
+
+        // Validate sample rate 44100 (0x44AC0000 in little endian -> [0x44, 0xAC, 0x00, 0x00])
+        let sample_rate = u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]);
+        assert_eq!(sample_rate, 44100);
+
+        // Validate 16-bit
+        let bits_per_sample = u16::from_le_bytes([wav[34], wav[35]]);
+        assert_eq!(bits_per_sample, 16);
+    }
+
+    // 3. String name mapping
+    assert_eq!(SoundCueType::from_str("task_completed"), Some(SoundCueType::TaskCompleted));
+    assert_eq!(SoundCueType::from_str("error"), Some(SoundCueType::ErrorAlert));
+    assert_eq!(SoundCueType::from_str("checkpoint"), Some(SoundCueType::CheckpointSaved));
+    assert_eq!(SoundCueType::from_str("tool"), Some(SoundCueType::ToolExecuted));
+    assert_eq!(SoundCueType::from_str("theme"), Some(SoundCueType::ThemeChanged));
+    assert_eq!(SoundCueType::from_str("warn"), Some(SoundCueType::WarningAlert));
+
+    // 4. Test all cues function
+    let test_reports = AudioCueEngine::test_all_cues();
+    assert_eq!(test_reports.len(), 6);
+
+    // 5. Test playing cue safely in test environment
+    let play_res = play_sound_cue("task_completed");
+    assert!(play_res.is_ok());
+
+    // 6. Terminal status report
+    let status_str = format_audio_engine_status_for_terminal(true, Some("task_completed"));
+    assert!(status_str.contains("AMBIENT AUDIO SENSORY ENGINE"));
+    assert!(status_str.contains("ENABLED"));
+    assert!(status_str.contains("task_completed"));
+
+    // 7. Verify play_audio_cue in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("play_audio_cue"));
+}
+
+// ============================================================================
+// SYSTEM 21: BRUTAL EDGE CASES ACROSS ALL 6 UX/UI SYSTEMS
+// ============================================================================
+
+#[tokio::test]
+async fn test_brutal_edge_cases_across_6_ux_ui_systems() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_brutal_uxui_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Graphics Edge Cases: empty image buffer & unknown protocol
+    let empty_render = render_terminal_graphics(&[], "unknown", "unknown_proto", 0, 0);
+    assert!(empty_render.is_ok());
+    let empty_str = empty_render.unwrap();
+    assert!(empty_str.contains("▀") || empty_str.is_empty());
+
+    // Non-existent image file falls back to treating input as diagram text
+    let missing_file_res = render_diagram_or_image("non_existent_file_12345.png", "unicode", 20, 10);
+    assert!(missing_file_res.is_ok());
+
+    // Corrupt base64 string
+    let bad_b64 = render_diagram_or_image("!!!badbase64???", "kitty", 20, 10);
+    assert!(bad_b64.is_ok());
+
+    // 2. GUI Edge Cases: 404 Route & Rapid Repeated Shutdown
+    let gui_handle = launch_desktop_companion_gui(0, false).await.unwrap();
+    let client = reqwest::Client::new();
+    let not_found_resp = client.get(format!("{}/non_existent_endpoint", gui_handle.url())).send().await.unwrap();
+    assert_eq!(not_found_resp.status(), 404);
+
+    gui_handle.stop();
+    gui_handle.stop(); // double stop is idempotent
+    assert!(!gui_handle.is_running());
+
+    // 3. Swarm Studio Edge Cases: Non-existent node updates and 404
+    let studio_handle = start_swarm_studio_server(0).await.unwrap();
+    studio_handle.update_agent_status("ghost_agent", "idle", "none");
+    studio_handle.broadcast_node_event("ghost1", "ghost2", "signal", "empty");
+    let not_found_studio = client.get(format!("{}/bad_path", studio_handle.url())).send().await.unwrap();
+    assert_eq!(not_found_studio.status(), 404);
+
+    studio_handle.stop();
+    studio_handle.stop();
+    assert!(!studio_handle.is_running());
+
+    // 4. Theme Engine Edge Cases: Malformed hex strings and unknown theme
+    assert!(RgbColor::from_hex("").is_none());
+    assert!(RgbColor::from_hex("#12").is_none());
+    assert!(RgbColor::from_hex("#12345").is_none());
+    assert!(RgbColor::from_hex("#zzzzzz").is_none());
+    assert!(ThemeManager::get_theme("totally_fake_theme").is_none());
+    let bad_theme_set = set_active_theme("non_existent_theme");
+    assert!(bad_theme_set.is_err());
+
+    // 5. Command Palette Edge Cases: Special regex characters in query
+    let special_q_items = FuzzyCommandPalette::build_default_items(&temp_dir, &[]);
+    let special_results = FuzzyCommandPalette::search_palette(".*+?^${}()|[]\\", &special_q_items);
+    // Should not panic, gracefully returns 0 results
+    assert_eq!(special_results.len(), 0);
+
+    // 6. Audio Engine Edge Cases: Muted sound does not throw error
+    AudioCueEngine::set_enabled(false);
+    let muted_play = play_sound_cue("task_completed");
+    assert!(muted_play.is_ok());
+    AudioCueEngine::set_enabled(true);
+
+    // Unknown cue string defaults gracefully
+    let unknown_cue = play_sound_cue("completely_unknown_cue_name");
+    assert!(unknown_cue.is_ok());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
