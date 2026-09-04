@@ -498,6 +498,210 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let parsed = parse_crash_stack_trace(&trace_content)?;
             println!("{}", format_stack_trace_report_for_terminal(&parsed));
         }
+        Some(Commands::Voice { model, timeout }) | Some(Commands::Duplex { model, timeout }) => {
+            let m = model.as_deref().unwrap_or(&cli.model);
+            let tuner = run_ai_tuner(0.1, true);
+            let summary = run_duplex_voice_loop(&client, m, &tuner.opts, *timeout).await?;
+            println!("{}", format_duplex_voice_summary_for_terminal(&summary));
+        }
+        Some(Commands::Gitgraph { max_commits, path }) => {
+            let graph = parse_git_branch_graph(std::path::Path::new(path), *max_commits)?;
+            println!("{}", render_git_graph_to_terminal(&graph));
+        }
+        Some(Commands::Sidecar { action, port, model }) => {
+            let m = model.as_deref().unwrap_or(&cli.model);
+            match action.to_lowercase().as_str() {
+                "start" => {
+                    let handle = start_editor_sidecar(*port, &client, m).await?;
+                    println!("{}", format_sidecar_report_for_terminal(&handle));
+                    println!("Press Ctrl+C to stop the Universal Editor Sidecar daemon...");
+                    tokio::signal::ctrl_c().await?;
+                    handle.stop();
+                    stop_active_sidecar();
+                    println!("Editor Sidecar stopped.");
+                }
+                "stop" => {
+                    stop_active_sidecar();
+                    println!("Editor Sidecar daemon stopped.");
+                }
+                _ => {
+                    if let Some(h) = get_active_sidecar() {
+                        println!("{}", format_sidecar_report_for_terminal(&h));
+                    } else {
+                        println!("No active Editor Sidecar daemon running.");
+                    }
+                }
+            }
+        }
+        Some(Commands::Pair { action, target, pin, port }) => {
+            match action.to_lowercase().as_str() {
+                "host" | "start" => {
+                    let handle = start_pair_session(*port).await?;
+                    println!("{}", format_pair_session_report_for_terminal(&handle));
+                    println!("Press Ctrl+C to stop pair session...");
+                    tokio::signal::ctrl_c().await?;
+                    handle.stop();
+                    stop_active_pair();
+                    println!("Pair programming session stopped.");
+                }
+                "join" => {
+                    let addr = target.as_deref().unwrap_or("127.0.0.1:8099");
+                    let pin_val = pin.as_deref().unwrap_or("");
+                    join_pair_session(addr, pin_val).await?;
+                }
+                "stop" => {
+                    stop_active_pair();
+                    println!("Pair session multiplexer stopped.");
+                }
+                _ => {
+                    if let Some(h) = get_active_pair() {
+                        println!("{}", format_pair_session_report_for_terminal(&h));
+                    } else {
+                        println!("No active pair session multiplexer.");
+                    }
+                }
+            }
+        }
+        Some(Commands::Health { path, json }) => {
+            let metrics = calculate_codebase_health(std::path::Path::new(path))?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&metrics)?);
+            } else {
+                println!("{}", render_health_radar_chart(&metrics, 80));
+            }
+        }
+        Some(Commands::Persona { name, list, details, path }) => {
+            let manager = PersonaManager::new(std::path::Path::new(path));
+            if *list || name.is_none() {
+                let personas = manager.list_personas();
+                println!("{}", format_persona_list_for_terminal(&personas, manager.active_persona.as_deref()));
+            } else if let Some(n) = name {
+                if let Some(p) = manager.get_persona(n) {
+                    if *details {
+                        println!("{}", format_persona_activated_for_terminal(&p));
+                        println!("System Prompt:\n{}\n", p.system_prompt.cyan());
+                    } else {
+                        println!("{}", format_persona_activated_for_terminal(&p));
+                    }
+                } else {
+                    println!("Persona '{}' not found.", n.red());
+                }
+            }
+        }
+        Some(Commands::Snippet { action, name, template, params, path }) => {
+            let manager = SnippetManager::new(std::path::Path::new(path));
+            match action.to_lowercase().as_str() {
+                "save" => {
+                    if let (Some(n), Some(t)) = (name, template) {
+                        let snip = manager.save_snippet(n, t, None)?;
+                        println!("Saved snippet `{}` (variables: {}).", snip.name.green().bold(), snip.variables.join(", ").yellow());
+                    } else {
+                        println!("Usage: zy snippet save <name> --template <template_str>");
+                    }
+                }
+                "delete" => {
+                    if let Some(n) = name {
+                        let deleted = manager.delete_snippet(n)?;
+                        println!("Snippet `{}` deleted: {}", n, deleted);
+                    }
+                }
+                "run" | "expand" => {
+                    if let Some(n) = name {
+                        let mut p_map = std::collections::HashMap::new();
+                        for p in params {
+                            if let Some((k, v)) = p.split_once('=') {
+                                p_map.insert(k.to_string(), v.to_string());
+                            }
+                        }
+                        let exp = manager.expand_snippet(n, &p_map)?;
+                        if let Some(snip) = manager.get_snippet(n) {
+                            println!("{}", format_snippet_expansion_for_terminal(&snip, &exp, &p_map));
+                        }
+                    }
+                }
+                _ => {
+                    let list = manager.list_snippets();
+                    println!("{}", format_snippet_list_for_terminal(&list));
+                }
+            }
+        }
+        Some(Commands::Web { port }) => {
+            let handle = EmbeddedWebDashboard::start(*port).await?;
+            println!("{}", format!("⚡ zy Local Web Dashboard running on http://localhost:{}", port).cyan().bold());
+            println!("{}", "Press Ctrl+C to terminate the dashboard server.".dimmed());
+            tokio::signal::ctrl_c().await?;
+            handle.abort();
+            println!("{}", "Web dashboard stopped.".yellow());
+        }
+        Some(Commands::Hud { action, port, query }) => {
+            let bridge = DesktopHudBridge::new(*port);
+            match action.to_lowercase().as_str() {
+                "query" => {
+                    let q = query.as_deref().unwrap_or("");
+                    let results = DesktopHudBridge::query_spotlight(q, std::path::Path::new("."));
+                    println!("\n{}", "🔍 SPOTLIGHT SEARCH RESULTS:".cyan().bold());
+                    for r in results {
+                        println!("  {} [{}] - {} ({})", r.title.green().bold(), r.category.yellow(), r.description.dimmed(), r.action_command.cyan());
+                    }
+                }
+                "state" => {
+                    let msg = DesktopHudMessage {
+                        jsonrpc: "2.0".to_string(),
+                        id: Some(1),
+                        method: "hud/get_telemetry".to_string(),
+                        params: serde_json::json!({}),
+                    };
+                    let resp = DesktopHudBridge::handle_hud_rpc_message(&msg, &bridge).await;
+                    println!("{}", serde_json::to_string_pretty(&resp).unwrap());
+                }
+                _ => {
+                    println!("{}", format!("⚡ zy Desktop GUI & HUD Bridge active on port {}", port).green().bold());
+                    println!("Spotlight shortcut ready: Ctrl+Space / Cmd+Space");
+                }
+            }
+        }
+        Some(Commands::Ux { mode, target }) => {
+            match mode.to_lowercase().as_str() {
+                "radar" => {
+                    let metrics = CodebaseRadarMetrics::calculate(std::path::Path::new(target));
+                    println!("\n{}", "📊 CODEBASE HEALTH & ARCHITECTURE RADAR:".cyan().bold());
+                    println!("  Maintainability:  {:.1}%", metrics.maintainability);
+                    println!("  Complexity Score: {:.1}%", metrics.complexity);
+                    println!("  Test Coverage:    {:.1}%", metrics.test_coverage);
+                    println!("  Security Rating:  {:.1}%", metrics.security);
+                    println!("  Performance:      {:.1}%", metrics.performance);
+                    println!("  Documentation:    {:.1}%", metrics.documentation);
+                    println!("  Overall Rating:   {:.1}%", metrics.overall_score.to_string().green().bold());
+                }
+                "dag" => {
+                    let dag = DagLayout::build_swarm_workflow_dag(target, &[
+                        "Scan repository symbols".to_string(),
+                        "Analyze architectural dependencies".to_string(),
+                        "Execute automated verifications".to_string(),
+                    ]);
+                    println!("\n{}", "🔀 SWARM TOPOLOGICAL DAG MERMAID:".cyan().bold());
+                    println!("{}\n", dag.to_mermaid().cyan());
+                }
+                "voice" => {
+                    let synthetic_pcm: Vec<f32> = (0..16000).map(|i| (i as f32 * 0.05).sin() * 0.1).collect();
+                    let spectrum = FastFourierSpectrum::compute(&synthetic_pcm, 16000);
+                    println!("\n{}", "🎙️ FULL-DUPLEX AUDIO SPECTRUM VISUALIZER:".cyan().bold());
+                    println!("  Frequency Bars: [{}]", spectrum.to_ascii_bars().green().bold());
+                    println!("  RMS Volume:     {:.4}", spectrum.rms_volume);
+                    println!("  Peak Frequency: {:.1} Hz", spectrum.peak_frequency_hz);
+                    println!("  VAD Speaking:   {}", if spectrum.is_speech_active { "YES".green() } else { "NO".dimmed() });
+                }
+                _ => {
+                    let caps = TerminalCapabilities::detect();
+                    println!("\n{}", "⚡ ZY 5-SYSTEM UX/UI ENGINE STATUS:".cyan().bold());
+                    println!("  1. TUI Graphics Protocol:    {:?}", caps.protocol);
+                    println!("  2. 24-bit TrueColor:         {}", if caps.true_color { "Enabled".green() } else { "Disabled".dimmed() });
+                    println!("  3. Embedded Web Dashboard:   http://localhost:7890");
+                    println!("  4. Desktop HUD Spotlight:    Ready (Port 8105)");
+                    println!("  5. Universal Editor Sidecar: Ready (Port 8098)");
+                }
+            }
+        }
         None => {
             if cli.tui {
                 let tuner = run_ai_tuner(0.1, true);

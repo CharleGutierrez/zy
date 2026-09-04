@@ -16,10 +16,16 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use sysinfo::System;
 use termimad::print_text;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use walkdir::WalkDir;
+
+pub mod tier3_ux;
+pub use tier3_ux::*;
+pub mod ux_stack;
+pub use ux_stack::*;
 
 pub const OLLAMA_URL: &str = "http://localhost:11434";
 
@@ -473,7 +479,127 @@ pub enum Commands {
         /// Execute input as a shell command to capture crash output
         #[arg(short = 'e', long)]
         execute: bool,
-    }
+    },
+    /// Continuous Full-Duplex Voice Conversation Mode
+    Voice {
+        /// Optional model override for voice loop
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Session timeout in seconds (default 30)
+        #[arg(short, long, default_value_t = 30)]
+        timeout: u64,
+    },
+    /// Continuous Full-Duplex Voice Conversation Mode
+    Duplex {
+        /// Optional model override for voice loop
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Session timeout in seconds (default 30)
+        #[arg(short, long, default_value_t = 30)]
+        timeout: u64,
+    },
+    /// Interactive Git Branch & Merge Graph TUI
+    Gitgraph {
+        /// Maximum number of commits to render (default 25)
+        #[arg(short = 'n', long, default_value_t = 25)]
+        max_commits: usize,
+        /// Target workspace path
+        #[arg(short, long, default_value = ".")]
+        path: String,
+    },
+    /// Universal Editor Sidecar Bridge (JSON-RPC 2.0 LSP daemon)
+    Sidecar {
+        /// Action: start, stop, status
+        #[arg(default_value = "start")]
+        action: String,
+        /// Port to bind (default 7373, 0 for dynamic)
+        #[arg(short, long, default_value_t = 7373)]
+        port: u16,
+        /// Model to use for completions and chat
+        #[arg(short, long)]
+        model: Option<String>,
+    },
+    /// Real-Time Multi-Terminal Pair-Programming Multiplexer
+    Pair {
+        /// Action: host, join, status, stop, vote
+        #[arg(default_value = "host")]
+        action: String,
+        /// Server address for 'join' action, or session ID
+        target: Option<String>,
+        /// 6-digit session PIN for 'join' or voting
+        #[arg(short, long)]
+        pin: Option<String>,
+        /// Port to bind (default 8099, 0 for dynamic)
+        #[arg(short, long, default_value_t = 8099)]
+        port: u16,
+    },
+    /// Codebase Health & Architecture Radar Chart
+    Health {
+        /// Target workspace path
+        #[arg(default_value = ".")]
+        path: String,
+        /// Output raw JSON metrics instead of rendered ASCII radar chart
+        #[arg(long)]
+        json: bool,
+    },
+    /// Dynamic Persona Matrix & System Prompt Swapper
+    Persona {
+        /// Persona name to activate or inspect (e.g. security-auditor, clean-coder, performance-optimizer)
+        name: Option<String>,
+        /// List all available built-in and custom personas
+        #[arg(short, long)]
+        list: bool,
+        /// Show detailed prompt and guidelines for persona
+        #[arg(short, long)]
+        details: bool,
+        /// Workspace root path (defaults to '.')
+        #[arg(short, long, default_value = ".")]
+        path: String,
+    },
+    /// Parameterized Prompt Snippet Library
+    Snippet {
+        /// Action: list, save, run, delete, show
+        #[arg(default_value = "list")]
+        action: String,
+        /// Snippet name
+        name: Option<String>,
+        /// Snippet template string (for 'save' action)
+        #[arg(short, long)]
+        template: Option<String>,
+        /// Parameters in KEY=VALUE format for template expansion
+        #[arg(short, long)]
+        params: Vec<String>,
+        /// Workspace root path (defaults to '.')
+        #[arg(short, long, default_value = ".")]
+        path: String,
+    },
+    /// Embedded Local Web Dashboard & GUI (Zero-install localhost server)
+    Web {
+        /// Port to bind web server (default: 7890)
+        #[arg(short, long, default_value_t = 7890)]
+        port: u16,
+    },
+    /// Desktop GUI & HUD Spotlight Overlay Bridge
+    Hud {
+        /// Action: start, query, state
+        #[arg(default_value = "start")]
+        action: String,
+        /// Port for IPC daemon (default: 8105)
+        #[arg(short, long, default_value_t = 8105)]
+        port: u16,
+        /// Query string for spotlight search
+        #[arg(short, long)]
+        query: Option<String>,
+    },
+    /// Advanced Multi-Modal UX Engine (TUI, Radar, DAG, Voice spectrum)
+    Ux {
+        /// Mode: tui, radar, dag, voice, info
+        #[arg(default_value = "info")]
+        mode: String,
+        /// Target path or goal description
+        #[arg(default_value = ".")]
+        target: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -14248,6 +14374,13 @@ impl FuzzyCommandPalette {
             ("/widgets", "Modular dockable TUI widgets bar", "/widgets"),
             ("/speak", "Local text-to-speech voice synthesis", "/speak"),
             ("/debug", "Interactive AI debugger & crash trace visualizer", "/debug"),
+            ("/duplex", "Continuous full-duplex voice conversation mode", "/duplex"),
+            ("/gitgraph", "Interactive git branch and merge graph visualizer", "/gitgraph"),
+            ("/sidecar", "Universal editor sidecar daemon bridge", "/sidecar"),
+            ("/pair", "Real-time multi-terminal pair-programming multiplexer", "/pair"),
+            ("/health", "Codebase health and architecture radar chart", "/health"),
+            ("/persona", "Dynamic persona matrix and prompt switcher", "/persona"),
+            ("/snippet", "Parameterized prompt snippet templates", "/snippet"),
         ];
 
         for (cmd, desc, payload) in commands {
@@ -14275,6 +14408,12 @@ impl FuzzyCommandPalette {
             ("manage_widgets", "Dockable TUI widgets bar manager"),
             ("speak_text", "Synthesize local speech with native TTS"),
             ("debug_trace", "AI crash debugger and stack trace visualizer"),
+            ("duplex_voice_session", "Continuous full-duplex voice conversation loop"),
+            ("git_branch_graph", "Interactive git branch and merge DAG graph"),
+            ("editor_sidecar_bridge", "Standardized editor JSON-RPC 2.0 sidecar"),
+            ("multi_terminal_pair", "Multi-terminal pair-programming multiplexer"),
+            ("codebase_health_radar", "Codebase health and architecture radar analysis"),
+            ("persona_matrix_manager", "Dynamic persona matrix and prompt snippets"),
             ("run_bash", "Execute shell commands in workspace"),
             ("run_tests", "Run automated test suites and report traces"),
             ("lsp_diagnostics", "Run compiler/linter diagnostics"),
@@ -16394,6 +16533,13 @@ pub async fn interactive_chat(
                             println!("  /widgets [action]     - Modular Dockable TUI Widgets Bar");
                             println!("  /speak <text>         - Local Text-to-Speech Voice Engine");
                             println!("  /debug <trace_or_cmd> - Interactive AI Debugger & Stack Trace Visualizer");
+                            println!("  /duplex [model]       - Continuous Full-Duplex Voice Conversation Mode");
+                            println!("  /gitgraph [max]       - Interactive Git Branch & Merge Graph Visualizer");
+                            println!("  /sidecar <act> [port] - Universal Editor Sidecar Bridge (JSON-RPC 2.0)");
+                            println!("  /pair <act> [target]  - Real-Time Multi-Terminal Pair-Programming Multiplexer");
+                            println!("  /health [path]        - Codebase Health & Architecture Radar Chart");
+                            println!("  /persona [name]       - Dynamic Persona Matrix & System Prompt Swapper");
+                            println!("  /snippet <act> [args] - Parameterized Prompt Snippet Library");
                             println!("  /undo                 - Git-revert the last agent file edit");
                             println!("  /exit, /quit          - End the session");
                             continue;
@@ -17894,6 +18040,180 @@ except Exception as e:
                             }
                             continue;
                         }
+                        "/duplex" | "/voice" => {
+                            let custom_model = if parts.len() > 1 { parts[1] } else { active_model.as_str() };
+                            let _ = run_duplex_voice_loop(client, custom_model, &tuner.opts, 30).await;
+                            continue;
+                        }
+                        "/gitgraph" => {
+                            let max_commits = if parts.len() > 1 { parts[1].parse::<usize>().unwrap_or(25) } else { 25 };
+                            match parse_git_branch_graph(std::path::Path::new("."), max_commits) {
+                                Ok(graph) => println!("{}", render_git_graph_to_terminal(&graph)),
+                                Err(e) => println!("{} {}", "❌ Git Graph Error:".red(), e),
+                            }
+                            continue;
+                        }
+                        "/sidecar" => {
+                            let action = if parts.len() > 1 { parts[1].to_lowercase() } else { "status".to_string() };
+                            let port = if parts.len() > 2 { parts[2].parse::<u16>().unwrap_or(7373) } else { 7373 };
+                            match action.as_str() {
+                                "start" => {
+                                    match start_editor_sidecar(port, client, &active_model).await {
+                                        Ok(h) => println!("{}", format_sidecar_report_for_terminal(&h)),
+                                        Err(e) => println!("{} {}", "❌ Sidecar Start Error:".red(), e),
+                                    }
+                                }
+                                "stop" => {
+                                    stop_active_sidecar();
+                                    println!("{}", "Universal Editor Sidecar daemon stopped.".green());
+                                }
+                                _ => {
+                                    if let Some(h) = get_active_sidecar() {
+                                        println!("{}", format_sidecar_report_for_terminal(&h));
+                                    } else {
+                                        println!("{}", "No active Editor Sidecar daemon running. Start with `/sidecar start`.".yellow());
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        "/pair" => {
+                            let action = if parts.len() > 1 { parts[1].to_lowercase() } else { "status".to_string() };
+                            match action.as_str() {
+                                "host" | "start" => {
+                                    let port = if parts.len() > 2 { parts[2].parse::<u16>().unwrap_or(8099) } else { 8099 };
+                                    match start_pair_session(port).await {
+                                        Ok(h) => println!("{}", format_pair_session_report_for_terminal(&h)),
+                                        Err(e) => println!("{} {}", "❌ Pair Host Error:".red(), e),
+                                    }
+                                }
+                                "join" => {
+                                    if parts.len() > 2 {
+                                        let addr = parts[2];
+                                        let pin = if parts.len() > 3 { parts[3] } else { "" };
+                                        let _ = join_pair_session(addr, pin).await;
+                                    } else {
+                                        println!("{}", "Usage: /pair join <server_addr:port> [pin]".red());
+                                    }
+                                }
+                                "stop" => {
+                                    stop_active_pair();
+                                    println!("{}", "Pair programming multiplexer stopped.".green());
+                                }
+                                "vote" => {
+                                    if parts.len() > 3 {
+                                        let call_id = parts[2];
+                                        let approve = parts[3].eq_ignore_ascii_case("yes") || parts[3].eq_ignore_ascii_case("true") || parts[3].eq_ignore_ascii_case("y");
+                                        if let Some(h) = get_active_pair() {
+                                            let st = h.cast_vote(call_id, "chat_user", approve);
+                                            println!("Cast vote for {}: status {:?}", call_id, st);
+                                        }
+                                    } else {
+                                        println!("{}", "Usage: /pair vote <call_id> <yes|no>".red());
+                                    }
+                                }
+                                _ => {
+                                    if let Some(h) = get_active_pair() {
+                                        println!("{}", format_pair_session_report_for_terminal(&h));
+                                    } else {
+                                        println!("{}", "No active Pair multiplexer session. Host with `/pair host`.".yellow());
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        "/health" => {
+                            let target_path = if parts.len() > 1 { parts[1] } else { "." };
+                            match calculate_codebase_health(std::path::Path::new(target_path)) {
+                                Ok(metrics) => println!("{}", render_health_radar_chart(&metrics, 80)),
+                                Err(e) => println!("{} {}", "❌ Codebase Health Error:".red(), e),
+                            }
+                            continue;
+                        }
+                        "/persona" => {
+                            let mut manager = PersonaManager::new(std::path::Path::new("."));
+                            if parts.len() > 1 {
+                                let name = parts[1];
+                                if name.eq_ignore_ascii_case("list") {
+                                    let personas = manager.list_personas();
+                                    println!("{}", format_persona_list_for_terminal(&personas, manager.active_persona.as_deref()));
+                                } else {
+                                    match manager.activate_persona(name, &mut messages) {
+                                        Ok(p) => println!("{}", format_persona_activated_for_terminal(&p)),
+                                        Err(e) => println!("{} {}", "❌ Persona Activation Error:".red(), e),
+                                    }
+                                }
+                            } else {
+                                let personas = manager.list_personas();
+                                println!("{}", format_persona_list_for_terminal(&personas, manager.active_persona.as_deref()));
+                            }
+                            continue;
+                        }
+                        "/snippet" => {
+                            let manager = SnippetManager::new(std::path::Path::new("."));
+                            let action = if parts.len() > 1 { parts[1].to_lowercase() } else { "list".to_string() };
+                            match action.as_str() {
+                                "save" => {
+                                    if parts.len() > 3 {
+                                        let name = parts[2];
+                                        let tmpl = parts[3..].join(" ");
+                                        match manager.save_snippet(name, &tmpl, None) {
+                                            Ok(s) => println!("Saved snippet `{}`.", s.name.green().bold()),
+                                            Err(e) => println!("{} {}", "❌ Snippet Save Error:".red(), e),
+                                        }
+                                    } else {
+                                        println!("{}", "Usage: /snippet save <name> <template string with $PARAM>".red());
+                                    }
+                                }
+                                "delete" => {
+                                    if parts.len() > 2 {
+                                        let name = parts[2];
+                                        let _ = manager.delete_snippet(name);
+                                        println!("Snippet `{}` deleted.", name);
+                                    }
+                                }
+                                "run" => {
+                                    if parts.len() > 2 {
+                                        let name = parts[2];
+                                        let mut params = std::collections::HashMap::new();
+                                        for p in &parts[3..] {
+                                            if let Some((k, v)) = p.split_once('=') {
+                                                params.insert(k.to_string(), v.to_string());
+                                            }
+                                        }
+                                        match manager.expand_snippet(name, &params) {
+                                            Ok(expanded) => {
+                                                if let Some(snip) = manager.get_snippet(name) {
+                                                    println!("{}", format_snippet_expansion_for_terminal(&snip, &expanded, &params));
+                                                }
+                                                // Feed directly into conversation input
+                                                messages.push(Message {
+                                                    role: "user".to_string(),
+                                                    content: expanded,
+                                                    tool_calls: None,
+                                                    images: None,
+                                                });
+                                                if agent {
+                                                    agent_loop(client, &active_model, &mut messages, markdown, &tuner.opts, force, format_schema.as_ref(), sandbox).await?;
+                                                } else {
+                                                    let resp = fetch_full_response(client, &active_model, &messages, &tuner.opts, format_schema.as_ref()).await?;
+                                                    println!("{}", resp);
+                                                    messages.push(Message { role: "assistant".to_string(), content: resp, tool_calls: None, images: None });
+                                                }
+                                            }
+                                            Err(e) => println!("{} {}", "❌ Snippet Expansion Error:".red(), e),
+                                        }
+                                    } else {
+                                        println!("{}", "Usage: /snippet run <name> [KEY=VALUE ...]".red());
+                                    }
+                                }
+                                _ => {
+                                    let snippets = manager.list_snippets();
+                                    println!("{}", format_snippet_list_for_terminal(&snippets));
+                                }
+                            }
+                            continue;
+                        }
                         "/exit" | "/quit" => break,
                         _ => {
                             println!("{}", "Unknown slash command. Type /help to see available commands.".red());
@@ -18893,6 +19213,109 @@ pub fn get_tools() -> serde_json::Value {
                         "is_command": { "type": "boolean", "description": "Whether trace_log is a command line to execute and capture crash trace (default false)" }
                     },
                     "required": ["trace_log"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "duplex_voice_session",
+                "description": "Continuous Full-Duplex Voice Conversation Mode. Captures microphone stream with VAD energy detection, transcribes audio turns via Whisper, queries LLM agent, and speaks response in real-time.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "description": "Action: 'run', 'status' (default 'run')" },
+                        "timeout_secs": { "type": "integer", "description": "Session timeout duration in seconds (default 30)" },
+                        "model": { "type": "string", "description": "Optional model override" }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "git_branch_graph",
+                "description": "Interactive Git Branch & Merge Graph TUI. Parses git topological DAG commit history, rendering visual branching lines, commit hashes, branch pointers, messages, and TrueColor branch lanes.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "max_commits": { "type": "integer", "description": "Maximum number of commits to render (default 25)" },
+                        "path": { "type": "string", "description": "Workspace root path (defaults to '.')" }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "editor_sidecar_bridge",
+                "description": "Universal Editor Sidecar Bridge. Serves a standardized JSON-RPC 2.0 daemon endpoint supporting textDocument/inlineCompletion, textDocument/codeAction, and zy/chat.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "description": "Action: 'start', 'stop', 'status', 'complete', 'action', 'chat'" },
+                        "port": { "type": "integer", "description": "Port to bind (default 7373)" },
+                        "model": { "type": "string", "description": "Model identifier" },
+                        "prompt": { "type": "string", "description": "Prompt for chat action" },
+                        "prefix": { "type": "string", "description": "Code prefix for inline completion" },
+                        "suffix": { "type": "string", "description": "Code suffix for inline completion" },
+                        "context_code": { "type": "string", "description": "Context code snippet for code actions" }
+                    },
+                    "required": ["action"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "multi_terminal_pair",
+                "description": "Real-Time Multi-Terminal Pair-Programming Multiplexer. Generates 6-digit session PINs, broadcasts live conversation history, thoughts, and tool execution requests across multiple terminals over Tokio TCP, with multi-client voting approval.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "description": "Action: 'host', 'join', 'status', 'stop', 'vote', 'create_approval'" },
+                        "port": { "type": "integer", "description": "Port to bind (default 8099)" },
+                        "pin": { "type": "string", "description": "6-digit session PIN" },
+                        "server_addr": { "type": "string", "description": "Target server address for 'join'" },
+                        "call_id": { "type": "string", "description": "Tool call ID for voting" },
+                        "client_id": { "type": "string", "description": "Voter client ID" },
+                        "approve": { "type": "boolean", "description": "Vote decision (true for approve, false for reject)" }
+                    },
+                    "required": ["action"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "codebase_health_radar",
+                "description": "Codebase Health & Architecture Radar Chart. Calculates 6 dimensions (Test Coverage, Low Complexity, Security Posture, Documentation Ratio, Dead Code Cleanliness, Dependency Health) and renders ASCII/TrueColor spider/radar chart polygons with prioritized remediation action plans.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Target workspace root path (defaults to '.')" },
+                        "render_chart": { "type": "boolean", "description": "Whether to render ASCII radar chart to stdout (default true)" }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "persona_matrix_manager",
+                "description": "Dynamic Persona Matrix & Prompt Snippet Library. Manages pre-configured personas (security-auditor, clean-coder, performance-optimizer, frontend-architect, junior-mentor, chaos-engineer) and saves, lists, and expands parameterized prompt snippets ($PARAM templates).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "description": "Action: 'list_personas', 'get_persona', 'activate_persona', 'list_snippets', 'get_snippet', 'save_snippet', 'delete_snippet', 'expand_snippet'" },
+                        "persona_name": { "type": "string", "description": "Persona identifier to activate or inspect" },
+                        "snippet_name": { "type": "string", "description": "Snippet identifier name" },
+                        "template": { "type": "string", "description": "Snippet template string" },
+                        "description": { "type": "string", "description": "Snippet description" },
+                        "params": { "type": "object", "description": "Key-value map for snippet template expansion" },
+                        "path": { "type": "string", "description": "Workspace root path (defaults to '.')" }
+                    },
+                    "required": ["action"]
                 }
             }
         }
@@ -20382,6 +20805,275 @@ pub async fn agent_loop(
                     } else {
                         tool_result = "Error: Missing trace_log parameter".to_string();
                         println!("{}", "❌ Missing Parameters".red());
+                    }
+                } else if fn_name == "duplex_voice_session" {
+                    let timeout = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(30);
+                    let mdl = args.get("model").and_then(|v| v.as_str()).unwrap_or(model);
+                    match run_duplex_voice_loop(client, mdl, options, timeout).await {
+                        Ok(summary) => {
+                            tool_result = serde_json::to_string_pretty(&summary).unwrap();
+                            println!("{}", "✔️ Duplex Voice Loop Completed".green());
+                        }
+                        Err(e) => {
+                            tool_result = format!("Duplex voice error: {}", e);
+                            println!("{} {}", "❌ Voice Error:".red(), e);
+                        }
+                    }
+                } else if fn_name == "git_branch_graph" {
+                    let max_c = args.get("max_commits").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
+                    let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                    match parse_git_branch_graph(std::path::Path::new(path_arg), max_c) {
+                        Ok(graph) => {
+                            let rendered = render_git_graph_to_terminal(&graph);
+                            println!("{}", rendered);
+                            tool_result = serde_json::to_string_pretty(&graph).unwrap();
+                            println!("{}", "✔️ Git Branch Graph Rendered".green());
+                        }
+                        Err(e) => {
+                            tool_result = format!("Git branch graph error: {}", e);
+                            println!("{} {}", "❌ Git Graph Error:".red(), e);
+                        }
+                    }
+                } else if fn_name == "editor_sidecar_bridge" {
+                    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("status");
+                    let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(7373) as u16;
+                    let mdl = args.get("model").and_then(|v| v.as_str()).unwrap_or(model);
+                    match action.to_lowercase().as_str() {
+                        "start" => {
+                            match start_editor_sidecar(port, client, mdl).await {
+                                Ok(h) => {
+                                    println!("{}", format_sidecar_report_for_terminal(&h));
+                                    tool_result = serde_json::json!({
+                                        "status": "running",
+                                        "port": h.port,
+                                        "url": h.url,
+                                    }).to_string();
+                                    println!("{}", "✔️ Editor Sidecar Started".green());
+                                }
+                                Err(e) => {
+                                    tool_result = format!("Sidecar start error: {}", e);
+                                    println!("{} {}", "❌ Sidecar Error:".red(), e);
+                                }
+                            }
+                        }
+                        "stop" => {
+                            stop_active_sidecar();
+                            tool_result = "Editor Sidecar daemon stopped.".to_string();
+                            println!("{}", "✔️ Editor Sidecar Stopped".green());
+                        }
+                        "complete" => {
+                            let pfx = args.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
+                            let sfx = args.get("suffix").and_then(|v| v.as_str()).unwrap_or("");
+                            let req = JsonRpcRequest {
+                                jsonrpc: "2.0".to_string(),
+                                id: serde_json::json!(1),
+                                method: "textDocument/inlineCompletion".to_string(),
+                                params: Some(serde_json::json!({ "prefix": pfx, "suffix": sfx, "line": 0, "column": 0, "text_document_uri": "file:///active" })),
+                            };
+                            let resp = EditorSidecarServer::handle_json_rpc_request(&req, Some(client), mdl);
+                            tool_result = serde_json::to_string_pretty(&resp).unwrap();
+                        }
+                        "action" => {
+                            let ctx = args.get("context_code").and_then(|v| v.as_str()).unwrap_or("");
+                            let req = JsonRpcRequest {
+                                jsonrpc: "2.0".to_string(),
+                                id: serde_json::json!(1),
+                                method: "textDocument/codeAction".to_string(),
+                                params: Some(serde_json::json!({ "context_code": ctx, "text_document_uri": "file:///active", "start_line": 0, "start_col": 0, "end_line": 0, "end_col": 0, "diagnostics": [] })),
+                            };
+                            let resp = EditorSidecarServer::handle_json_rpc_request(&req, Some(client), mdl);
+                            tool_result = serde_json::to_string_pretty(&resp).unwrap();
+                        }
+                        "chat" => {
+                            let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("Hello");
+                            let req = JsonRpcRequest {
+                                jsonrpc: "2.0".to_string(),
+                                id: serde_json::json!(1),
+                                method: "zy/chat".to_string(),
+                                params: Some(serde_json::json!({ "prompt": prompt })),
+                            };
+                            let resp = EditorSidecarServer::handle_json_rpc_request(&req, Some(client), mdl);
+                            tool_result = serde_json::to_string_pretty(&resp).unwrap();
+                        }
+                        _ => {
+                            if let Some(h) = get_active_sidecar() {
+                                println!("{}", format_sidecar_report_for_terminal(&h));
+                                tool_result = serde_json::json!({
+                                    "status": "running",
+                                    "port": h.port,
+                                    "url": h.url,
+                                    "requests_handled": h.request_count.load(Ordering::SeqCst),
+                                }).to_string();
+                            } else {
+                                tool_result = "{\"status\":\"stopped\",\"message\":\"No active Sidecar daemon\"}".to_string();
+                            }
+                        }
+                    }
+                } else if fn_name == "multi_terminal_pair" {
+                    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("status");
+                    let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(8099) as u16;
+                    match action.to_lowercase().as_str() {
+                        "host" | "start" => {
+                            match start_pair_session(port).await {
+                                Ok(h) => {
+                                    println!("{}", format_pair_session_report_for_terminal(&h));
+                                    tool_result = serde_json::json!({
+                                        "status": "hosting",
+                                        "session_id": h.session_id,
+                                        "pin": h.pin,
+                                        "port": h.port,
+                                    }).to_string();
+                                    println!("{}", "✔️ Pair Session Hosted".green());
+                                }
+                                Err(e) => {
+                                    tool_result = format!("Pair start error: {}", e);
+                                    println!("{} {}", "❌ Pair Error:".red(), e);
+                                }
+                            }
+                        }
+                        "stop" => {
+                            stop_active_pair();
+                            tool_result = "Pair session stopped.".to_string();
+                            println!("{}", "✔️ Pair Session Stopped".green());
+                        }
+                        "vote" => {
+                            let call_id = args.get("call_id").and_then(|v| v.as_str()).unwrap_or("call-1");
+                            let client_id = args.get("client_id").and_then(|v| v.as_str()).unwrap_or("client-1");
+                            let approve = args.get("approve").and_then(|v| v.as_bool()).unwrap_or(true);
+                            if let Some(h) = get_active_pair() {
+                                let st = h.cast_vote(call_id, client_id, approve);
+                                tool_result = serde_json::json!({
+                                    "call_id": call_id,
+                                    "client_id": client_id,
+                                    "approval_status": format!("{:?}", st),
+                                }).to_string();
+                            } else {
+                                tool_result = "No active pair session to vote in.".to_string();
+                            }
+                        }
+                        _ => {
+                            if let Some(h) = get_active_pair() {
+                                println!("{}", format_pair_session_report_for_terminal(&h));
+                                tool_result = serde_json::json!({
+                                    "status": "active",
+                                    "session_id": h.session_id,
+                                    "pin": h.pin,
+                                    "port": h.port,
+                                    "clients": h.clients_count,
+                                }).to_string();
+                            } else {
+                                tool_result = "{\"status\":\"inactive\",\"message\":\"No pair session hosted\"}".to_string();
+                            }
+                        }
+                    }
+                } else if fn_name == "codebase_health_radar" {
+                    let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                    let render_chart = args.get("render_chart").and_then(|v| v.as_bool()).unwrap_or(true);
+                    match calculate_codebase_health(std::path::Path::new(path_arg)) {
+                        Ok(metrics) => {
+                            if render_chart {
+                                println!("{}", render_health_radar_chart(&metrics, 80));
+                            }
+                            tool_result = serde_json::to_string_pretty(&metrics).unwrap();
+                            println!("{}", "✔️ Codebase Health Radar Computed".green());
+                        }
+                        Err(e) => {
+                            tool_result = format!("Health calculation error: {}", e);
+                            println!("{} {}", "❌ Health Error:".red(), e);
+                        }
+                    }
+                } else if fn_name == "persona_matrix_manager" {
+                    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list_personas");
+                    let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                    let mut persona_mgr = PersonaManager::new(std::path::Path::new(path_arg));
+                    let snippet_mgr = SnippetManager::new(std::path::Path::new(path_arg));
+
+                    match action.to_lowercase().as_str() {
+                        "list_personas" => {
+                            let personas = persona_mgr.list_personas();
+                            println!("{}", format_persona_list_for_terminal(&personas, persona_mgr.active_persona.as_deref()));
+                            tool_result = serde_json::to_string_pretty(&personas).unwrap();
+                        }
+                        "get_persona" => {
+                            let p_name = args.get("persona_name").and_then(|v| v.as_str()).unwrap_or("clean-coder");
+                            if let Some(p) = persona_mgr.get_persona(p_name) {
+                                println!("{}", format_persona_activated_for_terminal(&p));
+                                tool_result = serde_json::to_string_pretty(&p).unwrap();
+                            } else {
+                                tool_result = format!("Persona '{}' not found", p_name);
+                            }
+                        }
+                        "activate_persona" => {
+                            let p_name = args.get("persona_name").and_then(|v| v.as_str()).unwrap_or("clean-coder");
+                            match persona_mgr.activate_persona(p_name, messages) {
+                                Ok(p) => {
+                                    println!("{}", format_persona_activated_for_terminal(&p));
+                                    tool_result = format!("Activated persona: {}", p.title);
+                                    println!("{}", "✔️ Persona Activated".green());
+                                }
+                                Err(e) => {
+                                    tool_result = format!("Activate error: {}", e);
+                                }
+                            }
+                        }
+                        "list_snippets" => {
+                            let snippets = snippet_mgr.list_snippets();
+                            println!("{}", format_snippet_list_for_terminal(&snippets));
+                            tool_result = serde_json::to_string_pretty(&snippets).unwrap();
+                        }
+                        "get_snippet" => {
+                            let s_name = args.get("snippet_name").and_then(|v| v.as_str()).unwrap_or("refactor");
+                            if let Some(s) = snippet_mgr.get_snippet(s_name) {
+                                tool_result = serde_json::to_string_pretty(&s).unwrap();
+                            } else {
+                                tool_result = format!("Snippet '{}' not found", s_name);
+                            }
+                        }
+                        "save_snippet" => {
+                            let s_name = args.get("snippet_name").and_then(|v| v.as_str()).unwrap_or("custom");
+                            let s_tmpl = args.get("template").and_then(|v| v.as_str()).unwrap_or("Custom template");
+                            let s_desc = args.get("description").and_then(|v| v.as_str());
+                            match snippet_mgr.save_snippet(s_name, s_tmpl, s_desc) {
+                                Ok(s) => {
+                                    tool_result = serde_json::to_string_pretty(&s).unwrap();
+                                    println!("Saved snippet `{}`", s_name);
+                                }
+                                Err(e) => {
+                                    tool_result = format!("Save snippet error: {}", e);
+                                }
+                            }
+                        }
+                        "delete_snippet" => {
+                            let s_name = args.get("snippet_name").and_then(|v| v.as_str()).unwrap_or("");
+                            let deleted = snippet_mgr.delete_snippet(s_name).unwrap_or(false);
+                            tool_result = format!("Deleted snippet '{}': {}", s_name, deleted);
+                        }
+                        "expand_snippet" => {
+                            let s_name = args.get("snippet_name").and_then(|v| v.as_str()).unwrap_or("refactor");
+                            let mut map = std::collections::HashMap::new();
+                            if let Some(params_obj) = args.get("params").and_then(|v| v.as_object()) {
+                                for (k, v) in params_obj {
+                                    if let Some(s) = v.as_str() {
+                                        map.insert(k.clone(), s.to_string());
+                                    }
+                                }
+                            }
+                            match snippet_mgr.expand_snippet(s_name, &map) {
+                                Ok(expanded) => {
+                                    if let Some(s) = snippet_mgr.get_snippet(s_name) {
+                                        println!("{}", format_snippet_expansion_for_terminal(&s, &expanded, &map));
+                                    }
+                                    tool_result = expanded;
+                                }
+                                Err(e) => {
+                                    tool_result = format!("Snippet expand error: {}", e);
+                                }
+                            }
+                        }
+                        _ => {
+                            let personas = persona_mgr.list_personas();
+                            tool_result = serde_json::to_string_pretty(&personas).unwrap();
+                        }
                     }
                 } else {
                     tool_result = format!("Unknown function: {}", fn_name);
