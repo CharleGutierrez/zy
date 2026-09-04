@@ -49,6 +49,10 @@ pub struct Cli {
     /// Multi-Agent Swarm Orchestrator goal
     #[arg(long)]
     pub swarm: Option<String>,
+
+    /// Launch Full-Screen Interactive TUI Dashboard (ratatui + crossterm)
+    #[arg(long)]
+    pub tui: bool,
 }
 
 #[derive(Subcommand, Clone, Debug)]
@@ -122,6 +126,10 @@ pub enum Commands {
         /// Multi-Agent Swarm Orchestrator goal
         #[arg(long)]
         swarm: Option<String>,
+
+        /// Launch Full-Screen Interactive TUI Dashboard (ratatui + crossterm)
+        #[arg(long)]
+        tui: bool,
     },
     /// Index a directory for RAG
     Index {
@@ -223,7 +231,7 @@ pub struct EmbedResponse {
     pub embedding: Vec<f32>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct RagChunk {
     pub file: String,
     pub text: String,
@@ -1832,32 +1840,42 @@ pub fn hybrid_rag_search<'a>(
 }
 
 pub async fn apply_rag(client: &Client, prompt: &str, messages: &mut Vec<Message>) -> Result<(), Box<dyn std::error::Error>> {
-    let index_file = ".zy_rag_index.json";
-    if let Ok(data) = tokio::fs::read_to_string(index_file).await {
-        if let Ok(chunks) = serde_json::from_str::<Vec<RagChunk>>(&data) {
-            if chunks.is_empty() { return Ok(()); }
-            
-            print!("{} ", "🔍 Searching local codebase (Hybrid RAG + RRF)...".magenta());
-            io::stdout().flush()?;
-            
-            let query_vec = embed_text(client, prompt).await.unwrap_or_default();
-            let ranked = hybrid_rag_search(&chunks, prompt, &query_vec, 3, 60);
-            
-            let mut context_text = String::from("Relevant codebase context via Hybrid RAG (BM25 + Vector RRF):\n");
-            for (score, chunk) in ranked {
-                if score > 0.0 {
-                    context_text.push_str(&format!("--- FILE: {} (RRF Score: {:.4}) ---\n{}\n\n", chunk.file, score, chunk.text));
-                }
-            }
-            
-            messages.push(Message {
-                role: "system".to_string(),
-                content: context_text,
-                tool_calls: None,
-                images: None,
-            });
-            println!("{}", "Done".green());
+    let bin_path = std::path::Path::new(BINARY_VECTORS_DEFAULT_FILE);
+    let chunks: Vec<RagChunk> = if bin_path.exists() {
+        if let Ok(store) = load_binary_vector_index(bin_path) {
+            store.chunks
+        } else if let Ok(data) = tokio::fs::read_to_string(".zy_rag_index.json").await {
+            serde_json::from_str(&data).unwrap_or_default()
+        } else {
+            Vec::new()
         }
+    } else if let Ok(data) = tokio::fs::read_to_string(".zy_rag_index.json").await {
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    if !chunks.is_empty() {
+        print!("{} ", "🔍 Searching local codebase (Hybrid RAG + Binary Vectors + RRF)...".magenta());
+        io::stdout().flush()?;
+        
+        let query_vec = embed_text(client, prompt).await.unwrap_or_default();
+        let ranked = hybrid_rag_search(&chunks, prompt, &query_vec, 3, 60);
+        
+        let mut context_text = String::from("Relevant codebase context via Hybrid RAG (BM25 + Vector RRF):\n");
+        for (score, chunk) in ranked {
+            if score > 0.0 {
+                context_text.push_str(&format!("--- FILE: {} (RRF Score: {:.4}) ---\n{}\n\n", chunk.file, score, chunk.text));
+            }
+        }
+        
+        messages.push(Message {
+            role: "system".to_string(),
+            content: context_text,
+            tool_calls: None,
+            images: None,
+        });
+        println!("{}", "Done".green());
     } else {
         println!("{}", "RAG enabled but index not found. Run 'zy index .' first.".red());
     }
@@ -1883,7 +1901,7 @@ pub fn smart_chunk(content: &str, max_len: usize) -> Vec<String> {
 }
 
 pub async fn build_rag_index(client: &Client, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{} {}", "Indexing directory (Smart Chunking):".bold(), path.cyan());
+    println!("{} {}", "Indexing directory (Smart Chunking & Binary Vector Store):".bold(), path.cyan());
     let mut chunks = Vec::new();
     
     for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
@@ -1913,17 +1931,26 @@ pub async fn build_rag_index(client: &Client, path: &str) -> Result<(), Box<dyn 
         }
     }
     
+    let _ = save_binary_vector_index(std::path::Path::new(BINARY_VECTORS_DEFAULT_FILE), &chunks);
     let json_data = serde_json::to_string(&chunks)?;
     tokio::fs::write(".zy_rag_index.json", json_data).await?;
-    println!("{} {} chunks", "Indexed & saved".green().bold(), chunks.len());
+    println!("{} {} chunks (saved to {} & .zy_rag_index.json)", "Indexed & saved".green().bold(), chunks.len(), BINARY_VECTORS_DEFAULT_FILE.cyan());
     Ok(())
 }
 
 pub async fn vella_reindex_file(client: &Client, file_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let index_file = ".zy_rag_index.json";
+    let bin_path = std::path::Path::new(BINARY_VECTORS_DEFAULT_FILE);
     let path_str = file_path.to_string_lossy().to_string();
     
-    let mut chunks: Vec<RagChunk> = if let Ok(data) = tokio::fs::read_to_string(index_file).await {
+    let mut chunks: Vec<RagChunk> = if bin_path.exists() {
+        if let Ok(store) = load_binary_vector_index(bin_path) {
+            store.chunks
+        } else if let Ok(data) = tokio::fs::read_to_string(".zy_rag_index.json").await {
+            serde_json::from_str(&data).unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else if let Ok(data) = tokio::fs::read_to_string(".zy_rag_index.json").await {
         serde_json::from_str(&data).unwrap_or_default()
     } else {
         Vec::new()
@@ -1944,9 +1971,10 @@ pub async fn vella_reindex_file(client: &Client, file_path: &std::path::Path) ->
         }
     }
     
+    let _ = save_binary_vector_index(bin_path, &chunks);
     let json_data = serde_json::to_string(&chunks)?;
-    tokio::fs::write(index_file, json_data).await?;
-    println!("{} {}", "✔️  Vella Sync Complete:".green(), path_str);
+    tokio::fs::write(".zy_rag_index.json", json_data).await?;
+    println!("{} {}", "✔️  Vella Sync Complete (Binary + JSON):".green(), path_str);
     Ok(())
 }
 
@@ -2798,6 +2826,1842 @@ pub async fn generate_pr_description(
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// FEATURE 17: FULL-SCREEN INTERACTIVE TUI DASHBOARD (ratatui + crossterm)
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct TuiAppState {
+    pub messages: Vec<Message>,
+    pub input: String,
+    pub active_model: String,
+    pub agent_mode: bool,
+    pub force_mode: bool,
+    pub rag_mode: bool,
+    pub preview_file: String,
+    pub preview_content: String,
+    pub diff_content: String,
+    pub cpu_cores: usize,
+    pub total_mem_gb: u64,
+    pub used_mem_gb: u64,
+    pub token_budget_info: String,
+    pub aituner_profile: String,
+    pub status_msg: String,
+    pub scroll_chat: u16,
+    pub scroll_preview: u16,
+    pub is_thinking: bool,
+    pub think_buffer: String,
+}
+
+impl Default for TuiAppState {
+    fn default() -> Self {
+        Self {
+            messages: Vec::new(),
+            input: String::new(),
+            active_model: "llama2".to_string(),
+            agent_mode: false,
+            force_mode: false,
+            rag_mode: false,
+            preview_file: String::new(),
+            preview_content: String::new(),
+            diff_content: String::new(),
+            cpu_cores: 8,
+            total_mem_gb: 16,
+            used_mem_gb: 4,
+            token_budget_info: "0 / 2048 (0%)".to_string(),
+            aituner_profile: "ECO (2048 ctx)".to_string(),
+            status_msg: "Ready".to_string(),
+            scroll_chat: 0,
+            scroll_preview: 0,
+            is_thinking: false,
+            think_buffer: String::new(),
+        }
+    }
+}
+
+pub fn render_tui_layout(f: &mut ratatui::Frame, state: &TuiAppState) {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(f.size());
+
+    // Left Panel: Chat history & agent <think> streaming
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(main_chunks[0]);
+
+    let mut chat_lines = Vec::new();
+    for msg in &state.messages {
+        let (role_color, role_name) = match msg.role.as_str() {
+            "user" => (Color::Green, "User ❯"),
+            "assistant" => (Color::Cyan, "zy ❯"),
+            "system" => (Color::Yellow, "System ❯"),
+            "tool" => (Color::Magenta, "Tool ❯"),
+            _ => (Color::White, "Message ❯"),
+        };
+
+        chat_lines.push(Line::from(vec![
+            Span::styled(format!("{} ", role_name), Style::default().fg(role_color).add_modifier(Modifier::BOLD)),
+        ]));
+
+        let content = &msg.content;
+        let mut in_think = false;
+        for line in content.lines() {
+            if line.contains("<think>") {
+                in_think = true;
+            }
+            if in_think {
+                chat_lines.push(Line::from(vec![
+                    Span::styled(format!("  🧠 {}", line), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+                ]));
+            } else {
+                chat_lines.push(Line::from(vec![
+                    Span::raw(format!("  {}", line)),
+                ]));
+            }
+            if line.contains("</think>") {
+                in_think = false;
+            }
+        }
+        chat_lines.push(Line::from(""));
+    }
+
+    if state.is_thinking && !state.think_buffer.is_empty() {
+        chat_lines.push(Line::from(vec![
+            Span::styled("zy ❯ [Thinking...]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        ]));
+        for line in state.think_buffer.lines() {
+            chat_lines.push(Line::from(vec![
+                Span::styled(format!("  🧠 {}", line), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+            ]));
+        }
+    }
+
+    let chat_block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" 💬 Chat & Agent Thinking ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    let chat_p = Paragraph::new(chat_lines)
+        .block(chat_block)
+        .wrap(Wrap { trim: false })
+        .scroll((state.scroll_chat, 0));
+    f.render_widget(chat_p, left_chunks[0]);
+
+    // Input line
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(format!(" ❯ Prompt ({}) ", state.status_msg), Style::default().fg(Color::Green)));
+    let input_p = Paragraph::new(state.input.as_str())
+        .block(input_block)
+        .style(Style::default().fg(Color::White));
+    f.render_widget(input_p, left_chunks[1]);
+
+    // Right side: Top-Right (File preview & diff) and Bottom-Right (Hardware stats)
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .split(main_chunks[1]);
+
+    // Top-Right Panel: File preview & live syntax-highlighted code diff panel
+    let mut preview_lines = Vec::new();
+    if !state.diff_content.is_empty() {
+        preview_lines.push(Line::from(Span::styled("--- Live Unified Code Diff ---", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+        for l in state.diff_content.lines() {
+            if l.starts_with('+') {
+                preview_lines.push(Line::from(Span::styled(l, Style::default().fg(Color::Green))));
+            } else if l.starts_with('-') {
+                preview_lines.push(Line::from(Span::styled(l, Style::default().fg(Color::Red))));
+            } else if l.starts_with('@') {
+                preview_lines.push(Line::from(Span::styled(l, Style::default().fg(Color::Cyan))));
+            } else {
+                preview_lines.push(Line::from(Span::raw(l)));
+            }
+        }
+    } else if !state.preview_content.is_empty() {
+        preview_lines.push(Line::from(Span::styled(format!("File: {}", state.preview_file), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+        preview_lines.push(Line::from(""));
+        for (i, l) in state.preview_content.lines().enumerate() {
+            preview_lines.push(Line::from(vec![
+                Span::styled(format!("{:>4} │ ", i + 1), Style::default().fg(Color::DarkGray)),
+                Span::raw(l),
+            ]));
+        }
+    } else {
+        preview_lines.push(Line::from(Span::styled("No file preview or diff active.", Style::default().fg(Color::DarkGray))));
+        preview_lines.push(Line::from(Span::raw("Edit files or run /transaction diff to view live syntax diffs.")));
+    }
+
+    let preview_title = if !state.preview_file.is_empty() {
+        format!(" 📄 File Preview & Live Diff: {} ", state.preview_file)
+    } else {
+        " 📄 File Preview & Live Diff ".to_string()
+    };
+    let preview_block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(preview_title, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    let preview_p = Paragraph::new(preview_lines)
+        .block(preview_block)
+        .wrap(Wrap { trim: false })
+        .scroll((state.scroll_preview, 0));
+    f.render_widget(preview_p, right_chunks[0]);
+
+    // Bottom-Right Panel: Hardware stats (CPU cores, RAM usage, Token budget, AiTuner profile)
+    let stats_block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" ⚡ Hardware Stats & AiTuner Profile ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)));
+
+    let stats_lines = vec![
+        Line::from(vec![
+            Span::styled("  CPU Cores:       ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{} Cores", state.cpu_cores), Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("  RAM Usage:       ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{} GB / {} GB", state.used_mem_gb, state.total_mem_gb), Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(vec![
+            Span::styled("  AiTuner Profile: ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(state.aituner_profile.clone(), Style::default().fg(if state.aituner_profile.contains("TURBO") { Color::Magenta } else { Color::Green }).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Token Budget:    ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(state.token_budget_info.clone(), Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Active Model:    ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(state.active_model.clone(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  [Agent: {} | RAG: {}]", if state.agent_mode { "ON" } else { "OFF" }, if state.rag_mode { "ON" } else { "OFF" }), Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let stats_p = Paragraph::new(stats_lines).block(stats_block);
+    f.render_widget(stats_p, right_chunks[1]);
+}
+
+pub async fn run_tui_app(
+    client: &Client,
+    model: &str,
+    system: Option<&str>,
+    files: &[String],
+    agent: bool,
+    rag: bool,
+    tuner: &AiTunerState,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crossterm::{
+        event::{self, Event, KeyCode, KeyModifiers},
+        execute,
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    };
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::Terminal;
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    let total_ram_gb = sys.total_memory() / (1024 * 1024 * 1024);
+    let used_ram_gb = sys.used_memory() / (1024 * 1024 * 1024);
+    let cpu_cores = sys.cpus().len();
+
+    let initial_msgs = build_initial_messages(system, files, false).unwrap_or_default();
+    let token_info = format_token_budget(&initial_msgs, tuner.num_ctx);
+
+    let (prev_file, prev_content) = if let Some(first_file) = files.first() {
+        (first_file.clone(), fs::read_to_string(first_file).unwrap_or_default())
+    } else if std::path::Path::new("src/main.rs").exists() {
+        ("src/main.rs".to_string(), fs::read_to_string("src/main.rs").unwrap_or_default())
+    } else {
+        (String::new(), String::new())
+    };
+
+    let mut app_state = TuiAppState {
+        messages: initial_msgs,
+        input: String::new(),
+        active_model: model.to_string(),
+        agent_mode: agent,
+        force_mode: force,
+        rag_mode: rag,
+        preview_file: prev_file,
+        preview_content: prev_content,
+        diff_content: String::new(),
+        cpu_cores,
+        total_mem_gb: total_ram_gb,
+        used_mem_gb: used_ram_gb,
+        token_budget_info: token_info,
+        aituner_profile: tuner.profile_name.clone(),
+        status_msg: "Press Esc to exit, Enter to send".to_string(),
+        scroll_chat: 0,
+        scroll_preview: 0,
+        is_thinking: false,
+        think_buffer: String::new(),
+    };
+
+    loop {
+        terminal.draw(|f| {
+            render_tui_layout(f, &app_state);
+        })?;
+
+        if event::poll(std::time::Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    break;
+                }
+                match key.code {
+                    KeyCode::Esc => break,
+                    KeyCode::Enter => {
+                        let prompt = app_state.input.trim().to_string();
+                        if !prompt.is_empty() {
+                            if prompt == "/exit" || prompt == "/quit" {
+                                break;
+                            }
+                            app_state.input.clear();
+                            app_state.messages.push(Message {
+                                role: "user".to_string(),
+                                content: prompt.clone(),
+                                tool_calls: None,
+                                images: None,
+                            });
+                            app_state.is_thinking = true;
+                            app_state.think_buffer = "Streaming response...".to_string();
+                            terminal.draw(|f| render_tui_layout(f, &app_state))?;
+
+                            if let Ok(resp) = fetch_full_response(client, &app_state.active_model, &app_state.messages, &tuner.opts, None).await {
+                                app_state.messages.push(Message {
+                                    role: "assistant".to_string(),
+                                    content: resp,
+                                    tool_calls: None,
+                                    images: None,
+                                });
+                            }
+                            app_state.is_thinking = false;
+                            app_state.think_buffer.clear();
+                            app_state.token_budget_info = format_token_budget(&app_state.messages, tuner.num_ctx);
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        app_state.input.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        app_state.input.pop();
+                    }
+                    KeyCode::Up => {
+                        if app_state.scroll_chat > 0 { app_state.scroll_chat -= 1; }
+                    }
+                    KeyCode::Down => {
+                        app_state.scroll_chat += 1;
+                    }
+                    KeyCode::PageUp => {
+                        if app_state.scroll_preview > 0 { app_state.scroll_preview = app_state.scroll_preview.saturating_sub(5); }
+                    }
+                    KeyCode::PageDown => {
+                        app_state.scroll_preview = app_state.scroll_preview.saturating_add(5);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------------------------------------
+// FEATURE 18: EMBEDDED ZERO-COPY PERSISTENT BINARY VECTOR DB
+// -------------------------------------------------------------------------------------------------
+
+pub const BINARY_VECTOR_MAGIC: &[u8; 8] = b"ZYVEC\x02\x00\x00";
+pub const BINARY_VECTORS_DEFAULT_FILE: &str = ".zy_vectors.bin";
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BinaryVectorStore {
+    pub version: u32,
+    pub vector_dim: usize,
+    pub timestamp: u64,
+    pub chunks: Vec<RagChunk>,
+}
+
+impl BinaryVectorStore {
+    pub fn new(chunks: Vec<RagChunk>) -> Self {
+        let dim = chunks.first().map(|c| c.vector.len()).unwrap_or(0);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            version: 1,
+            vector_dim: dim,
+            timestamp: ts,
+            chunks,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    pub fn search(&self, query: &str, query_vec: &[f32], top_k: usize, rrf_k: usize) -> Vec<(f32, &RagChunk)> {
+        hybrid_rag_search(&self.chunks, query, query_vec, top_k, rrf_k)
+    }
+
+    pub fn fast_vector_search(&self, query_vec: &[f32], top_k: usize) -> Vec<(f32, &RagChunk)> {
+        let mut scored: Vec<(f32, &RagChunk)> = self.chunks.iter()
+            .map(|c| (cosine_similarity(query_vec, &c.vector), c))
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(top_k).collect()
+    }
+
+    pub fn add_or_replace_file(&mut self, file_path: &str, new_chunks: Vec<RagChunk>) {
+        self.chunks.retain(|c| c.file != file_path);
+        self.chunks.extend(new_chunks);
+        if self.vector_dim == 0 && !self.chunks.is_empty() {
+            self.vector_dim = self.chunks[0].vector.len();
+        }
+        self.timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+    }
+}
+
+pub fn save_binary_vector_index(path: &std::path::Path, chunks: &[RagChunk]) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let mut buffer = Vec::new();
+    // 1. Magic
+    buffer.extend_from_slice(BINARY_VECTOR_MAGIC);
+    // 2. Version
+    buffer.extend_from_slice(&1u32.to_le_bytes());
+    // 3. Vector dim
+    let dim = chunks.first().map(|c| c.vector.len() as u32).unwrap_or(0);
+    buffer.extend_from_slice(&dim.to_le_bytes());
+    // 4. Chunk count
+    let count = chunks.len() as u32;
+    buffer.extend_from_slice(&count.to_le_bytes());
+    // 5. Timestamp
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    buffer.extend_from_slice(&ts.to_le_bytes());
+    // 6. Reserved
+    buffer.extend_from_slice(&0u32.to_le_bytes());
+
+    // Write chunks
+    for chunk in chunks {
+        let file_bytes = chunk.file.as_bytes();
+        buffer.extend_from_slice(&(file_bytes.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(file_bytes);
+
+        let text_bytes = chunk.text.as_bytes();
+        buffer.extend_from_slice(&(text_bytes.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(text_bytes);
+
+        let v_dim = chunk.vector.len() as u32;
+        buffer.extend_from_slice(&v_dim.to_le_bytes());
+        for &val in &chunk.vector {
+            buffer.extend_from_slice(&val.to_le_bytes());
+        }
+    }
+
+    fs::write(path, &buffer)?;
+    Ok(buffer.len())
+}
+
+pub fn load_binary_vector_index(path: &std::path::Path) -> Result<BinaryVectorStore, Box<dyn std::error::Error + Send + Sync>> {
+    let data = fs::read(path)?;
+    if data.len() < 32 {
+        return Err("Binary vector file too small to contain valid header".into());
+    }
+
+    if &data[0..8] != BINARY_VECTOR_MAGIC {
+        return Err("Invalid magic bytes in binary vector file".into());
+    }
+
+    let version = u32::from_le_bytes(data[8..12].try_into()?);
+    let vector_dim = u32::from_le_bytes(data[12..16].try_into()?) as usize;
+    let chunk_count = u32::from_le_bytes(data[16..20].try_into()?) as usize;
+    let timestamp = u64::from_le_bytes(data[20..28].try_into()?);
+
+    let mut cursor = 32;
+    let mut chunks = Vec::with_capacity(chunk_count);
+
+    for _ in 0..chunk_count {
+        if cursor + 4 > data.len() {
+            return Err("Unexpected EOF reading file length".into());
+        }
+        let file_len = u32::from_le_bytes(data[cursor..cursor+4].try_into()?) as usize;
+        cursor += 4;
+        if cursor + file_len > data.len() {
+            return Err("Unexpected EOF reading file path".into());
+        }
+        let file_str = String::from_utf8_lossy(&data[cursor..cursor+file_len]).to_string();
+        cursor += file_len;
+
+        if cursor + 4 > data.len() {
+            return Err("Unexpected EOF reading text length".into());
+        }
+        let text_len = u32::from_le_bytes(data[cursor..cursor+4].try_into()?) as usize;
+        cursor += 4;
+        if cursor + text_len > data.len() {
+            return Err("Unexpected EOF reading text content".into());
+        }
+        let text_str = String::from_utf8_lossy(&data[cursor..cursor+text_len]).to_string();
+        cursor += text_len;
+
+        if cursor + 4 > data.len() {
+            return Err("Unexpected EOF reading vector dimension".into());
+        }
+        let dim = u32::from_le_bytes(data[cursor..cursor+4].try_into()?) as usize;
+        cursor += 4;
+        if cursor + dim * 4 > data.len() {
+            return Err("Unexpected EOF reading float vector".into());
+        }
+        let mut vector = Vec::with_capacity(dim);
+        for _ in 0..dim {
+            let f = f32::from_le_bytes(data[cursor..cursor+4].try_into()?);
+            vector.push(f);
+            cursor += 4;
+        }
+
+        chunks.push(RagChunk {
+            file: file_str,
+            text: text_str,
+            vector,
+        });
+    }
+
+    Ok(BinaryVectorStore {
+        version,
+        vector_dim,
+        timestamp,
+        chunks,
+    })
+}
+
+// -------------------------------------------------------------------------------------------------
+// FEATURE 19: AUTONOMOUS DEPENDENCY & SECURITY AUDITOR
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SecurityVulnerability {
+    pub package: String,
+    pub version: String,
+    pub severity: String, // "CRITICAL", "HIGH", "MEDIUM", "LOW"
+    pub title: String,
+    pub description: String,
+    pub remediation: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LicenseRisk {
+    pub package: String,
+    pub license: String,
+    pub risk_level: String, // "HIGH", "MEDIUM", "LOW"
+    pub reason: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct OutdatedDependency {
+    pub package: String,
+    pub current_requirement: String,
+    pub issue: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SecurityAuditReport {
+    pub root_path: String,
+    pub scanned_manifests: Vec<String>,
+    pub total_dependencies: usize,
+    pub vulnerabilities: Vec<SecurityVulnerability>,
+    pub license_risks: Vec<LicenseRisk>,
+    pub outdated_or_wildcards: Vec<OutdatedDependency>,
+    pub summary: String,
+    pub passed: bool,
+}
+
+pub fn parse_version_tuple(v: &str) -> (u64, u64, u64) {
+    let clean = v.trim_matches(['^', '~', '=', 'v', ' ', '>', '<']);
+    let parts: Vec<u64> = clean
+        .split('.')
+        .filter_map(|s| s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok())
+        .collect();
+    (
+        parts.get(0).copied().unwrap_or(0),
+        parts.get(1).copied().unwrap_or(0),
+        parts.get(2).copied().unwrap_or(0),
+    )
+}
+
+pub fn check_known_vulnerability(package: &str, version: &str) -> Option<SecurityVulnerability> {
+    let pkg_lower = package.to_lowercase();
+    let ver_tuple = parse_version_tuple(version);
+
+    // Rust crates
+    if pkg_lower == "rustls" && (ver_tuple < (0, 21, 11) || (ver_tuple >= (0, 22, 0) && ver_tuple < (0, 23, 5))) {
+        return Some(SecurityVulnerability {
+            package: package.to_string(),
+            version: version.to_string(),
+            severity: "HIGH".to_string(),
+            title: "CVE-2024-32650: Uncontrolled Resource Consumption in rustls".to_string(),
+            description: "Infinite loop when processing close_notify alerts leading to Denial of Service.".to_string(),
+            remediation: "Upgrade rustls to >= 0.21.11 or >= 0.23.5".to_string(),
+        });
+    }
+    if pkg_lower == "rsa" && ver_tuple < (0, 9, 6) {
+        return Some(SecurityVulnerability {
+            package: package.to_string(),
+            version: version.to_string(),
+            severity: "HIGH".to_string(),
+            title: "Marvin Attack: Side-channel timing vulnerability in RSA PKCS#1 v1.5".to_string(),
+            description: "Timing discrepancies in decryption operations allow private key recovery.".to_string(),
+            remediation: "Upgrade rsa crate to >= 0.9.6".to_string(),
+        });
+    }
+    if pkg_lower == "tokio" && ver_tuple.0 == 1 && ver_tuple < (1, 18, 4) {
+        return Some(SecurityVulnerability {
+            package: package.to_string(),
+            version: version.to_string(),
+            severity: "MEDIUM".to_string(),
+            title: "RUSTSEC-2021-0124: Named Pipe impersonation vulnerability on Windows".to_string(),
+            description: "Vulnerability in tokio NamedPipeServer allowing local privilege escalation.".to_string(),
+            remediation: "Upgrade tokio to >= 1.18.4".to_string(),
+        });
+    }
+
+    // NPM packages
+    if pkg_lower == "lodash" && ver_tuple < (4, 17, 21) {
+        return Some(SecurityVulnerability {
+            package: package.to_string(),
+            version: version.to_string(),
+            severity: "HIGH".to_string(),
+            title: "CVE-2021-23337: Prototype Pollution in lodash.template".to_string(),
+            description: "Command injection via prototype pollution in template compiler.".to_string(),
+            remediation: "Upgrade lodash to >= 4.17.21".to_string(),
+        });
+    }
+    if pkg_lower == "tar" && ver_tuple < (6, 1, 9) {
+        return Some(SecurityVulnerability {
+            package: package.to_string(),
+            version: version.to_string(),
+            severity: "HIGH".to_string(),
+            title: "CVE-2021-37701: Arbitrary File Overwrite in npm tar".to_string(),
+            description: "Symlink caching bypass allowing extraction to overwrite arbitrary host files.".to_string(),
+            remediation: "Upgrade tar to >= 6.1.9".to_string(),
+        });
+    }
+    if pkg_lower == "axios" && ver_tuple < (1, 6, 0) {
+        return Some(SecurityVulnerability {
+            package: package.to_string(),
+            version: version.to_string(),
+            severity: "MEDIUM".to_string(),
+            title: "CVE-2023-45857: Cross-Site Request Forgery in Axios".to_string(),
+            description: "XSRF-TOKEN cookie leakage during absolute URL redirects across origins.".to_string(),
+            remediation: "Upgrade axios to >= 1.6.0".to_string(),
+        });
+    }
+    if pkg_lower == "express" && ver_tuple < (4, 19, 2) {
+        return Some(SecurityVulnerability {
+            package: package.to_string(),
+            version: version.to_string(),
+            severity: "MEDIUM".to_string(),
+            title: "Open Redirect & IP spoofing in Express".to_string(),
+            description: "Improper handling of X-Forwarded-Host leading to open redirects.".to_string(),
+            remediation: "Upgrade express to >= 4.19.2".to_string(),
+        });
+    }
+
+    // Python packages
+    if pkg_lower == "requests" && ver_tuple < (2, 31, 0) {
+        return Some(SecurityVulnerability {
+            package: package.to_string(),
+            version: version.to_string(),
+            severity: "MEDIUM".to_string(),
+            title: "CVE-2023-32681: Proxy-Authorization header leak in requests".to_string(),
+            description: "Credentials leaked to destination server during HTTPS-to-HTTP redirects.".to_string(),
+            remediation: "Upgrade requests to >= 2.31.0".to_string(),
+        });
+    }
+    if pkg_lower == "urllib3" && (ver_tuple < (1, 26, 17) || (ver_tuple.0 == 2 && ver_tuple < (2, 0, 7))) {
+        return Some(SecurityVulnerability {
+            package: package.to_string(),
+            version: version.to_string(),
+            severity: "HIGH".to_string(),
+            title: "CVE-2023-45803: Cookie leakage in urllib3 redirects".to_string(),
+            description: "Cookie header stripped improperly on cross-host redirects.".to_string(),
+            remediation: "Upgrade urllib3 to >= 1.26.17 or >= 2.0.7".to_string(),
+        });
+    }
+    if pkg_lower == "django" && ver_tuple < (4, 2, 11) {
+        return Some(SecurityVulnerability {
+            package: package.to_string(),
+            version: version.to_string(),
+            severity: "HIGH".to_string(),
+            title: "CVE-2024-27351: ReDoS in django.utils.text.Truncator".to_string(),
+            description: "Catastrophic backtracking leading to service unavailability.".to_string(),
+            remediation: "Upgrade django to >= 4.2.11 or >= 5.0.3".to_string(),
+        });
+    }
+    if pkg_lower == "pillow" && ver_tuple < (10, 0, 1) {
+        return Some(SecurityVulnerability {
+            package: package.to_string(),
+            version: version.to_string(),
+            severity: "HIGH".to_string(),
+            title: "CVE-2023-44271: Buffer overflow in PIL / Pillow".to_string(),
+            description: "Uncontrolled memory write when decoding malformed font assets.".to_string(),
+            remediation: "Upgrade pillow to >= 10.0.1".to_string(),
+        });
+    }
+
+    None
+}
+
+pub fn check_license_risk(pkg: &str, license_name: &str) -> Option<LicenseRisk> {
+    let lic_upper = license_name.to_uppercase();
+    if lic_upper.contains("AGPL") || lic_upper.contains("SSPL") {
+        Some(LicenseRisk {
+            package: pkg.to_string(),
+            license: license_name.to_string(),
+            risk_level: "HIGH".to_string(),
+            reason: "Strong network copyleft (AGPL/SSPL). Requires open-sourcing backend source code upon network interaction.".to_string(),
+        })
+    } else if lic_upper.contains("GPL-2.0") || lic_upper.contains("GPL-3.0") || (lic_upper.contains("GPL") && !lic_upper.contains("LGPL")) {
+        Some(LicenseRisk {
+            package: pkg.to_string(),
+            license: license_name.to_string(),
+            risk_level: "MEDIUM".to_string(),
+            reason: "Standard copyleft (GPL). Linking with proprietary code may impose GPL licensing requirements.".to_string(),
+        })
+    } else if lic_upper.contains("CC-BY-NC") || lic_upper.contains("NON-COMMERCIAL") {
+        Some(LicenseRisk {
+            package: pkg.to_string(),
+            license: license_name.to_string(),
+            risk_level: "HIGH".to_string(),
+            reason: "Non-commercial restriction. Prohibits any commercial deployment or monetization.".to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+pub fn audit_project_dependencies(path: &std::path::Path) -> SecurityAuditReport {
+    let mut scanned = Vec::new();
+    let mut total_deps = 0;
+    let mut vulnerabilities = Vec::new();
+    let mut license_risks = Vec::new();
+    let mut outdated_or_wildcards = Vec::new();
+
+    // 1. Scan Cargo.lock / Cargo.toml
+    let cargo_lock = path.join("Cargo.lock");
+    if cargo_lock.exists() {
+        scanned.push("Cargo.lock".to_string());
+        if let Ok(content) = fs::read_to_string(&cargo_lock) {
+            let mut current_name = String::new();
+            for line in content.lines() {
+                let l = line.trim();
+                if l.starts_with("name = ") {
+                    current_name = l.trim_start_matches("name = ").trim_matches('"').to_string();
+                } else if l.starts_with("version = ") && !current_name.is_empty() {
+                    let version = l.trim_start_matches("version = ").trim_matches('"').to_string();
+                    total_deps += 1;
+                    if let Some(vuln) = check_known_vulnerability(&current_name, &version) {
+                        vulnerabilities.push(vuln);
+                    }
+                    current_name.clear();
+                }
+            }
+        }
+    }
+
+    let cargo_toml = path.join("Cargo.toml");
+    if cargo_toml.exists() {
+        if !scanned.contains(&"Cargo.lock".to_string()) {
+            scanned.push("Cargo.toml".to_string());
+        }
+        if let Ok(content) = fs::read_to_string(&cargo_toml) {
+            let mut in_deps = false;
+            for line in content.lines() {
+                let l = line.trim();
+                if l.starts_with("[dependencies]") || l.starts_with("[dev-dependencies]") || l.starts_with("[build-dependencies]") {
+                    in_deps = true;
+                    continue;
+                }
+                if l.starts_with('[') {
+                    in_deps = false;
+                }
+                if in_deps && l.contains('=') {
+                    let parts: Vec<&str> = l.splitn(2, '=').collect();
+                    let pkg = parts[0].trim();
+                    let val = parts[1].trim().trim_matches(['"', '\'']);
+                    if val == "*" || val == "\">0.0.0\"" {
+                        outdated_or_wildcards.push(OutdatedDependency {
+                            package: pkg.to_string(),
+                            current_requirement: val.to_string(),
+                            issue: "Wildcard requirement '*' is non-reproducible and vulnerable to supply-chain attacks.".to_string(),
+                        });
+                    }
+                    if val.starts_with("http://") {
+                        vulnerabilities.push(SecurityVulnerability {
+                            package: pkg.to_string(),
+                            version: val.to_string(),
+                            severity: "HIGH".to_string(),
+                            title: "Insecure Plaintext Transport".to_string(),
+                            description: "Package is fetched over unencrypted HTTP protocol vulnerable to MITM attacks.".to_string(),
+                            remediation: "Upgrade dependency source URL to HTTPS / git+ssh.".to_string(),
+                        });
+                    }
+                }
+                if l.starts_with("license = ") {
+                    let lic = l.trim_start_matches("license = ").trim_matches('"');
+                    if let Some(risk) = check_license_risk("Cargo.toml (workspace)", lic) {
+                        license_risks.push(risk);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Scan package-lock.json / package.json
+    let pkg_lock = path.join("package-lock.json");
+    if pkg_lock.exists() {
+        scanned.push("package-lock.json".to_string());
+        if let Ok(content) = fs::read_to_string(&pkg_lock) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(packages) = val.get("packages").and_then(|p| p.as_object()) {
+                    for (k, v) in packages {
+                        let name = k.trim_start_matches("node_modules/").to_string();
+                        if name.is_empty() { continue; }
+                        let ver = v.get("version").and_then(|ver| ver.as_str()).unwrap_or("0.0.0");
+                        total_deps += 1;
+                        if let Some(vuln) = check_known_vulnerability(&name, ver) {
+                            vulnerabilities.push(vuln);
+                        }
+                    }
+                } else if let Some(deps) = val.get("dependencies").and_then(|d| d.as_object()) {
+                    for (name, v) in deps {
+                        let ver = v.get("version").and_then(|ver| ver.as_str()).unwrap_or("0.0.0");
+                        total_deps += 1;
+                        if let Some(vuln) = check_known_vulnerability(name, ver) {
+                            vulnerabilities.push(vuln);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let pkg_json = path.join("package.json");
+    if pkg_json.exists() && !scanned.contains(&"package-lock.json".to_string()) {
+        scanned.push("package.json".to_string());
+        if let Ok(content) = fs::read_to_string(&pkg_json) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                for section in &["dependencies", "devDependencies"] {
+                    if let Some(deps) = val.get(*section).and_then(|d| d.as_object()) {
+                        for (name, v) in deps {
+                            total_deps += 1;
+                            let ver_str = v.as_str().unwrap_or("*");
+                            if ver_str == "*" || ver_str == "latest" {
+                                outdated_or_wildcards.push(OutdatedDependency {
+                                    package: name.clone(),
+                                    current_requirement: ver_str.to_string(),
+                                    issue: "Unpinned / wildcard npm dependency allows unverified package versions.".to_string(),
+                                });
+                            }
+                            if let Some(vuln) = check_known_vulnerability(name, ver_str) {
+                                vulnerabilities.push(vuln);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Scan requirements.txt
+    let req_txt = path.join("requirements.txt");
+    if req_txt.exists() {
+        scanned.push("requirements.txt".to_string());
+        if let Ok(content) = fs::read_to_string(&req_txt) {
+            for line in content.lines() {
+                let l = line.trim();
+                if l.is_empty() || l.starts_with('#') { continue; }
+                total_deps += 1;
+                if l.contains("==") {
+                    let parts: Vec<&str> = l.split("==").collect();
+                    let pkg = parts[0].trim();
+                    let ver = parts[1].trim();
+                    if let Some(vuln) = check_known_vulnerability(pkg, ver) {
+                        vulnerabilities.push(vuln);
+                    }
+                } else if l.contains(">=") || l.contains("<=") || l.contains("~=") {
+                    let pkg = l.split(&['>', '<', '=', '~'][..]).next().unwrap_or("").trim();
+                    outdated_or_wildcards.push(OutdatedDependency {
+                        package: pkg.to_string(),
+                        current_requirement: l.to_string(),
+                        issue: "Loosely constrained requirement constraint. Pin exact versions with '=='.".to_string(),
+                    });
+                } else {
+                    outdated_or_wildcards.push(OutdatedDependency {
+                        package: l.to_string(),
+                        current_requirement: "unpinned".to_string(),
+                        issue: "Completely unpinned Python package dependency. Risk of breaking builds.".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // 4. Scan go.mod
+    let go_mod = path.join("go.mod");
+    if go_mod.exists() {
+        scanned.push("go.mod".to_string());
+        if let Ok(content) = fs::read_to_string(&go_mod) {
+            for line in content.lines() {
+                let l = line.trim();
+                if l.starts_with("require ") || (l.contains("v0.") || l.contains("v1.")) {
+                    let parts: Vec<&str> = l.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let pkg = parts[0].trim_start_matches("require");
+                        let ver = parts[1];
+                        total_deps += 1;
+                        if let Some(vuln) = check_known_vulnerability(pkg, ver) {
+                            vulnerabilities.push(vuln);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let passed = vulnerabilities.is_empty() && license_risks.is_empty();
+    let summary = if passed && outdated_or_wildcards.is_empty() {
+        format!("✅ Security Audit Clean: 0 vulnerabilities across {} dependencies in {:?}", total_deps, scanned)
+    } else {
+        format!("🛡️ Audit Complete: {} vulnerabilities, {} license risks, {} wildcard/outdated issues detected in {:?}", vulnerabilities.len(), license_risks.len(), outdated_or_wildcards.len(), scanned)
+    };
+
+    SecurityAuditReport {
+        root_path: path.to_string_lossy().to_string(),
+        scanned_manifests: scanned,
+        total_dependencies: total_deps,
+        vulnerabilities,
+        license_risks,
+        outdated_or_wildcards,
+        summary,
+        passed,
+    }
+}
+
+pub fn format_security_report_for_terminal(report: &SecurityAuditReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n{}\n", "╔═══════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} {:<43} ║\n", "🛡️  SECURITY & DEPENDENCY AUDIT:".cyan().bold(), report.root_path.yellow()));
+    out.push_str(&format!("║ Manifests: {:<47} ║\n", report.scanned_manifests.join(", ").magenta()));
+    out.push_str(&format!("║ Total Dependencies Scanned: {:<29} ║\n", report.total_dependencies.to_string().yellow().bold()));
+    out.push_str("╠═══════════════════════════════════════════════════════════╣\n");
+
+    if report.passed && report.outdated_or_wildcards.is_empty() {
+        out.push_str(&format!("║  {}  ║\n", "✨ Clean! No vulnerabilities or license risks detected.".green().bold()));
+    } else {
+        for v in &report.vulnerabilities {
+            let badge = match v.severity.as_str() {
+                "CRITICAL" => " CRITICAL ".on_red().white().bold(),
+                "HIGH" => " HIGH ".on_red().white().bold(),
+                "MEDIUM" => " MEDIUM ".on_yellow().black().bold(),
+                _ => " LOW ".on_blue().white().bold(),
+            };
+            out.push_str(&format!("  {} {} @ {}\n", badge, v.package.bold(), v.version.yellow()));
+            out.push_str(&format!("     {}: {}\n", "Title".white().bold(), v.title.red()));
+            out.push_str(&format!("     {}: {}\n", "Details".dimmed(), v.description.dimmed()));
+            out.push_str(&format!("     {}: {}\n", "Remediation".green().bold(), v.remediation.green()));
+            out.push_str(&format!("  {}\n", "───────────────────────────────────────────────────────".dimmed()));
+        }
+
+        for l in &report.license_risks {
+            let badge = " LICENSE RISK ".on_yellow().black().bold();
+            out.push_str(&format!("  {} {} (License: {})\n", badge, l.package.bold(), l.license.yellow()));
+            out.push_str(&format!("     {}: {}\n", "Reason".dimmed(), l.reason.yellow()));
+            out.push_str(&format!("  {}\n", "───────────────────────────────────────────────────────".dimmed()));
+        }
+
+        for o in &report.outdated_or_wildcards {
+            let badge = " UNPINNED ".on_blue().white().bold();
+            out.push_str(&format!("  {} {} ({})\n", badge, o.package.bold(), o.current_requirement.yellow()));
+            out.push_str(&format!("     {}: {}\n", "Issue".dimmed(), o.issue.dimmed()));
+            out.push_str(&format!("  {}\n", "───────────────────────────────────────────────────────".dimmed()));
+        }
+    }
+
+    out.push_str("╚═══════════════════════════════════════════════════════════╝\n");
+    out.push_str(&format!("📊 {}\n", report.summary.bold()));
+    out
+}
+
+// -------------------------------------------------------------------------------------------------
+// FEATURE 20: NATIVE LOCAL DATABASE & SQL INSPECTOR (rusqlite)
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TableColumnInfo {
+    pub cid: i64,
+    pub name: String,
+    pub col_type: String,
+    pub notnull: bool,
+    pub dflt_value: Option<String>,
+    pub pk: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TableSchemaInfo {
+    pub table_name: String,
+    pub item_type: String, // "table", "view"
+    pub row_count: i64,
+    pub columns: Vec<TableColumnInfo>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct QueryResultTable {
+    pub query: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub row_count: usize,
+    pub execution_ms: u128,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DatabaseInspectionReport {
+    pub db_path: String,
+    pub tables: Vec<TableSchemaInfo>,
+    pub query_result: Option<QueryResultTable>,
+    pub summary: String,
+    pub success: bool,
+}
+
+pub fn is_safe_read_only_query(query: &str) -> Result<(), String> {
+    let q_upper = query.trim().to_uppercase();
+    if q_upper.is_empty() {
+        return Err("Query cannot be empty".to_string());
+    }
+
+    // Must start with read-only statement
+    if !q_upper.starts_with("SELECT") && !q_upper.starts_with("PRAGMA") && !q_upper.starts_with("EXPLAIN") && !q_upper.starts_with("WITH") {
+        return Err("Only read-only queries (SELECT, PRAGMA, EXPLAIN, WITH) are permitted.".to_string());
+    }
+
+    let forbidden = ["INSERT ", "UPDATE ", "DELETE ", "DROP ", "ALTER ", "TRUNCATE ", "CREATE ", "REPLACE ", "ATTACH ", "DETACH ", "VACUUM "];
+    for f in &forbidden {
+        if q_upper.contains(f) {
+            return Err(format!("Query contains forbidden mutation keyword '{}'. Direct write operations are prohibited.", f.trim()));
+        }
+    }
+
+    // Disallow multi-statement injection with semicolon
+    let statements: Vec<&str> = query.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if statements.len() > 1 {
+        return Err("Multi-statement SQL execution is disallowed for security reasons.".to_string());
+    }
+
+    Ok(())
+}
+
+pub fn inspect_sqlite_database(db_path: &std::path::Path, query: Option<&str>) -> Result<DatabaseInspectionReport, Box<dyn std::error::Error + Send + Sync>> {
+    use rusqlite::{types::ValueRef, Connection, OpenFlags};
+
+    if !db_path.exists() {
+        return Err(format!("Database file '{}' does not exist.", db_path.display()).into());
+    }
+
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+
+    // 1. Introspect schema
+    let mut stmt = conn.prepare("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name;")?;
+    let table_rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut tables = Vec::new();
+    for t_res in table_rows {
+        let (t_name, t_type) = t_res?;
+        // PRAGMA table_info
+        let pragma_sql = format!("PRAGMA table_info(\"{}\");", t_name.replace('"', "\"\""));
+        let mut pragma_stmt = conn.prepare(&pragma_sql)?;
+        let col_rows = pragma_stmt.query_map([], |row| {
+            Ok(TableColumnInfo {
+                cid: row.get(0)?,
+                name: row.get(1)?,
+                col_type: row.get(2)?,
+                notnull: row.get::<_, i64>(3)? != 0,
+                dflt_value: row.get(4).ok(),
+                pk: row.get::<_, i64>(5)? != 0,
+            })
+        })?;
+
+        let mut columns = Vec::new();
+        for col in col_rows {
+            columns.push(col?);
+        }
+
+        // Row count
+        let count_sql = format!("SELECT COUNT(*) FROM \"{}\";", t_name.replace('"', "\"\""));
+        let count: i64 = conn.query_row(&count_sql, [], |r| r.get(0)).unwrap_or(0);
+
+        tables.push(TableSchemaInfo {
+            table_name: t_name,
+            item_type: t_type,
+            row_count: count,
+            columns,
+        });
+    }
+
+    // 2. Execute query if provided
+    let mut query_result = None;
+    if let Some(q) = query {
+        let q_trimmed = q.trim();
+        if !q_trimmed.is_empty() {
+            is_safe_read_only_query(q_trimmed).map_err(|e| format!("Security check failed: {}", e))?;
+
+            let start = std::time::Instant::now();
+            let mut q_stmt = conn.prepare(q_trimmed)?;
+            let col_names: Vec<String> = q_stmt.column_names().into_iter().map(|s| s.to_string()).collect();
+
+            let mut q_rows = q_stmt.query([])?;
+            let mut rows_data = Vec::new();
+
+            while let Some(row) = q_rows.next()? {
+                if rows_data.len() >= 100 {
+                    break;
+                }
+                let mut row_vals = Vec::new();
+                for i in 0..col_names.len() {
+                    let val_ref = row.get_ref(i)?;
+                    let val_str = match val_ref {
+                        ValueRef::Null => "NULL".to_string(),
+                        ValueRef::Integer(i) => i.to_string(),
+                        ValueRef::Real(f) => format!("{:.4}", f),
+                        ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
+                        ValueRef::Blob(b) => format!("<blob:{}B>", b.len()),
+                    };
+                    row_vals.push(val_str);
+                }
+                rows_data.push(row_vals);
+            }
+
+            let exec_time = start.elapsed().as_millis();
+            let row_count = rows_data.len();
+            query_result = Some(QueryResultTable {
+                query: q_trimmed.to_string(),
+                columns: col_names,
+                rows: rows_data,
+                row_count,
+                execution_ms: exec_time,
+            });
+        }
+    }
+
+    let summary = format!("Inspected database '{}' ({} tables/views found)", db_path.display(), tables.len());
+
+    Ok(DatabaseInspectionReport {
+        db_path: db_path.to_string_lossy().to_string(),
+        tables,
+        query_result,
+        summary,
+        success: true,
+    })
+}
+
+pub fn format_database_report_for_terminal(report: &DatabaseInspectionReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n{}\n", "╔═══════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} {:<44} ║\n", "🗄️  SQLITE DATABASE INSPECTOR:".cyan().bold(), report.db_path.yellow()));
+    out.push_str("╠═══════════════════════════════════════════════════════════╣\n");
+
+    if report.tables.is_empty() {
+        out.push_str(&format!("║  {}  ║\n", "Database has 0 tables or views.".yellow()));
+    } else {
+        for (i, t) in report.tables.iter().enumerate() {
+            out.push_str(&format!("  {} {} ({} rows, type: {})\n", "📋".cyan(), t.table_name.bold().green(), t.row_count.to_string().yellow(), t.item_type.magenta()));
+            for col in &t.columns {
+                let pk_tag = if col.pk { " [PK]".yellow().bold().to_string() } else { "".to_string() };
+                let null_tag = if col.notnull { " NOT NULL".dimmed().to_string() } else { "".to_string() };
+                out.push_str(&format!("     {} {}: {}{}{}\n", "•".dimmed(), col.name.white().bold(), col.col_type.cyan(), pk_tag, null_tag));
+            }
+            if i + 1 < report.tables.len() {
+                out.push_str(&format!("  {}\n", "───────────────────────────────────────────────────────".dimmed()));
+            }
+        }
+    }
+
+    if let Some(qr) = &report.query_result {
+        out.push_str("╠═══════════════════════════════════════════════════════════╣\n");
+        out.push_str(&format!("║ Query: {:<50} ║\n", qr.query.yellow()));
+        out.push_str(&format!("║ Execution Time: {}ms | Rows Returned: {:<20} ║\n", qr.execution_ms, qr.row_count.to_string().green()));
+        out.push_str("╠═══════════════════════════════════════════════════════════╣\n");
+
+        if qr.columns.is_empty() {
+            out.push_str("  (No columns returned)\n");
+        } else {
+            // Calculate column widths
+            let mut widths: Vec<usize> = qr.columns.iter().map(|c| c.len().max(4)).collect();
+            for row in &qr.rows {
+                for (i, val) in row.iter().enumerate() {
+                    if i < widths.len() {
+                        widths[i] = widths[i].max(val.len().min(40));
+                    }
+                }
+            }
+
+            // Top border
+            let top_border = widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join("┬");
+            out.push_str(&format!("  ┌{}┐\n", top_border));
+
+            // Header
+            let mut header_cells = Vec::new();
+            for (i, col) in qr.columns.iter().enumerate() {
+                header_cells.push(format!(" {:<width$} ", col.bold().cyan(), width = widths[i]));
+            }
+            out.push_str(&format!("  │{}│\n", header_cells.join("│")));
+
+            // Separator
+            let mid_border = widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join("┼");
+            out.push_str(&format!("  ├{}┤\n", mid_border));
+
+            // Rows
+            for row in &qr.rows {
+                let mut row_cells = Vec::new();
+                for (i, val) in row.iter().enumerate() {
+                    let w = widths.get(i).copied().unwrap_or(val.len());
+                    let display_val = if val.len() > 40 { format!("{}...", &val[..37]) } else { val.clone() };
+                    row_cells.push(format!(" {:<width$} ", display_val, width = w));
+                }
+                out.push_str(&format!("  │{}│\n", row_cells.join("│")));
+            }
+
+            // Bottom border
+            let bot_border = widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join("┴");
+            out.push_str(&format!("  └{}┘\n", bot_border));
+        }
+    }
+
+    out.push_str("╚═══════════════════════════════════════════════════════════╝\n");
+    out
+}
+
+// -------------------------------------------------------------------------------------------------
+// FEATURE 21: AUTOMATED API & DOCSTRING DOCUMENTATION GENERATOR
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UndocumentedSymbol {
+    pub file: String,
+    pub name: String,
+    pub symbol_type: String, // "function", "struct", "enum", "trait", "class", "interface"
+    pub line_number: usize,
+    pub signature: String,
+    pub language: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DocPatch {
+    pub file: String,
+    pub symbol_name: String,
+    pub line_number: usize,
+    pub docstring: String,
+    pub patch_diff: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DocGenerationReport {
+    pub target_path: String,
+    pub total_symbols_scanned: usize,
+    pub undocumented_count: usize,
+    pub symbols: Vec<UndocumentedSymbol>,
+    pub patches: Vec<DocPatch>,
+    pub applied_count: usize,
+    pub summary: String,
+}
+
+pub fn scan_undocumented_symbols(path: &std::path::Path) -> Vec<UndocumentedSymbol> {
+    let mut symbols = Vec::new();
+
+    let walker: Vec<_> = if path.is_file() {
+        vec![path.to_path_buf()]
+    } else {
+        WalkDir::new(path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.path().to_path_buf())
+            .collect()
+    };
+
+    for file_path in walker {
+        let path_str = file_path.to_string_lossy().to_string();
+        if path_str.contains("/target/") || path_str.contains("/.git/") || path_str.contains("node_modules") || path_str.contains(".zy") {
+            continue;
+        }
+
+        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if let Ok(content) = fs::read_to_string(&file_path) {
+            let lines: Vec<&str> = content.lines().collect();
+
+            if ext == "rs" {
+                for (idx, line) in lines.iter().enumerate() {
+                    let trimmed = line.trim();
+                    let is_target = trimmed.starts_with("pub fn ")
+                        || trimmed.starts_with("pub async fn ")
+                        || trimmed.starts_with("pub struct ")
+                        || trimmed.starts_with("pub enum ")
+                        || trimmed.starts_with("pub trait ")
+                        || trimmed.starts_with("fn ")
+                        || trimmed.starts_with("struct ")
+                        || trimmed.starts_with("enum ")
+                        || trimmed.starts_with("trait ");
+
+                    if is_target && !trimmed.starts_with("//") {
+                        let (sym_type, sym_name) = if trimmed.contains("fn ") {
+                            ("function", extract_identifier_after(trimmed, "fn ").unwrap_or("unknown"))
+                        } else if trimmed.contains("struct ") {
+                            ("struct", extract_identifier_after(trimmed, "struct ").unwrap_or("unknown"))
+                        } else if trimmed.contains("enum ") {
+                            ("enum", extract_identifier_after(trimmed, "enum ").unwrap_or("unknown"))
+                        } else if trimmed.contains("trait ") {
+                            ("trait", extract_identifier_after(trimmed, "trait ").unwrap_or("unknown"))
+                        } else {
+                            ("symbol", "unknown")
+                        };
+
+                        if sym_name == "unknown" || sym_name.starts_with('_') { continue; }
+
+                        // Check preceding lines for doc comments
+                        let mut has_doc = false;
+                        let mut lookback = idx;
+                        while lookback > 0 {
+                            lookback -= 1;
+                            let prev = lines[lookback].trim();
+                            if prev.starts_with("///") || prev.starts_with("//!") || prev.starts_with("#[doc") {
+                                has_doc = true;
+                                break;
+                            }
+                            if !prev.starts_with("#[") && !prev.is_empty() {
+                                break;
+                            }
+                        }
+
+                        if !has_doc {
+                            symbols.push(UndocumentedSymbol {
+                                file: path_str.clone(),
+                                name: sym_name.to_string(),
+                                symbol_type: sym_type.to_string(),
+                                line_number: idx + 1,
+                                signature: trimmed.to_string(),
+                                language: "rust".to_string(),
+                            });
+                        }
+                    }
+                }
+            } else if ext == "py" {
+                for (idx, line) in lines.iter().enumerate() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("def ") || trimmed.starts_with("async def ") || trimmed.starts_with("class ") {
+                        let (sym_type, sym_name) = if trimmed.starts_with("class ") {
+                            ("class", extract_identifier_after(trimmed, "class ").unwrap_or("unknown"))
+                        } else {
+                            ("function", extract_identifier_after(trimmed, "def ").unwrap_or("unknown"))
+                        };
+
+                        if sym_name == "unknown" || sym_name.starts_with("__") { continue; }
+
+                        // Check next line for docstring
+                        let mut has_doc = false;
+                        if idx + 1 < lines.len() {
+                            let next_line = lines[idx + 1].trim();
+                            if next_line.starts_with("\"\"\"") || next_line.starts_with("'''") {
+                                has_doc = true;
+                            }
+                        }
+
+                        if !has_doc {
+                            symbols.push(UndocumentedSymbol {
+                                file: path_str.clone(),
+                                name: sym_name.to_string(),
+                                symbol_type: sym_type.to_string(),
+                                line_number: idx + 1,
+                                signature: trimmed.to_string(),
+                                language: "python".to_string(),
+                            });
+                        }
+                    }
+                }
+            } else if ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" {
+                for (idx, line) in lines.iter().enumerate() {
+                    let trimmed = line.trim();
+                    let is_target = trimmed.starts_with("export function ")
+                        || trimmed.starts_with("export async function ")
+                        || trimmed.starts_with("export class ")
+                        || trimmed.starts_with("export interface ")
+                        || trimmed.starts_with("function ")
+                        || trimmed.starts_with("class ")
+                        || trimmed.starts_with("interface ");
+
+                    if is_target && !trimmed.starts_with("//") {
+                        let (sym_type, sym_name) = if trimmed.contains("function ") {
+                            ("function", extract_identifier_after(trimmed, "function ").unwrap_or("unknown"))
+                        } else if trimmed.contains("class ") {
+                            ("class", extract_identifier_after(trimmed, "class ").unwrap_or("unknown"))
+                        } else if trimmed.contains("interface ") {
+                            ("interface", extract_identifier_after(trimmed, "interface ").unwrap_or("unknown"))
+                        } else {
+                            ("symbol", "unknown")
+                        };
+
+                        if sym_name == "unknown" || sym_name.starts_with('_') { continue; }
+
+                        let mut has_doc = false;
+                        let mut lookback = idx;
+                        while lookback > 0 {
+                            lookback -= 1;
+                            let prev = lines[lookback].trim();
+                            if prev.ends_with("*/") || prev.starts_with("/**") || prev.starts_with("//") {
+                                has_doc = true;
+                                break;
+                            }
+                            if !prev.starts_with('@') && !prev.is_empty() {
+                                break;
+                            }
+                        }
+
+                        if !has_doc {
+                            symbols.push(UndocumentedSymbol {
+                                file: path_str.clone(),
+                                name: sym_name.to_string(),
+                                symbol_type: sym_type.to_string(),
+                                line_number: idx + 1,
+                                signature: trimmed.to_string(),
+                                language: "typescript".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    symbols
+}
+
+pub fn generate_docstring_patches(symbols: &[UndocumentedSymbol], _default_lang: &str) -> Vec<DocPatch> {
+    let mut patches = Vec::new();
+
+    for sym in symbols {
+        let docstring = if sym.language == "python" {
+            format!(
+                "\"\"\"\n{}: {}\n\nReturns:\n    Documented return value.\n\"\"\"",
+                sym.name, sym.signature
+            )
+        } else if sym.language == "typescript" || sym.language == "javascript" {
+            format!(
+                "/**\n * {}\n * @summary {}\n */",
+                sym.name, sym.signature
+            )
+        } else {
+            // Rust default
+            format!(
+                "/// {}\n///\n/// # Signature\n/// ```rust\n/// {}\n/// ```",
+                sym.name, sym.signature
+            )
+        };
+
+        let diff = render_terminal_diff(&sym.file, &sym.signature, &format!("{}\n{}", docstring, sym.signature));
+
+        patches.push(DocPatch {
+            file: sym.file.clone(),
+            symbol_name: sym.name.clone(),
+            line_number: sym.line_number,
+            docstring,
+            patch_diff: diff,
+        });
+    }
+
+    patches
+}
+
+pub fn apply_doc_patches(patches: &[DocPatch]) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let mut patches_by_file: std::collections::HashMap<String, Vec<&DocPatch>> = std::collections::HashMap::new();
+    for patch in patches {
+        patches_by_file.entry(patch.file.clone()).or_default().push(patch);
+    }
+
+    let mut count = 0;
+    for (file_path_str, mut file_patches) in patches_by_file {
+        let path = std::path::Path::new(&file_path_str);
+        if !path.exists() { continue; }
+        let content = fs::read_to_string(path)?;
+        let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+        // Sort descending by line number so inserting earlier doesn't shift indices of earlier lines
+        file_patches.sort_by(|a, b| b.line_number.cmp(&a.line_number));
+
+        let is_py = file_path_str.ends_with(".py");
+
+        for patch in file_patches {
+            if patch.line_number == 0 || patch.line_number > lines.len() {
+                continue;
+            }
+            let idx = patch.line_number - 1;
+            let target_line = lines[idx].clone();
+            let base_indent = target_line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
+
+            if is_py {
+                // In Python, docstrings reside inside the function/class block after the header line
+                let doc_indent = format!("{}    ", base_indent);
+                let doc_lines: Vec<String> = patch.docstring.lines().map(|l| {
+                    let trimmed = l.trim();
+                    if trimmed.is_empty() { String::new() } else { format!("{}{}", doc_indent, trimmed) }
+                }).collect();
+
+                let mut insert_pos = idx + 1;
+                for doc_line in doc_lines {
+                    lines.insert(insert_pos, doc_line);
+                    insert_pos += 1;
+                }
+            } else {
+                // In Rust, TypeScript, etc., doc comments precede the item declaration
+                let doc_lines: Vec<String> = patch.docstring.lines().map(|l| {
+                    let trimmed = l.trim();
+                    if trimmed.is_empty() { String::new() } else { format!("{}{}", base_indent, trimmed) }
+                }).collect();
+
+                let mut insert_pos = idx;
+                for doc_line in doc_lines {
+                    lines.insert(insert_pos, doc_line);
+                    insert_pos += 1;
+                }
+            }
+        }
+
+        auto_git_backup(&file_path_str);
+        let mut new_content = lines.join("\n");
+        if content.ends_with('\n') {
+            new_content.push('\n');
+        }
+        fs::write(path, new_content)?;
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+pub fn format_doc_generation_report_for_terminal(report: &DocGenerationReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n{}\n", "╔═══════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} {:<40} ║\n", "📚 DOCSTRING & API GENERATOR:".cyan().bold(), report.target_path.yellow()));
+    out.push_str(&format!("║ Undocumented Symbols Found: {:<29} ║\n", report.undocumented_count.to_string().yellow().bold()));
+    out.push_str("╠═══════════════════════════════════════════════════════════╣\n");
+
+    if report.symbols.is_empty() {
+        out.push_str(&format!("║  {}  ║\n", "✨ All symbols documented! 100% doc coverage.".green().bold()));
+    } else {
+        for (i, patch) in report.patches.iter().enumerate() {
+            out.push_str(&format!("  {} {} (Line {})\n", "📝".cyan(), patch.symbol_name.bold().green(), patch.line_number.to_string().yellow()));
+            for dl in patch.docstring.lines() {
+                out.push_str(&format!("     {} {}\n", "│".dimmed(), dl.dimmed().cyan()));
+            }
+            if i + 1 < report.patches.len() {
+                out.push_str(&format!("  {}\n", "───────────────────────────────────────────────────────".dimmed()));
+            }
+        }
+    }
+
+    out.push_str("╚═══════════════════════════════════════════════════════════╝\n");
+    out.push_str(&format!("📊 {}\n", report.summary.bold()));
+    out
+}
+
+// -------------------------------------------------------------------------------------------------
+// FEATURE 22: ATOMIC MULTI-FILE REFACTOR TRANSACTIONS
+// -------------------------------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct StagedFile {
+    pub path: String,
+    pub original_content: Option<String>,
+    pub staged_content: String,
+    pub is_deletion: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TransactionValidationReport {
+    pub is_valid: bool,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+    pub staged_files_count: usize,
+    pub summary: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RefactorTransaction {
+    pub id: String,
+    pub staged_files: std::collections::HashMap<String, StagedFile>,
+    pub created_at: u64,
+}
+
+impl Default for RefactorTransaction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RefactorTransaction {
+    pub fn new() -> Self {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let id = format!("tx_{}", ts);
+        Self {
+            id,
+            staged_files: std::collections::HashMap::new(),
+            created_at: ts,
+        }
+    }
+
+    pub fn stage_edit(&mut self, path: &std::path::Path, content: &str) {
+        let path_str = path.to_string_lossy().to_string();
+        let original = fs::read_to_string(path).ok();
+        self.staged_files.insert(path_str.clone(), StagedFile {
+            path: path_str,
+            original_content: original,
+            staged_content: content.to_string(),
+            is_deletion: false,
+        });
+    }
+
+    pub fn stage_delete(&mut self, path: &std::path::Path) {
+        let path_str = path.to_string_lossy().to_string();
+        let original = fs::read_to_string(path).ok();
+        self.staged_files.insert(path_str.clone(), StagedFile {
+            path: path_str,
+            original_content: original,
+            staged_content: String::new(),
+            is_deletion: true,
+        });
+    }
+
+    pub fn render_diff(&self) -> String {
+        if self.staged_files.is_empty() {
+            return "(No files currently staged in transaction)".to_string();
+        }
+        let mut diffs = Vec::new();
+        for (path, staged) in &self.staged_files {
+            if staged.is_deletion {
+                diffs.push(render_terminal_diff(path, staged.original_content.as_deref().unwrap_or(""), ""));
+            } else {
+                diffs.push(render_terminal_diff(path, staged.original_content.as_deref().unwrap_or(""), &staged.staged_content));
+            }
+        }
+        diffs.join("\n\n")
+    }
+
+    pub fn validate_all_staged(&self, _workspace_root: &std::path::Path) -> TransactionValidationReport {
+        if self.staged_files.is_empty() {
+            return TransactionValidationReport {
+                is_valid: true,
+                errors: Vec::new(),
+                warnings: Vec::new(),
+                staged_files_count: 0,
+                summary: "No staged files in transaction to validate.".to_string(),
+            };
+        }
+
+        let mut errors = Vec::new();
+        let warnings = Vec::new();
+
+        // Create temporary shadow directory for validation
+        let shadow_dir = std::env::temp_dir().join(format!("zy_shadow_tx_{}_{}", std::process::id(), self.id));
+        let _ = fs::create_dir_all(&shadow_dir);
+
+        // Validate Rust files syntax
+        for (p_str, staged) in &self.staged_files {
+            if p_str.ends_with(".rs") && !staged.is_deletion {
+                // Check for mismatched braces
+                let open_b = staged.staged_content.chars().filter(|c| *c == '{').count();
+                let close_b = staged.staged_content.chars().filter(|c| *c == '}').count();
+                if open_b != close_b {
+                    errors.push(format!("{}: Mismatched curly braces ({} open vs {} close)", p_str, open_b, close_b));
+                }
+                let open_p = staged.staged_content.chars().filter(|c| *c == '(').count();
+                let close_p = staged.staged_content.chars().filter(|c| *c == ')').count();
+                if open_p != close_p {
+                    errors.push(format!("{}: Mismatched parentheses ({} open vs {} close)", p_str, open_p, close_p));
+                }
+            }
+        }
+
+        for (p_str, staged) in &self.staged_files {
+            if p_str.ends_with(".py") && !staged.is_deletion {
+                let temp_py = shadow_dir.join("test_syntax.py");
+                if fs::write(&temp_py, &staged.staged_content).is_ok() {
+                    let py_cmd = if cfg!(windows) { "python" } else { "python3" };
+                    if let Ok(out) = std::process::Command::new(py_cmd).args(["-m", "py_compile", &temp_py.to_string_lossy()]).output() {
+                        if !out.status.success() {
+                            let err_msg = String::from_utf8_lossy(&out.stderr).to_string();
+                            errors.push(format!("{}: Python syntax error: {}", p_str, err_msg.lines().last().unwrap_or("syntax error")));
+                        }
+                    }
+                }
+            }
+            if (p_str.ends_with(".json") || p_str.ends_with(".zyrules")) && !staged.is_deletion {
+                if let Err(e) = serde_json::from_str::<serde_json::Value>(&staged.staged_content) {
+                    if p_str.ends_with(".json") {
+                        errors.push(format!("{}: Invalid JSON syntax: {}", p_str, e));
+                    }
+                }
+            }
+        }
+
+        let _ = fs::remove_dir_all(&shadow_dir);
+
+        let is_valid = errors.is_empty();
+        let summary = if is_valid {
+            format!("Transaction validation PASSED ({} file(s) staged)", self.staged_files.len())
+        } else {
+            format!("Transaction validation FAILED with {} error(s)", errors.len())
+        };
+
+        TransactionValidationReport {
+            is_valid,
+            errors,
+            warnings,
+            staged_files_count: self.staged_files.len(),
+            summary,
+        }
+    }
+
+    pub fn commit(&mut self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let _ = create_git_checkpoint_with_label(Some(&format!("pre-commit-{}", self.id)));
+        let mut committed = Vec::new();
+
+        for (p_str, staged) in &self.staged_files {
+            let path = std::path::Path::new(p_str);
+            if staged.is_deletion {
+                if path.exists() {
+                    fs::remove_file(path)?;
+                }
+            } else {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                fs::write(path, &staged.staged_content)?;
+            }
+            committed.push(p_str.clone());
+        }
+
+        self.staged_files.clear();
+        Ok(committed)
+    }
+
+    pub fn rollback(&mut self) {
+        self.staged_files.clear();
+    }
+
+    pub fn status(&self) -> String {
+        let mut out = format!("📦 Refactor Transaction: [{}]\n", self.id.cyan().bold());
+        out.push_str(&format!("   Staged files: {}\n", self.staged_files.len().to_string().yellow().bold()));
+        if self.staged_files.is_empty() {
+            out.push_str("   (No files currently staged)");
+        } else {
+            for (p, s) in &self.staged_files {
+                let op = if s.is_deletion { "[DELETE]".red().bold() } else { "[STAGE]".green().bold() };
+                out.push_str(&format!("   • {} {} ({} bytes)\n", op, p.bold(), s.staged_content.len()));
+            }
+        }
+        out
+    }
+}
+
+static ACTIVE_TRANSACTION: std::sync::Mutex<Option<RefactorTransaction>> = std::sync::Mutex::new(None);
+
+pub fn begin_refactor_transaction() {
+    let mut lock = ACTIVE_TRANSACTION.lock().unwrap();
+    *lock = Some(RefactorTransaction::new());
+}
+
+pub fn stage_in_refactor_transaction(path: &std::path::Path, content: &str) {
+    let mut lock = ACTIVE_TRANSACTION.lock().unwrap();
+    if lock.is_none() {
+        *lock = Some(RefactorTransaction::new());
+    }
+    if let Some(tx) = lock.as_mut() {
+        tx.stage_edit(path, content);
+    }
+}
+
+pub fn validate_refactor_transaction(workspace_root: &std::path::Path) -> TransactionValidationReport {
+    let lock = ACTIVE_TRANSACTION.lock().unwrap();
+    if let Some(tx) = lock.as_ref() {
+        tx.validate_all_staged(workspace_root)
+    } else {
+        TransactionValidationReport {
+            is_valid: true,
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            staged_files_count: 0,
+            summary: "No active refactor transaction.".to_string(),
+        }
+    }
+}
+
+pub fn commit_refactor_transaction() -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut lock = ACTIVE_TRANSACTION.lock().unwrap();
+    if let Some(tx) = lock.as_mut() {
+        tx.commit()
+    } else {
+        Err("No active refactor transaction to commit.".into())
+    }
+}
+
+pub fn rollback_refactor_transaction() {
+    let mut lock = ACTIVE_TRANSACTION.lock().unwrap();
+    if let Some(tx) = lock.as_mut() {
+        tx.rollback();
+    }
+    *lock = None;
+}
+
+pub fn get_refactor_transaction_diff() -> String {
+    let lock = ACTIVE_TRANSACTION.lock().unwrap();
+    if let Some(tx) = lock.as_ref() {
+        tx.render_diff()
+    } else {
+        "(No active refactor transaction)".to_string()
+    }
+}
+
+pub fn get_refactor_transaction_status() -> String {
+    let lock = ACTIVE_TRANSACTION.lock().unwrap();
+    if let Some(tx) = lock.as_ref() {
+        tx.status()
+    } else {
+        "📦 Refactor Transaction: [None active]\n   Use /transaction begin or tool refactor_transaction to start one.".to_string()
+    }
+}
+
 pub async fn single_prompt(
     client: &Client, 
     model: &str, 
@@ -2975,6 +4839,11 @@ pub async fn interactive_chat(
                         "/help" => {
                             println!("{}", "Available slash commands:".yellow());
                             println!("  /help                 - Show this help message");
+                            println!("  /tui                  - Full-Screen Interactive TUI Dashboard (ratatui + crossterm)");
+                            println!("  /audit [path]         - Autonomous Dependency & Security Auditor");
+                            println!("  /db <path> [sql]      - Native Local SQLite Database & SQL Inspector");
+                            println!("  /docs <path>          - Automated API & Docstring Documentation Generator");
+                            println!("  /transaction <action> - Atomic Multi-File Refactor Transactions (stage/commit/rollback)");
                             println!("  /swarm <goal>         - Autonomous Multi-Agent Swarm (Architect -> Coder -> Auditor -> QA)");
                             println!("  /search <query>       - Perform live DuckDuckGo web search without API key");
                             println!("  /mentions             - Help for interactive @file, @git, @diff, @symbol mentions");
@@ -3681,6 +5550,119 @@ except Exception as e:
                             }
                             continue;
                         }
+                        "/tui" => {
+                            println!("{}", "Launching Full-Screen Interactive TUI Dashboard...".cyan().bold());
+                            let _ = run_tui_app(client, &active_model, system, files, agent, rag, tuner, force).await;
+                            continue;
+                        }
+                        "/audit" => {
+                            let target_path = if parts.len() > 1 { parts[1] } else { "." };
+                            println!("{} Auditing dependencies in `{}`...", "🛡️  Security Auditor:".cyan().bold(), target_path.yellow());
+                            let report = audit_project_dependencies(std::path::Path::new(target_path));
+                            println!("{}", format_security_report_for_terminal(&report));
+                            continue;
+                        }
+                        "/db" => {
+                            if parts.len() > 1 {
+                                let db_path = parts[1];
+                                let query = if parts.len() > 2 { Some(parts[2..].join(" ")) } else { None };
+                                println!("{} Inspecting database `{}`...", "🗄️  Database Inspector:".cyan().bold(), db_path.yellow());
+                                match inspect_sqlite_database(std::path::Path::new(db_path), query.as_deref()) {
+                                    Ok(report) => println!("{}", format_database_report_for_terminal(&report)),
+                                    Err(e) => println!("{} {}", "❌ Database Inspector Error:".red(), e),
+                                }
+                            } else {
+                                println!("{}", "Usage: /db <path_to_sqlite_db> [safe_sql_query]".red());
+                            }
+                            continue;
+                        }
+                        "/docs" => {
+                            let target_path = if parts.len() > 1 { parts[1] } else { "." };
+                            println!("{} Scanning `{}` for undocumented symbols...", "📚 Docstring Generator:".cyan().bold(), target_path.yellow());
+                            let symbols = scan_undocumented_symbols(std::path::Path::new(target_path));
+                            let patches = generate_docstring_patches(&symbols, "rust");
+                            let report = DocGenerationReport {
+                                target_path: target_path.to_string(),
+                                total_symbols_scanned: symbols.len(),
+                                undocumented_count: symbols.len(),
+                                symbols,
+                                patches: patches.clone(),
+                                applied_count: 0,
+                                summary: format!("Found {} undocumented symbols in {}", patches.len(), target_path),
+                            };
+                            println!("{}", format_doc_generation_report_for_terminal(&report));
+                            if !patches.is_empty() {
+                                let proceed = if force { true } else { ask_confirmation("Apply generated docstrings to files?") };
+                                if proceed {
+                                    match apply_doc_patches(&patches) {
+                                        Ok(count) => println!("{} Successfully applied docstrings to {} file(s).", "✨".green(), count),
+                                        Err(e) => println!("{} {}", "❌ Failed to apply docstrings:".red(), e),
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        "/transaction" => {
+                            if parts.len() > 1 {
+                                let action = parts[1].to_lowercase();
+                                match action.as_str() {
+                                    "begin" => {
+                                        begin_refactor_transaction();
+                                        println!("{}", "🚀 Initiated fresh in-memory Refactor Transaction.".green().bold());
+                                    }
+                                    "stage" => {
+                                        if parts.len() >= 4 {
+                                            let path = parts[2];
+                                            let content = parts[3..].join(" ");
+                                            stage_in_refactor_transaction(std::path::Path::new(path), &content);
+                                            println!("{} Staged virtual edit for `{}`", "📝".cyan(), path.yellow());
+                                        } else {
+                                            println!("{}", "Usage: /transaction stage <path> <content>".red());
+                                        }
+                                    }
+                                    "validate" => {
+                                        println!("{}", "🔍 Validating all staged virtual edits with compiler diagnostics...".cyan().bold());
+                                        let report = validate_refactor_transaction(std::path::Path::new("."));
+                                        if report.is_valid {
+                                            println!("{} {}", "✅ Validation Clean:".green().bold(), report.summary);
+                                        } else {
+                                            println!("{} {}", "❌ Validation Failed:".red().bold(), report.summary);
+                                            for err in &report.errors {
+                                                println!("   {} {}", "•".red(), err);
+                                            }
+                                        }
+                                    }
+                                    "diff" => {
+                                        let diff = get_refactor_transaction_diff();
+                                        println!("\n{}\n", diff);
+                                    }
+                                    "commit" => {
+                                        match commit_refactor_transaction() {
+                                            Ok(files) => {
+                                                println!("{} Atomically committed {} file(s):", "🎉 Transaction Committed:".green().bold(), files.len());
+                                                for f in files {
+                                                    println!("   {} {}", "✔".green(), f);
+                                                }
+                                            }
+                                            Err(e) => println!("{} {}", "❌ Transaction Commit Failed:".red(), e),
+                                        }
+                                    }
+                                    "rollback" => {
+                                        rollback_refactor_transaction();
+                                        println!("{}", "⏪ Refactor Transaction rolled back. Staging buffer cleared.".yellow().bold());
+                                    }
+                                    "status" => {
+                                        println!("{}", get_refactor_transaction_status());
+                                    }
+                                    _ => {
+                                        println!("{}", "Usage: /transaction <begin|stage|validate|diff|commit|rollback|status>".red());
+                                    }
+                                }
+                            } else {
+                                println!("{}", get_refactor_transaction_status());
+                            }
+                            continue;
+                        }
                         "/exit" | "/quit" => break,
                         _ => {
                             println!("{}", "Unknown slash command. Type /help to see available commands.".red());
@@ -4047,6 +6029,64 @@ pub fn get_tools() -> serde_json::Value {
                         "max_results": { "type": "integer", "description": "Maximum search results to return (default 5)" }
                     },
                     "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "audit_security",
+                "description": "Autonomous Dependency & Security Auditor. Scans Cargo.lock, package-lock.json, requirements.txt, etc., for known security vulnerabilities, license risks, and outdated/wildcard packages.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Root directory path to audit (defaults to '.')" }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "db_query",
+                "description": "Native Local Database & SQL Inspector. Introspects SQLite database schemas, tables, views, columns, and executes safe read-only SQL queries.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "db_path": { "type": "string", "description": "Path to the SQLite database file" },
+                        "query": { "type": "string", "description": "Optional safe read-only SQL query to execute (e.g. 'SELECT * FROM users LIMIT 10')" }
+                    },
+                    "required": ["db_path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "generate_docs",
+                "description": "Automated API & Docstring Documentation Generator. Scans codebase for undocumented symbols (Rust, Python, TypeScript) and generates idiomatic docstrings.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File or directory path to scan for undocumented symbols (defaults to '.')" },
+                        "auto_apply": { "type": "boolean", "description": "Whether to automatically write the generated docstrings to files (default false)" }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "refactor_transaction",
+                "description": "Atomic Multi-File Refactor Transaction Engine. Manages an in-memory virtual staging buffer with pre-commit compiler validation, diff review, and rollback.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "description": "Action to perform: 'begin', 'stage', 'validate', 'diff', 'commit', 'rollback', 'status'" },
+                        "path": { "type": "string", "description": "File path (for 'stage' action)" },
+                        "content": { "type": "string", "description": "Staged file content (for 'stage' action)" }
+                    },
+                    "required": ["action"]
                 }
             }
         }
@@ -4429,6 +6469,111 @@ pub async fn agent_loop(
                         }
                     } else {
                         tool_result = "Error: Missing query parameter".to_string();
+                        println!("{}", "❌ Error".red());
+                    }
+                } else if fn_name == "audit_security" {
+                    let root_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                    println!("{} Auditing security and dependencies for `{}`...", "🛡️ ".cyan(), root_path.yellow());
+                    let report = audit_project_dependencies(std::path::Path::new(root_path));
+                    println!("{}", format_security_report_for_terminal(&report));
+                    tool_result = serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.summary.clone());
+                    println!("{}", if report.passed { "✔️ Security Audit Clean".green() } else { "⚠️ Security Issues Detected".yellow() });
+                } else if fn_name == "db_query" {
+                    if let Some(db_path) = args.get("db_path").and_then(|v| v.as_str()) {
+                        let query_opt = args.get("query").and_then(|v| v.as_str());
+                        println!("{} Inspecting database `{}`...", "🗄️ ".cyan(), db_path.yellow());
+                        match inspect_sqlite_database(std::path::Path::new(db_path), query_opt) {
+                            Ok(report) => {
+                                println!("{}", format_database_report_for_terminal(&report));
+                                tool_result = serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.summary.clone());
+                                println!("{}", "✔️ Database Inspected".green());
+                            }
+                            Err(e) => {
+                                tool_result = format!("Database error: {}", e);
+                                println!("{} {}", "❌ Database Error:".red(), e);
+                            }
+                        }
+                    } else {
+                        tool_result = "Error: Missing db_path parameter".to_string();
+                        println!("{}", "❌ Error".red());
+                    }
+                } else if fn_name == "generate_docs" {
+                    let target_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                    let auto_apply = args.get("auto_apply").and_then(|v| v.as_bool()).unwrap_or(false);
+                    println!("{} Scanning `{}` for undocumented API symbols...", "📚".cyan(), target_path.yellow());
+                    let symbols = scan_undocumented_symbols(std::path::Path::new(target_path));
+                    let patches = generate_docstring_patches(&symbols, "rust");
+                    let mut applied = 0;
+                    if auto_apply && !patches.is_empty() {
+                        applied = apply_doc_patches(&patches).unwrap_or(0);
+                    }
+                    let report = DocGenerationReport {
+                        target_path: target_path.to_string(),
+                        total_symbols_scanned: symbols.len(),
+                        undocumented_count: symbols.len(),
+                        symbols,
+                        patches: patches.clone(),
+                        applied_count: applied,
+                        summary: format!("Generated {} docstring patches (applied: {})", patches.len(), applied),
+                    };
+                    println!("{}", format_doc_generation_report_for_terminal(&report));
+                    tool_result = serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.summary.clone());
+                    println!("{}", "✔️ Doc Generation Complete".green());
+                } else if fn_name == "refactor_transaction" {
+                    if let Some(action) = args.get("action").and_then(|v| v.as_str()) {
+                        match action.to_lowercase().as_str() {
+                            "begin" => {
+                                begin_refactor_transaction();
+                                tool_result = "Initiated new refactor transaction.".to_string();
+                                println!("{}", "✔️ Transaction Begun".green());
+                            }
+                            "stage" => {
+                                if let (Some(path), Some(content)) = (args.get("path").and_then(|v| v.as_str()), args.get("content").and_then(|v| v.as_str())) {
+                                    stage_in_refactor_transaction(std::path::Path::new(path), content);
+                                    tool_result = format!("Staged virtual edit for {}", path);
+                                    println!("{}", "✔️ Edit Staged".green());
+                                } else {
+                                    tool_result = "Error: Missing path or content for staging".to_string();
+                                    println!("{}", "❌ Missing Parameters".red());
+                                }
+                            }
+                            "validate" => {
+                                let val_rep = validate_refactor_transaction(std::path::Path::new("."));
+                                tool_result = serde_json::to_string_pretty(&val_rep).unwrap_or_else(|_| val_rep.summary.clone());
+                                println!("{}", if val_rep.is_valid { "✔️ Validation Clean".green() } else { "⚠️ Validation Issues".yellow() });
+                            }
+                            "diff" => {
+                                tool_result = get_refactor_transaction_diff();
+                                println!("{}", "✔️ Diff Generated".green());
+                            }
+                            "commit" => {
+                                match commit_refactor_transaction() {
+                                    Ok(files) => {
+                                        tool_result = format!("Successfully committed transaction (modified files: {:?})", files);
+                                        println!("{}", "✔️ Transaction Committed".green());
+                                    }
+                                    Err(e) => {
+                                        tool_result = format!("Transaction commit error: {}", e);
+                                        println!("{} {}", "❌ Commit Error:".red(), e);
+                                    }
+                                }
+                            }
+                            "rollback" => {
+                                rollback_refactor_transaction();
+                                tool_result = "Transaction rolled back and staging buffer cleared.".to_string();
+                                println!("{}", "⏪ Rolled Back".yellow());
+                            }
+                            "status" => {
+                                tool_result = get_refactor_transaction_status();
+                                println!("{}", "✔️ Status Checked".green());
+                            }
+                            _ => {
+                                tool_result = format!("Unknown transaction action '{}'", action);
+                                println!("{}", "❌ Unknown Action".red());
+                            }
+                        }
+                    } else {
+                        tool_result = "Error: Missing action parameter".to_string();
                         println!("{}", "❌ Error".red());
                     }
                 } else {

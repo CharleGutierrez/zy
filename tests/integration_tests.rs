@@ -1129,5 +1129,551 @@ refactor(rag): optimize BM25 reciprocal rank fusion calculation
     assert!(fallback_pr.contains("## 🧪 Testing Checklist"));
 }
 
+// -------------------------------------------------------------------------------------------------
+// INTEGRATION TESTS: 6 NEW ESSENTIAL SYSTEMS
+// -------------------------------------------------------------------------------------------------
+
+#[test]
+fn test_tui_dashboard_layout_rendering_and_panels() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let backend = TestBackend::new(140, 45);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    let mut state = TuiAppState::default();
+    state.active_model = "llama3:70b".to_string();
+    state.agent_mode = true;
+    state.force_mode = true;
+    state.rag_mode = true;
+    state.cpu_cores = 16;
+    state.total_mem_gb = 32;
+    state.used_mem_gb = 12;
+    state.token_budget_info = "1420 / 8192 (17%)".to_string();
+    state.aituner_profile = "TURBO (8192 ctx)".to_string();
+    state.status_msg = "Agent ready".to_string();
+
+    state.messages.push(Message {
+        role: "user".to_string(),
+        content: "Refactor vector indexing to zero-copy binary format".to_string(),
+        tool_calls: None,
+        images: None,
+    });
+    state.messages.push(Message {
+        role: "assistant".to_string(),
+        content: "<think>\nAnalyzing memory layout and byte alignment\n</think>\nImplementation complete with 8-byte headers.".to_string(),
+        tool_calls: None,
+        images: None,
+    });
+
+    state.preview_file = "src/vector.rs".to_string();
+    state.preview_content = "pub struct BinaryVectorStore {\n    pub version: u32,\n}".to_string();
+    state.diff_content = "+pub struct BinaryVectorStore {\n+    pub version: u32,\n+}".to_string();
+
+    terminal.draw(|f| {
+        render_tui_layout(f, &state);
+    }).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+
+    // Assert 3 panels rendered
+    assert!(content.contains("Chat & Agent Thinking"));
+    assert!(content.contains("File Preview & Live Diff"));
+    assert!(content.contains("Hardware Stats & AiTuner Profile"));
+
+    // Assert hardware metrics & profile displayed
+    assert!(content.contains("16 Cores"));
+    assert!(content.contains("12 GB / 32 GB"));
+    assert!(content.contains("TURBO"));
+    assert!(content.contains("1420 / 8192"));
+    assert!(content.contains("llama3:70b"));
+
+    // Assert chat & think tags processed
+    assert!(content.contains("User"));
+    assert!(content.contains("Refactor vector indexing"));
+    assert!(content.contains("Analyzing memory layout"));
+    assert!(content.contains("Implementation complete"));
+
+    // Assert diff content rendered
+    assert!(content.contains("Live Unified Code Diff"));
+    assert!(content.contains("BinaryVectorStore"));
+}
+
+#[test]
+fn test_embedded_binary_vector_store_serialization_and_search() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_bin_vec_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let bin_path = temp_dir.join("vectors.bin");
+
+    // 1. Create realistic chunks with 768-dim float vectors
+    let mut chunk1_vec = vec![0.0f32; 768];
+    chunk1_vec[0] = 0.85;
+    chunk1_vec[1] = 0.45;
+    chunk1_vec[767] = -0.32;
+
+    let mut chunk2_vec = vec![0.0f32; 768];
+    chunk2_vec[0] = 0.10;
+    chunk2_vec[1] = 0.95;
+    chunk2_vec[767] = 0.12;
+
+    let chunks = vec![
+        RagChunk {
+            file: "src/memory.rs".to_string(),
+            text: "Zero-copy persistent binary vector database for fast neural embeddings.".to_string(),
+            vector: chunk1_vec.clone(),
+        },
+        RagChunk {
+            file: "src/database.rs".to_string(),
+            text: "SQLite schema introspection and safe read-only SQL execution engine.".to_string(),
+            vector: chunk2_vec.clone(),
+        },
+    ];
+
+    // 2. Save binary vector index
+    let bytes_written = save_binary_vector_index(&bin_path, &chunks).unwrap();
+    assert!(bytes_written > 32);
+    assert!(bin_path.exists());
+
+    // Verify binary magic header directly from disk bytes
+    let raw_bytes = std::fs::read(&bin_path).unwrap();
+    assert_eq!(&raw_bytes[0..8], BINARY_VECTOR_MAGIC);
+
+    // 3. Load binary vector index
+    let store = load_binary_vector_index(&bin_path).unwrap();
+    assert_eq!(store.version, 1);
+    assert_eq!(store.vector_dim, 768);
+    assert_eq!(store.len(), 2);
+    assert_eq!(store.chunks[0].file, "src/memory.rs");
+    assert_eq!(store.chunks[0].text, "Zero-copy persistent binary vector database for fast neural embeddings.");
+    assert_eq!(store.chunks[0].vector.len(), 768);
+    assert!((store.chunks[0].vector[0] - 0.85).abs() < 1e-6);
+    assert_eq!(store.chunks[1].file, "src/database.rs");
+
+    // 4. Test search operations
+    let query = "binary vector database";
+    let mut query_vec = vec![0.0f32; 768];
+    query_vec[0] = 0.90;
+    query_vec[1] = 0.40;
+
+    let search_res = store.search(query, &query_vec, 2, 60);
+    assert_eq!(search_res.len(), 2);
+    assert_eq!(search_res[0].1.file, "src/memory.rs");
+
+    let fast_res = store.fast_vector_search(&query_vec, 1);
+    assert_eq!(fast_res.len(), 1);
+    assert_eq!(fast_res[0].1.file, "src/memory.rs");
+
+    // 5. Test add_or_replace_file
+    let mut store_mut = store;
+    let mut new_vec = vec![0.0f32; 768];
+    new_vec[0] = 0.99;
+    store_mut.add_or_replace_file("src/memory.rs", vec![
+        RagChunk {
+            file: "src/memory.rs".to_string(),
+            text: "Updated memory engine chunk".to_string(),
+            vector: new_vec,
+        }
+    ]);
+    assert_eq!(store_mut.len(), 2);
+    assert_eq!(store_mut.chunks.iter().find(|c| c.file == "src/memory.rs").unwrap().text, "Updated memory engine chunk");
+
+    // 6. Test corruption handling
+    let corrupt_path = temp_dir.join("corrupt.bin");
+    std::fs::write(&corrupt_path, b"INVALID_HEADER_DATA_1234567890").unwrap();
+    assert!(load_binary_vector_index(&corrupt_path).is_err());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_dependency_and_security_auditor() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_audit_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Synthetic Cargo.lock with known vulnerable rustls and rsa
+    let cargo_lock_content = r#"
+version = 3
+
+[[package]]
+name = "rustls"
+version = "0.21.5"
+
+[[package]]
+name = "rsa"
+version = "0.8.0"
+
+[[package]]
+name = "serde"
+version = "1.0.197"
+"#;
+    std::fs::write(temp_dir.join("Cargo.lock"), cargo_lock_content).unwrap();
+
+    // 2. Synthetic Cargo.toml with wildcard and copyleft license
+    let cargo_toml_content = r#"
+[package]
+name = "sample-app"
+version = "0.1.0"
+license = "AGPL-3.0"
+
+[dependencies]
+bad-crate = "*"
+insecure-pkg = "http://insecure-server.com/repo.git"
+"#;
+    std::fs::write(temp_dir.join("Cargo.toml"), cargo_toml_content).unwrap();
+
+    // 3. Synthetic package.json with vulnerable lodash and axios
+    let pkg_json_content = r#"{
+  "name": "web-frontend",
+  "dependencies": {
+    "lodash": "4.17.15",
+    "axios": "1.5.0",
+    "left-pad": "latest"
+  }
+}"#;
+    std::fs::write(temp_dir.join("package.json"), pkg_json_content).unwrap();
+
+    // 4. Synthetic requirements.txt with vulnerable requests and unpinned package
+    let req_content = "requests==2.25.0\ndjango==4.0.0\nflask\n";
+    std::fs::write(temp_dir.join("requirements.txt"), req_content).unwrap();
+
+    // 5. Run audit
+    let report = audit_project_dependencies(&temp_dir);
+    assert!(!report.passed);
+    assert!(report.scanned_manifests.contains(&"Cargo.lock".to_string()));
+    assert!(report.scanned_manifests.contains(&"package.json".to_string()));
+    assert!(report.scanned_manifests.contains(&"requirements.txt".to_string()));
+    assert!(report.total_dependencies >= 7);
+
+    // Assert vulnerabilities detected
+    assert!(report.vulnerabilities.iter().any(|v| v.package == "rustls" && v.severity == "HIGH"));
+    assert!(report.vulnerabilities.iter().any(|v| v.package == "rsa" && v.severity == "HIGH"));
+    assert!(report.vulnerabilities.iter().any(|v| v.package == "lodash" && v.severity == "HIGH"));
+    assert!(report.vulnerabilities.iter().any(|v| v.package == "requests" && v.severity == "MEDIUM"));
+    assert!(report.vulnerabilities.iter().any(|v| v.package == "django" && v.severity == "HIGH"));
+    assert!(report.vulnerabilities.iter().any(|v| v.package == "insecure-pkg" && v.title.contains("Insecure Plaintext Transport")));
+
+    // Assert license risk detected
+    assert!(report.license_risks.iter().any(|l| l.license == "AGPL-3.0" && l.risk_level == "HIGH"));
+
+    // Assert wildcard and unpinned dependencies detected
+    assert!(report.outdated_or_wildcards.iter().any(|o| o.package == "bad-crate" && o.current_requirement == "*"));
+    assert!(report.outdated_or_wildcards.iter().any(|o| o.package == "left-pad" && o.current_requirement == "latest"));
+    assert!(report.outdated_or_wildcards.iter().any(|o| o.package == "flask" && o.current_requirement == "unpinned"));
+
+    // 6. Test terminal report formatting
+    let terminal_out = format_security_report_for_terminal(&report);
+    assert!(terminal_out.contains("SECURITY & DEPENDENCY AUDIT"));
+    assert!(terminal_out.contains("CVE-2024-32650"));
+    assert!(terminal_out.contains("CVE-2021-23337"));
+    assert!(terminal_out.contains("LICENSE RISK"));
+
+    // 7. Verify audit_security tool exists in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("audit_security"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_sqlite_database_and_sql_inspector() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_db_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let db_path = temp_dir.join("test_app.sqlite");
+
+    // 1. Create and populate SQLite database
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(r#"
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                email TEXT,
+                balance REAL DEFAULT 0.0
+            );
+            CREATE TABLE orders (
+                order_id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                total REAL NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE VIEW active_users AS SELECT id, username, email FROM users WHERE balance > 0.0;
+
+            INSERT INTO users (username, email, balance) VALUES ('alice', 'alice@zy.ai', 150.50);
+            INSERT INTO users (username, email, balance) VALUES ('bob', 'bob@zy.ai', 0.0);
+            INSERT INTO users (username, email, balance) VALUES ('charlie', 'charlie@zy.ai', 99.99);
+
+            INSERT INTO orders (user_id, total, status) VALUES (1, 45.0, 'completed');
+            INSERT INTO orders (user_id, total, status) VALUES (3, 89.99, 'pending');
+        "#).unwrap();
+    }
+
+    // 2. Test schema inspection without query
+    let schema_report = inspect_sqlite_database(&db_path, None).unwrap();
+    assert!(schema_report.success);
+    assert_eq!(schema_report.tables.len(), 3); // users, orders, active_users
+
+    let users_table = schema_report.tables.iter().find(|t| t.table_name == "users").unwrap();
+    assert_eq!(users_table.item_type, "table");
+    assert_eq!(users_table.row_count, 3);
+    assert_eq!(users_table.columns.len(), 4);
+    assert!(users_table.columns.iter().any(|c| c.name == "username" && c.notnull));
+    assert!(users_table.columns.iter().any(|c| c.name == "id" && c.pk));
+
+    // 3. Test safe read-only SQL query execution
+    let query_sql = "SELECT username, email, balance FROM users WHERE balance > 10.0 ORDER BY balance DESC";
+    let query_report = inspect_sqlite_database(&db_path, Some(query_sql)).unwrap();
+    assert!(query_report.success);
+    assert!(query_report.query_result.is_some());
+
+    let q_res = query_report.query_result.as_ref().unwrap();
+    assert_eq!(q_res.columns, vec!["username", "email", "balance"]);
+    assert_eq!(q_res.row_count, 2);
+    assert_eq!(q_res.rows[0][0], "alice");
+    assert_eq!(q_res.rows[1][0], "charlie");
+
+    // 4. Test safe queries: EXPLAIN, PRAGMA, WITH
+    assert!(is_safe_read_only_query("EXPLAIN SELECT 1").is_ok());
+    assert!(is_safe_read_only_query("PRAGMA table_info('users')").is_ok());
+    assert!(is_safe_read_only_query("WITH top_users AS (SELECT * FROM users) SELECT * FROM top_users").is_ok());
+
+    // 5. Test security rejection of destructive mutation queries
+    assert!(is_safe_read_only_query("DROP TABLE users").is_err());
+    assert!(is_safe_read_only_query("DELETE FROM users WHERE 1=1").is_err());
+    assert!(is_safe_read_only_query("INSERT INTO users (username) VALUES ('hacker')").is_err());
+    assert!(is_safe_read_only_query("UPDATE users SET balance = 100000").is_err());
+    assert!(is_safe_read_only_query("ALTER TABLE users ADD COLUMN password TEXT").is_err());
+    assert!(is_safe_read_only_query("SELECT * FROM users; DROP TABLE users;").is_err());
+
+    // 6. Test terminal output formatting with ASCII table grid
+    let terminal_out = format_database_report_for_terminal(&query_report);
+    assert!(terminal_out.contains("SQLITE DATABASE INSPECTOR"));
+    assert!(terminal_out.contains("users"));
+    assert!(terminal_out.contains("orders"));
+    assert!(terminal_out.contains("┌"));
+    assert!(terminal_out.contains("alice"));
+    assert!(terminal_out.contains("charlie"));
+
+    // 7. Verify db_query tool exists in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("db_query"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_docstring_and_api_documentation_generator() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_docs_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Rust file with undocumented symbols
+    let rs_path = temp_dir.join("sample_service.rs");
+    let rs_content = r#"
+pub fn calculate_hash(data: &[u8]) -> u64 {
+    42
+}
+
+pub struct ServiceConfig {
+    pub port: u16,
+}
+
+/// Already documented function
+pub fn documented_helper() -> bool {
+    true
+}
+"#;
+    std::fs::write(&rs_path, rs_content).unwrap();
+
+    // 2. Python file with undocumented symbols
+    let py_path = temp_dir.join("worker.py");
+    let py_content = r#"
+def process_data(records):
+    return len(records)
+
+class TaskManager:
+    pass
+
+def already_documented():
+    """This function is documented."""
+    pass
+"#;
+    std::fs::write(&py_path, py_content).unwrap();
+
+    // 3. TypeScript file with undocumented symbols
+    let ts_path = temp_dir.join("api.ts");
+    let ts_content = r#"
+export function sendRequest(url: string) {
+    return fetch(url);
+}
+
+export interface ClientOptions {
+    timeout: number;
+}
+
+/**
+ * Documented API client
+ */
+export class ApiClient {}
+"#;
+    std::fs::write(&ts_path, ts_content).unwrap();
+
+    // 4. Scan undocumented symbols
+    let symbols = scan_undocumented_symbols(&temp_dir);
+    assert_eq!(symbols.len(), 6); // 2 in rs, 2 in py, 2 in ts
+
+    assert!(symbols.iter().any(|s| s.name == "calculate_hash" && s.language == "rust"));
+    assert!(symbols.iter().any(|s| s.name == "ServiceConfig" && s.language == "rust"));
+    assert!(symbols.iter().any(|s| s.name == "process_data" && s.language == "python"));
+    assert!(symbols.iter().any(|s| s.name == "TaskManager" && s.language == "python"));
+    assert!(symbols.iter().any(|s| s.name == "sendRequest" && s.language == "typescript"));
+    assert!(symbols.iter().any(|s| s.name == "ClientOptions" && s.language == "typescript"));
+
+    // Ensure already documented functions are NOT flagged
+    assert!(!symbols.iter().any(|s| s.name == "documented_helper"));
+    assert!(!symbols.iter().any(|s| s.name == "already_documented"));
+    assert!(!symbols.iter().any(|s| s.name == "ApiClient"));
+
+    // 5. Generate docstring patches
+    let patches = generate_docstring_patches(&symbols, "rust");
+    assert_eq!(patches.len(), 6);
+
+    let rs_patch = patches.iter().find(|p| p.symbol_name == "calculate_hash").unwrap();
+    assert!(rs_patch.docstring.starts_with("///"));
+    assert!(rs_patch.patch_diff.contains("Unified Diff"));
+
+    let py_patch = patches.iter().find(|p| p.symbol_name == "process_data").unwrap();
+    assert!(py_patch.docstring.contains("\"\"\""));
+
+    let ts_patch = patches.iter().find(|p| p.symbol_name == "sendRequest").unwrap();
+    assert!(ts_patch.docstring.contains("/**"));
+
+    // 6. Apply patches to files
+    let applied_count = apply_doc_patches(&patches).unwrap();
+    assert_eq!(applied_count, 3); // 3 files modified
+
+    // Verify files on disk have received docstrings
+    let updated_rs = std::fs::read_to_string(&rs_path).unwrap();
+    assert!(updated_rs.contains("/// calculate_hash"));
+    assert!(updated_rs.contains("/// ServiceConfig"));
+
+    let updated_py = std::fs::read_to_string(&py_path).unwrap();
+    assert!(updated_py.contains("\"\"\""));
+
+    let updated_ts = std::fs::read_to_string(&ts_path).unwrap();
+    assert!(updated_ts.contains("/**"));
+
+    // 7. Verify re-scan reports 0 undocumented symbols
+    let rescan = scan_undocumented_symbols(&temp_dir);
+    assert_eq!(rescan.len(), 0);
+
+    // 8. Test report formatting
+    let report = DocGenerationReport {
+        target_path: temp_dir.to_string_lossy().to_string(),
+        total_symbols_scanned: 6,
+        undocumented_count: 6,
+        symbols,
+        patches,
+        applied_count,
+        summary: "6 docstrings applied".to_string(),
+    };
+    let formatted_rep = format_doc_generation_report_for_terminal(&report);
+    assert!(formatted_rep.contains("DOCSTRING & API GENERATOR"));
+    assert!(formatted_rep.contains("calculate_hash"));
+
+    // 9. Verify generate_docs tool exists in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("generate_docs"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_atomic_multi_file_refactor_transactions() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_tx_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let src_dir = temp_dir.join("src");
+    let _ = std::fs::create_dir_all(&src_dir);
+
+    let file_a = src_dir.join("math.rs");
+    let file_b = src_dir.join("formatter.rs");
+    let file_to_delete = src_dir.join("deprecated.rs");
+
+    std::fs::write(&file_a, "pub fn add(a: i32, b: i32) -> i32 { a + b }\n").unwrap();
+    std::fs::write(&file_b, "pub fn format_val(v: i32) -> String { format!(\"{}\", v) }\n").unwrap();
+    std::fs::write(&file_to_delete, "pub fn old_code() {}\n").unwrap();
+
+    // 1. Initialize transaction
+    let mut tx = RefactorTransaction::new();
+    assert!(tx.id.starts_with("tx_"));
+    assert!(tx.staged_files.is_empty());
+
+    // 2. Stage edits in-memory (virtual buffer)
+    let new_math_code = "pub fn add(a: i32, b: i32) -> i32 {\n    // Vectorized addition\n    a + b\n}\npub fn mul(a: i32, b: i32) -> i32 { a * b }\n";
+    let new_fmt_code = "pub fn format_val(v: i32) -> String {\n    format!(\"Value: {}\", v)\n}\n";
+
+    tx.stage_edit(&file_a, new_math_code);
+    tx.stage_edit(&file_b, new_fmt_code);
+    tx.stage_delete(&file_to_delete);
+
+    assert_eq!(tx.staged_files.len(), 3);
+
+    // Assert disk files are UNMODIFIED before commit
+    assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "pub fn add(a: i32, b: i32) -> i32 { a + b }\n");
+    assert!(file_to_delete.exists());
+
+    // 3. Render unified diff
+    let diff_view = tx.render_diff();
+    assert!(diff_view.contains("math.rs"));
+    assert!(diff_view.contains("formatter.rs"));
+    assert!(diff_view.contains("deprecated.rs"));
+
+    // 4. Validate all staged changes (syntax & compiler checks)
+    let val_report_ok = tx.validate_all_staged(&temp_dir);
+    assert!(val_report_ok.is_valid);
+    assert_eq!(val_report_ok.staged_files_count, 3);
+
+    // Test syntax error detection during validation
+    let mut bad_tx = RefactorTransaction::new();
+    bad_tx.stage_edit(&file_a, "pub fn broken() { let x = 10; "); // Mismatched braces
+    let val_report_err = bad_tx.validate_all_staged(&temp_dir);
+    assert!(!val_report_err.is_valid);
+    assert!(val_report_err.errors.iter().any(|e| e.contains("Mismatched curly braces")));
+
+    // 5. Commit transaction atomically
+    let committed = tx.commit().unwrap();
+    assert_eq!(committed.len(), 3);
+    assert!(tx.staged_files.is_empty());
+
+    // Verify disk files are now updated
+    assert_eq!(std::fs::read_to_string(&file_a).unwrap(), new_math_code);
+    assert_eq!(std::fs::read_to_string(&file_b).unwrap(), new_fmt_code);
+    assert!(!file_to_delete.exists());
+
+    // 6. Test rollback
+    let mut rollback_tx = RefactorTransaction::new();
+    rollback_tx.stage_edit(&file_a, "COMPLETELY BAD EDIT THAT SHOULD NOT BE WRITTEN");
+    assert_eq!(rollback_tx.staged_files.len(), 1);
+    rollback_tx.rollback();
+    assert!(rollback_tx.staged_files.is_empty());
+    assert_eq!(std::fs::read_to_string(&file_a).unwrap(), new_math_code);
+
+    // 7. Test global transaction management functions
+    begin_refactor_transaction();
+    stage_in_refactor_transaction(&file_a, "global staged test");
+    assert!(get_refactor_transaction_diff().contains("global staged test"));
+    assert!(get_refactor_transaction_status().contains("Staged files: 1"));
+    rollback_refactor_transaction();
+    assert!(get_refactor_transaction_status().contains("None active"));
+
+    // 8. Verify refactor_transaction tool exists in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("refactor_transaction"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 
 

@@ -27,3 +27,6 @@ sysinfo = "0.39.6"
 notify = "8.2.0"
 base64 = "0.23.1"
 similar = "2.4.0"
+ratatui = "0.26.3"
+crossterm = "0.27.0"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
