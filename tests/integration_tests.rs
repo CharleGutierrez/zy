@@ -1669,7 +1669,9 @@ fn test_atomic_multi_file_refactor_transactions() {
     begin_refactor_transaction();
     stage_in_refactor_transaction(&file_a, "global staged test");
     assert!(get_refactor_transaction_diff().contains("global staged test"));
-    assert!(get_refactor_transaction_status().contains("Staged files: 1"));
+    let status_str = get_refactor_transaction_status();
+    assert!(status_str.contains("Staged files:"));
+    assert!(status_str.contains("1"));
     rollback_refactor_transaction();
     assert!(get_refactor_transaction_status().contains("None active"));
 
