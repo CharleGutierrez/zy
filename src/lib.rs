@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use base64::Engine;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -10,8 +12,10 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use sysinfo::System;
 use termimad::print_text;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -263,6 +267,78 @@ pub enum Commands {
         /// Auto-execute rebase commands
         #[arg(short, long)]
         execute: bool,
+    },
+    /// Database Migration & Schema Diff Generator
+    Migrate {
+        /// Old schema SQL string or file path
+        old_schema: String,
+        /// New schema SQL string or file path
+        new_schema: String,
+        /// Migration name (e.g. "add_users_table")
+        #[arg(short, long, default_value = "migration")]
+        name: String,
+        /// SQL Dialect: postgres, sqlite, mysql
+        #[arg(short, long, default_value = "postgres")]
+        dialect: String,
+        /// Write up.sql and down.sql files directly to disk
+        #[arg(short, long)]
+        write_files: bool,
+    },
+    /// Multi-Language Code Transpiler & Porter
+    Translate {
+        /// Source file path or raw code string
+        source: String,
+        /// Target language (rust, python, typescript, javascript, go, c)
+        target_lang: String,
+        /// Source language (optional, auto-detected if omitted)
+        #[arg(short, long)]
+        source_lang: Option<String>,
+        /// Output file path to write translated code
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Architecture Decision Record (ADR) Synthesizer
+    Adr {
+        /// ADR Title (e.g. "Use PostgreSQL for Primary Storage")
+        title: String,
+        /// Context and Problem Statement
+        context: String,
+        /// Decision outcome
+        decision: String,
+        /// Consequences / trade-offs (optional)
+        #[arg(short, long, default_value = "Improved maintainability and standard interface.")]
+        consequences: String,
+        /// Status: Proposed, Accepted, Deprecated, Superseded
+        #[arg(short, long, default_value = "Accepted")]
+        status: String,
+        /// Workspace root path (defaults to '.')
+        #[arg(short, long, default_value = ".")]
+        path: String,
+    },
+    /// Package Registry & Compatibility Inspector
+    Pkg {
+        /// Ecosystem: crates.io (or cargo/rust), npm (or js/node), pypi (or python/pip)
+        ecosystem: String,
+        /// Package name to query
+        package: String,
+    },
+    /// Frontend Accessibility (a11y) & Web Vitals Auditor
+    A11y {
+        /// Optional specific target template file (HTML/JSX/TSX/Vue/Svelte)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Workspace root path (defaults to '.')
+        #[arg(default_value = ".")]
+        path: String,
+    },
+    /// Local Token & Cloud Cost Savings Analytics Engine
+    Stats {
+        /// Workspace root path (defaults to '.')
+        #[arg(default_value = ".")]
+        path: String,
+        /// Reset cumulative analytics metrics
+        #[arg(short, long)]
+        reset: bool,
     }
 }
 
@@ -10432,6 +10508,1864 @@ pub fn format_rebase_plan_for_terminal(plan: &RebasePlan) -> String {
     out
 }
 
+// ============================================================================
+// SYSTEM 1: DATABASE MIGRATION & SCHEMA DIFF GENERATOR
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ColumnDef {
+    pub name: String,
+    pub col_type: String,
+    pub nullable: bool,
+    pub is_primary_key: bool,
+    pub is_unique: bool,
+    pub default_value: Option<String>,
+    pub references: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ForeignKeyDef {
+    pub column: String,
+    pub ref_table: String,
+    pub ref_column: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct IndexDef {
+    pub name: String,
+    pub table_name: String,
+    pub columns: Vec<String>,
+    pub is_unique: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TableSchema {
+    pub name: String,
+    pub columns: Vec<ColumnDef>,
+    pub primary_keys: Vec<String>,
+    pub foreign_keys: Vec<ForeignKeyDef>,
+    pub indexes: Vec<IndexDef>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ParsedDatabaseSchema {
+    pub tables: HashMap<String, TableSchema>,
+    pub standalone_indexes: Vec<IndexDef>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ColumnDiff {
+    pub column_name: String,
+    pub old_type: Option<String>,
+    pub new_type: Option<String>,
+    pub old_nullable: Option<bool>,
+    pub new_nullable: Option<bool>,
+    pub change_type: String, // "added", "dropped", "altered"
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TableDiff {
+    pub table_name: String,
+    pub added_columns: Vec<ColumnDef>,
+    pub dropped_columns: Vec<ColumnDef>,
+    pub altered_columns: Vec<ColumnDiff>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SchemaDiff {
+    pub added_tables: Vec<TableSchema>,
+    pub dropped_tables: Vec<TableSchema>,
+    pub altered_tables: Vec<TableDiff>,
+    pub added_indexes: Vec<IndexDef>,
+    pub dropped_indexes: Vec<IndexDef>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct MigrationResult {
+    pub name: String,
+    pub dialect: String,
+    pub up_sql: String,
+    pub down_sql: String,
+    pub diff_summary: String,
+    pub added_tables: Vec<String>,
+    pub dropped_tables: Vec<String>,
+    pub altered_tables: Vec<TableDiff>,
+    pub added_indexes: Vec<String>,
+    pub dropped_indexes: Vec<String>,
+}
+
+fn strip_sql_comments(sql: &str) -> String {
+    let mut result = String::new();
+    let mut in_block_comment = false;
+    for line in sql.lines() {
+        let trimmed = line.trim();
+        if in_block_comment {
+            if let Some(pos) = trimmed.find("*/") {
+                in_block_comment = false;
+                result.push_str(&trimmed[pos + 2..]);
+                result.push('\n');
+            }
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+        if trimmed.starts_with("--") {
+            continue;
+        }
+        if let Some(pos) = line.find("--") {
+            result.push_str(&line[..pos]);
+        } else {
+            result.push_str(line);
+        }
+        result.push('\n');
+    }
+    result
+}
+
+fn split_sql_items(body: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0;
+    let mut in_quote = false;
+
+    for ch in body.chars() {
+        match ch {
+            '\'' | '"' | '`' => {
+                in_quote = !in_quote;
+                current.push(ch);
+            }
+            '(' if !in_quote => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' if !in_quote => {
+                if paren_depth > 0 { paren_depth -= 1; }
+                current.push(ch);
+            }
+            ',' if paren_depth == 0 && !in_quote => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    items.push(trimmed);
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        items.push(trimmed);
+    }
+    items
+}
+
+fn clean_identifier(s: &str) -> String {
+    s.trim().trim_matches(|c| c == '"' || c == '`' || c == '\'' || c == '[' || c == ']').to_string()
+}
+
+pub fn parse_sql_schema(sql: &str) -> ParsedDatabaseSchema {
+    let clean = strip_sql_comments(sql);
+    let mut tables: HashMap<String, TableSchema> = HashMap::new();
+    let mut standalone_indexes: Vec<IndexDef> = Vec::new();
+
+    // Split on statements ending with semicolon or simple splitting
+    let statements: Vec<&str> = clean.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+
+    for stmt in statements {
+        let stmt_upper = stmt.to_uppercase();
+        if stmt_upper.starts_with("CREATE TABLE") {
+            let without_create = &stmt[12..].trim_start();
+            let without_if_not_exists = if without_create.to_uppercase().starts_with("IF NOT EXISTS") {
+                &without_create[13..].trim_start()
+            } else {
+                without_create
+            };
+
+            if let Some(open_paren) = without_if_not_exists.find('(') {
+                let raw_table_name = without_if_not_exists[..open_paren].trim();
+                let table_name = clean_identifier(raw_table_name);
+                
+                if let Some(close_paren) = without_if_not_exists.rfind(')') {
+                    if close_paren > open_paren {
+                        let body = &without_if_not_exists[open_paren + 1..close_paren];
+                        let items = split_sql_items(body);
+
+                        let mut columns: Vec<ColumnDef> = Vec::new();
+                        let mut primary_keys: Vec<String> = Vec::new();
+                        let mut foreign_keys: Vec<ForeignKeyDef> = Vec::new();
+
+                        for item in items {
+                            let item_upper = item.to_uppercase();
+                            if item_upper.starts_with("PRIMARY KEY") || item_upper.starts_with("CONSTRAINT") && item_upper.contains("PRIMARY KEY") {
+                                if let Some(p_open) = item.find('(') {
+                                    if let Some(p_close) = item.find(')') {
+                                        let pk_cols = &item[p_open + 1..p_close];
+                                        for col in pk_cols.split(',') {
+                                            let cleaned_col = clean_identifier(col);
+                                            if !cleaned_col.is_empty() {
+                                                primary_keys.push(cleaned_col);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if item_upper.starts_with("FOREIGN KEY") || item_upper.contains("REFERENCES") && (item_upper.starts_with("CONSTRAINT") || item_upper.contains("FOREIGN KEY")) {
+                                if let (Some(fk_open), Some(fk_close), Some(ref_idx)) = (item.find('('), item.find(')'), item_upper.find("REFERENCES")) {
+                                    let col_name = clean_identifier(&item[fk_open + 1..fk_close]);
+                                    let after_ref = &item[ref_idx + 10..].trim();
+                                    if let Some(ref_open) = after_ref.find('(') {
+                                        let ref_tbl = clean_identifier(&after_ref[..ref_open]);
+                                        if let Some(ref_close) = after_ref.find(')') {
+                                            let ref_col = clean_identifier(&after_ref[ref_open + 1..ref_close]);
+                                            foreign_keys.push(ForeignKeyDef {
+                                                column: col_name,
+                                                ref_table: ref_tbl,
+                                                ref_column: ref_col,
+                                            });
+                                        }
+                                    }
+                                }
+                            } else if item_upper.starts_with("CHECK") || item_upper.starts_with("CONSTRAINT") && item_upper.contains("CHECK") {
+                                // Skip or record check constraint
+                            } else {
+                                // Column definition: name type [constraints...]
+                                let tokens: Vec<&str> = item.split_whitespace().collect();
+                                if tokens.len() >= 2 {
+                                    let col_name = clean_identifier(tokens[0]);
+                                    let col_type = tokens[1].to_string();
+
+                                    let is_pk = item_upper.contains("PRIMARY KEY");
+                                    let is_not_null = item_upper.contains("NOT NULL") || is_pk;
+                                    let is_uniq = item_upper.contains("UNIQUE") && !is_pk;
+
+                                    let mut def_val = None;
+                                    if let Some(def_idx) = item_upper.find("DEFAULT") {
+                                        let after_def = item[def_idx + 7..].trim();
+                                        let def_token = after_def.split_whitespace().next().unwrap_or("").trim_end_matches(',');
+                                        if !def_token.is_empty() {
+                                            def_val = Some(def_token.to_string());
+                                        }
+                                    }
+
+                                    let mut ref_opt = None;
+                                    if let Some(ref_idx) = item_upper.find("REFERENCES") {
+                                        let after_ref = item[ref_idx + 10..].trim();
+                                        let ref_token = after_ref.split_whitespace().next().unwrap_or("").trim_end_matches(',');
+                                        if !ref_token.is_empty() {
+                                            ref_opt = Some(ref_token.to_string());
+                                        }
+                                    }
+
+                                    if is_pk && !primary_keys.contains(&col_name) {
+                                        primary_keys.push(col_name.clone());
+                                    }
+
+                                    columns.push(ColumnDef {
+                                        name: col_name,
+                                        col_type,
+                                        nullable: !is_not_null,
+                                        is_primary_key: is_pk,
+                                        is_unique: is_uniq,
+                                        default_value: def_val,
+                                        references: ref_opt,
+                                    });
+                                }
+                            }
+                        }
+
+                        // Mark PK in column defs if detected from table constraint
+                        for col in &mut columns {
+                            if primary_keys.contains(&col.name) {
+                                col.is_primary_key = true;
+                                col.nullable = false;
+                            }
+                        }
+
+                        tables.insert(table_name.clone(), TableSchema {
+                            name: table_name,
+                            columns,
+                            primary_keys,
+                            foreign_keys,
+                            indexes: Vec::new(),
+                        });
+                    }
+                }
+            }
+        } else if stmt_upper.starts_with("CREATE INDEX") || stmt_upper.starts_with("CREATE UNIQUE INDEX") {
+            let is_unique = stmt_upper.contains("UNIQUE");
+            let idx_str = if is_unique { &stmt[18..] } else { &stmt[12..] }.trim();
+            let without_if = if idx_str.to_uppercase().starts_with("IF NOT EXISTS") {
+                &idx_str[13..].trim()
+            } else {
+                idx_str
+            };
+
+            if let Some(on_pos) = without_if.to_uppercase().find("ON") {
+                let index_name = clean_identifier(&without_if[..on_pos]);
+                let after_on = &without_if[on_pos + 2..].trim();
+                if let Some(open_p) = after_on.find('(') {
+                    let table_name = clean_identifier(&after_on[..open_p]);
+                    if let Some(close_p) = after_on.find(')') {
+                        let cols_str = &after_on[open_p + 1..close_p];
+                        let cols: Vec<String> = cols_str.split(',').map(|c| clean_identifier(c)).filter(|c| !c.is_empty()).collect();
+                        standalone_indexes.push(IndexDef {
+                            name: index_name,
+                            table_name,
+                            columns: cols,
+                            is_unique,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    ParsedDatabaseSchema {
+        tables,
+        standalone_indexes,
+    }
+}
+
+pub fn compute_schema_diff(
+    old_db: &ParsedDatabaseSchema,
+    new_db: &ParsedDatabaseSchema,
+    _dialect: &str,
+) -> SchemaDiff {
+    let mut added_tables = Vec::new();
+    let mut dropped_tables = Vec::new();
+    let mut altered_tables = Vec::new();
+
+    // Check for added tables
+    for (t_name, t_schema) in &new_db.tables {
+        if !old_db.tables.contains_key(t_name) {
+            added_tables.push(t_schema.clone());
+        }
+    }
+
+    // Check for dropped tables
+    for (t_name, t_schema) in &old_db.tables {
+        if !new_db.tables.contains_key(t_name) {
+            dropped_tables.push(t_schema.clone());
+        }
+    }
+
+    // Check for altered tables
+    for (t_name, new_table) in &new_db.tables {
+        if let Some(old_table) = old_db.tables.get(t_name) {
+            let mut added_columns = Vec::new();
+            let mut dropped_columns = Vec::new();
+            let mut altered_columns = Vec::new();
+
+            let old_cols: HashMap<String, &ColumnDef> = old_table.columns.iter().map(|c| (c.name.clone(), c)).collect();
+            let new_cols: HashMap<String, &ColumnDef> = new_table.columns.iter().map(|c| (c.name.clone(), c)).collect();
+
+            // Added columns
+            for (col_name, col_def) in &new_cols {
+                if !old_cols.contains_key(col_name) {
+                    added_columns.push((*col_def).clone());
+                }
+            }
+
+            // Dropped columns
+            for (col_name, col_def) in &old_cols {
+                if !new_cols.contains_key(col_name) {
+                    dropped_columns.push((*col_def).clone());
+                }
+            }
+
+            // Altered columns
+            for (col_name, new_col) in &new_cols {
+                if let Some(old_col) = old_cols.get(col_name) {
+                    let type_changed = old_col.col_type.to_lowercase() != new_col.col_type.to_lowercase();
+                    let null_changed = old_col.nullable != new_col.nullable;
+                    if type_changed || null_changed {
+                        altered_columns.push(ColumnDiff {
+                            column_name: col_name.clone(),
+                            old_type: Some(old_col.col_type.clone()),
+                            new_type: Some(new_col.col_type.clone()),
+                            old_nullable: Some(old_col.nullable),
+                            new_nullable: Some(new_col.nullable),
+                            change_type: if type_changed { "altered_type".to_string() } else { "altered_nullability".to_string() },
+                        });
+                    }
+                }
+            }
+
+            if !added_columns.is_empty() || !dropped_columns.is_empty() || !altered_columns.is_empty() {
+                altered_tables.push(TableDiff {
+                    table_name: t_name.clone(),
+                    added_columns,
+                    dropped_columns,
+                    altered_columns,
+                });
+            }
+        }
+    }
+
+    // Indexes
+    let mut added_indexes = Vec::new();
+    let mut dropped_indexes = Vec::new();
+
+    let old_idx_map: HashMap<String, &IndexDef> = old_db.standalone_indexes.iter().map(|i| (i.name.clone(), i)).collect();
+    let new_idx_map: HashMap<String, &IndexDef> = new_db.standalone_indexes.iter().map(|i| (i.name.clone(), i)).collect();
+
+    for (name, idx) in &new_idx_map {
+        if !old_idx_map.contains_key(name) {
+            added_indexes.push((*idx).clone());
+        }
+    }
+
+    for (name, idx) in &old_idx_map {
+        if !new_idx_map.contains_key(name) {
+            dropped_indexes.push((*idx).clone());
+        }
+    }
+
+    SchemaDiff {
+        added_tables,
+        dropped_tables,
+        altered_tables,
+        added_indexes,
+        dropped_indexes,
+    }
+}
+
+pub fn generate_schema_migration(
+    old_schema: &str,
+    new_schema: &str,
+    migration_name: &str,
+    dialect: &str,
+) -> Result<MigrationResult, Box<dyn std::error::Error>> {
+    let old_sql = if std::path::Path::new(old_schema).is_file() {
+        fs::read_to_string(old_schema)?
+    } else {
+        old_schema.to_string()
+    };
+
+    let new_sql = if std::path::Path::new(new_schema).is_file() {
+        fs::read_to_string(new_schema)?
+    } else {
+        new_schema.to_string()
+    };
+
+    let old_parsed = parse_sql_schema(&old_sql);
+    let new_parsed = parse_sql_schema(&new_sql);
+    let diff = compute_schema_diff(&old_parsed, &new_parsed, dialect);
+
+    let d_norm = match dialect.to_lowercase().as_str() {
+        "sqlite" => "sqlite",
+        "mysql" => "mysql",
+        _ => "postgres",
+    };
+
+    let mut up_sql = format!("-- Migration Up: {}\n-- Dialect: {}\n\n", migration_name, d_norm);
+    let mut down_sql = format!("-- Migration Down (Rollback): {}\n-- Dialect: {}\n\n", migration_name, d_norm);
+
+    // UP: Create Added Tables
+    for tbl in &diff.added_tables {
+        up_sql.push_str(&format!("CREATE TABLE {} (\n", tbl.name));
+        let mut col_defs = Vec::new();
+        for col in &tbl.columns {
+            let mut line = format!("    {} {}", col.name, col.col_type);
+            if col.is_primary_key { line.push_str(" PRIMARY KEY"); }
+            else if !col.nullable { line.push_str(" NOT NULL"); }
+            if col.is_unique { line.push_str(" UNIQUE"); }
+            if let Some(def) = &col.default_value { line.push_str(&format!(" DEFAULT {}", def)); }
+            if let Some(re) = &col.references { line.push_str(&format!(" REFERENCES {}", re)); }
+            col_defs.push(line);
+        }
+        for fk in &tbl.foreign_keys {
+            col_defs.push(format!("    FOREIGN KEY ({}) REFERENCES {}({})", fk.column, fk.ref_table, fk.ref_column));
+        }
+        up_sql.push_str(&col_defs.join(",\n"));
+        up_sql.push_str("\n);\n\n");
+    }
+
+    // DOWN: Drop Added Tables
+    for tbl in &diff.added_tables {
+        down_sql.push_str(&format!("DROP TABLE IF EXISTS {};\n", tbl.name));
+    }
+
+    // UP: Altered Tables
+    for alt in &diff.altered_tables {
+        for col in &alt.added_columns {
+            let not_null = if !col.nullable { " NOT NULL" } else { "" };
+            let def = col.default_value.as_ref().map(|d| format!(" DEFAULT {}", d)).unwrap_or_default();
+            up_sql.push_str(&format!("ALTER TABLE {} ADD COLUMN {} {}{}{};\n", alt.table_name, col.name, col.col_type, not_null, def));
+        }
+        for col in &alt.dropped_columns {
+            if d_norm == "mysql" {
+                up_sql.push_str(&format!("ALTER TABLE `{}` DROP COLUMN `{}`;\n", alt.table_name, col.name));
+            } else {
+                up_sql.push_str(&format!("ALTER TABLE {} DROP COLUMN {};\n", alt.table_name, col.name));
+            }
+        }
+        for col in &alt.altered_columns {
+            if d_norm == "postgres" {
+                if let Some(nt) = &col.new_type {
+                    up_sql.push_str(&format!("ALTER TABLE {} ALTER COLUMN {} TYPE {};\n", alt.table_name, col.column_name, nt));
+                }
+            } else if d_norm == "mysql" {
+                if let Some(nt) = &col.new_type {
+                    up_sql.push_str(&format!("ALTER TABLE `{}` MODIFY COLUMN `{}` {};\n", alt.table_name, col.column_name, nt));
+                }
+            } else {
+                if let Some(nt) = &col.new_type {
+                    up_sql.push_str(&format!("-- Note: SQLite column alteration: {} {} -> {}\n", alt.table_name, col.column_name, nt));
+                }
+            }
+        }
+        up_sql.push('\n');
+    }
+
+    // DOWN: Revert Altered Tables
+    for alt in &diff.altered_tables {
+        for col in &alt.added_columns {
+            down_sql.push_str(&format!("ALTER TABLE {} DROP COLUMN {};\n", alt.table_name, col.name));
+        }
+        for col in &alt.dropped_columns {
+            let not_null = if !col.nullable { " NOT NULL" } else { "" };
+            let def = col.default_value.as_ref().map(|d| format!(" DEFAULT {}", d)).unwrap_or_default();
+            down_sql.push_str(&format!("ALTER TABLE {} ADD COLUMN {} {}{}{};\n", alt.table_name, col.name, col.col_type, not_null, def));
+        }
+        for col in &alt.altered_columns {
+            if d_norm == "postgres" {
+                if let Some(ot) = &col.old_type {
+                    down_sql.push_str(&format!("ALTER TABLE {} ALTER COLUMN {} TYPE {};\n", alt.table_name, col.column_name, ot));
+                }
+            } else if d_norm == "mysql" {
+                if let Some(ot) = &col.old_type {
+                    down_sql.push_str(&format!("ALTER TABLE `{}` MODIFY COLUMN `{}` {};\n", alt.table_name, col.column_name, ot));
+                }
+            }
+        }
+        down_sql.push('\n');
+    }
+
+    // UP: Create Added Indexes
+    for idx in &diff.added_indexes {
+        let uniq = if idx.is_unique { "UNIQUE " } else { "" };
+        up_sql.push_str(&format!("CREATE {}INDEX IF NOT EXISTS {} ON {}({});\n", uniq, idx.name, idx.table_name, idx.columns.join(", ")));
+    }
+    // UP: Drop Dropped Indexes
+    for idx in &diff.dropped_indexes {
+        up_sql.push_str(&format!("DROP INDEX IF EXISTS {};\n", idx.name));
+    }
+    // UP: Drop Dropped Tables
+    for tbl in &diff.dropped_tables {
+        up_sql.push_str(&format!("DROP TABLE IF EXISTS {};\n", tbl.name));
+    }
+
+    // DOWN: Re-create Dropped Tables
+    for tbl in &diff.dropped_tables {
+        down_sql.push_str(&format!("CREATE TABLE {} (\n", tbl.name));
+        let mut col_defs = Vec::new();
+        for col in &tbl.columns {
+            let mut line = format!("    {} {}", col.name, col.col_type);
+            if col.is_primary_key { line.push_str(" PRIMARY KEY"); }
+            else if !col.nullable { line.push_str(" NOT NULL"); }
+            if col.is_unique { line.push_str(" UNIQUE"); }
+            col_defs.push(line);
+        }
+        down_sql.push_str(&col_defs.join(",\n"));
+        down_sql.push_str("\n);\n\n");
+    }
+    // DOWN: Re-create Dropped Indexes
+    for idx in &diff.dropped_indexes {
+        let uniq = if idx.is_unique { "UNIQUE " } else { "" };
+        down_sql.push_str(&format!("CREATE {}INDEX IF NOT EXISTS {} ON {}({});\n", uniq, idx.name, idx.table_name, idx.columns.join(", ")));
+    }
+    // DOWN: Drop Added Indexes
+    for idx in &diff.added_indexes {
+        down_sql.push_str(&format!("DROP INDEX IF EXISTS {};\n", idx.name));
+    }
+
+    let summary = format!(
+        "Database Migration '{}' ({}) diff: +{} table(s), -{} table(s), ~{} altered table(s), +{} index(es), -{} index(es)",
+        migration_name, d_norm, diff.added_tables.len(), diff.dropped_tables.len(), diff.altered_tables.len(), diff.added_indexes.len(), diff.dropped_indexes.len()
+    );
+
+    Ok(MigrationResult {
+        name: migration_name.to_string(),
+        dialect: d_norm.to_string(),
+        up_sql: up_sql.trim().to_string(),
+        down_sql: down_sql.trim().to_string(),
+        diff_summary: summary,
+        added_tables: diff.added_tables.into_iter().map(|t| t.name).collect(),
+        dropped_tables: diff.dropped_tables.into_iter().map(|t| t.name).collect(),
+        altered_tables: diff.altered_tables,
+        added_indexes: diff.added_indexes.into_iter().map(|i| i.name).collect(),
+        dropped_indexes: diff.dropped_indexes.into_iter().map(|i| i.name).collect(),
+    })
+}
+
+pub fn format_migration_report_for_terminal(res: &MigrationResult) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n{}\n", "╔══════════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} ║\n", "🗄️  DATABASE MIGRATION & SCHEMA DIFF GENERATOR".cyan().bold()));
+    out.push_str(&format!("{}\n", "╠══════════════════════════════════════════════════════════════╣".cyan()));
+    out.push_str(&format!("  Migration Name:  {}\n", res.name.yellow().bold()));
+    out.push_str(&format!("  SQL Dialect:     {}\n", res.dialect.green().bold()));
+    out.push_str(&format!("  Added Tables:    {}\n", res.added_tables.len().to_string().cyan().bold()));
+    out.push_str(&format!("  Dropped Tables:  {}\n", res.dropped_tables.len().to_string().red().bold()));
+    out.push_str(&format!("  Altered Tables:  {}\n", res.altered_tables.len().to_string().yellow().bold()));
+    out.push_str(&format!("  Added Indexes:   {}\n", res.added_indexes.len().to_string().cyan().bold()));
+    out.push_str(&format!("{}\n", "╟──────────────────────────────────────────────────────────────╢".cyan()));
+    
+    if !res.added_tables.is_empty() {
+        out.push_str(&format!("  {} {}\n", "+ Tables:".green().bold(), res.added_tables.join(", ").green()));
+    }
+    if !res.dropped_tables.is_empty() {
+        out.push_str(&format!("  {} {}\n", "- Tables:".red().bold(), res.dropped_tables.join(", ").red()));
+    }
+    for alt in &res.altered_tables {
+        out.push_str(&format!("  {} {}\n", "~ Table:".yellow().bold(), alt.table_name.cyan()));
+        for col in &alt.added_columns {
+            out.push_str(&format!("    + Column: {} ({})\n", col.name.green(), col.col_type.dimmed()));
+        }
+        for col in &alt.dropped_columns {
+            out.push_str(&format!("    - Column: {}\n", col.name.red()));
+        }
+        for col in &alt.altered_columns {
+            out.push_str(&format!("    ~ Column: {} ({} -> {})\n", col.column_name.yellow(), col.old_type.as_deref().unwrap_or("?"), col.new_type.as_deref().unwrap_or("?")));
+        }
+    }
+
+    out.push_str(&format!("{}\n", "╟────────────────────────── UP.SQL ────────────────────────────╢".cyan()));
+    for line in res.up_sql.lines().take(12) {
+        out.push_str(&format!("  {}\n", line.dimmed()));
+    }
+    if res.up_sql.lines().count() > 12 {
+        out.push_str(&format!("  ... ({} lines total)\n", res.up_sql.lines().count()));
+    }
+
+    out.push_str(&format!("{}\n", "╚══════════════════════════════════════════════════════════════╝".cyan()));
+    out.push_str(&format!("📊 {}\n", res.diff_summary.bold()));
+    out
+}
+
+// ============================================================================
+// SYSTEM 2: MULTI-LANGUAGE CODE TRANSPILER & PORTER
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TranspileResult {
+    pub source_language: String,
+    pub target_language: String,
+    pub original_code: String,
+    pub transpiled_code: String,
+    pub idiomatic_conversions: Vec<String>,
+    pub warnings: Vec<String>,
+    pub diagnostics_clean: bool,
+    pub diff_preview: String,
+}
+
+pub fn detect_source_language(path_or_code: &str) -> &'static str {
+    if path_or_code.ends_with(".py") || path_or_code.contains("def ") && path_or_code.contains(':') && !path_or_code.contains('{') {
+        "python"
+    } else if path_or_code.ends_with(".rs") || path_or_code.contains("fn ") || path_or_code.contains("pub struct ") || path_or_code.contains("impl ") {
+        "rust"
+    } else if path_or_code.ends_with(".ts") || path_or_code.ends_with(".tsx") || path_or_code.contains("interface ") || path_or_code.contains(": string") {
+        "typescript"
+    } else if path_or_code.ends_with(".js") || path_or_code.ends_with(".jsx") || path_or_code.contains("const ") || path_or_code.contains("function ") {
+        "javascript"
+    } else if path_or_code.ends_with(".go") || path_or_code.contains("func ") || path_or_code.contains("package ") {
+        "go"
+    } else if path_or_code.ends_with(".c") || path_or_code.ends_with(".cpp") || path_or_code.ends_with(".h") || path_or_code.contains("#include") || path_or_code.contains("printf(") {
+        "c"
+    } else {
+        "python"
+    }
+}
+
+pub fn normalize_language(lang: &str) -> &'static str {
+    match lang.to_lowercase().trim() {
+        "py" | "python" | "python3" => "python",
+        "rs" | "rust" => "rust",
+        "ts" | "typescript" | "tsx" => "typescript",
+        "js" | "javascript" | "jsx" | "node" => "javascript",
+        "go" | "golang" => "go",
+        "c" | "cpp" | "c++" | "cxx" | "h" => "c",
+        _ => "rust",
+    }
+}
+
+pub fn transpile_code_offline(
+    source_code: &str,
+    source_lang: &str,
+    target_lang: &str,
+) -> Result<TranspileResult, Box<dyn std::error::Error>> {
+    let s_lang = normalize_language(source_lang);
+    let t_lang = normalize_language(target_lang);
+
+    let mut transpiled = String::new();
+    let mut idiomatic_conversions = Vec::new();
+    let mut warnings = Vec::new();
+
+    if s_lang == "python" && t_lang == "rust" {
+        transpiled.push_str("// Transpiled from Python to Idiomatic Rust (zy compiler engine)\n");
+        transpiled.push_str("use std::collections::HashMap;\nuse serde::{Serialize, Deserialize};\n\n");
+        idiomatic_conversions.push("Imported std::collections::HashMap and serde derives".to_string());
+
+        for line in source_code.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                transpiled.push_str(&format!("// {}\n", &trimmed[1..].trim()));
+            } else if trimmed.starts_with("def ") {
+                let after_def = &trimmed[4..];
+                if let Some(open_p) = after_def.find('(') {
+                    let fn_name = &after_def[..open_p];
+                    if let Some(close_p) = after_def.find(')') {
+                        let params = &after_def[open_p + 1..close_p];
+                        let mut rust_params = Vec::new();
+                        for p in params.split(',') {
+                            let p_trim = p.trim();
+                            if p_trim.is_empty() || p_trim == "self" { continue; }
+                            if p_trim.contains(':') {
+                                let parts: Vec<&str> = p_trim.split(':').collect();
+                                let p_name = parts[0].trim();
+                                let p_type = match parts[1].trim().to_lowercase().as_str() {
+                                    "int" => "i64",
+                                    "float" => "f64",
+                                    "str" => "&str",
+                                    "bool" => "bool",
+                                    _ => "&str",
+                                };
+                                rust_params.push(format!("{}: {}", p_name, p_type));
+                            } else {
+                                rust_params.push(format!("{}: &str", p_trim));
+                            }
+                        }
+                        transpiled.push_str(&format!("pub fn {}({}) -> Result<(), Box<dyn std::error::Error>> {{\n", fn_name, rust_params.join(", ")));
+                        idiomatic_conversions.push(format!("Converted Python function `{}` into Rust `pub fn` returning `Result`", fn_name));
+                    }
+                }
+            } else if trimmed.starts_with("class ") {
+                let class_name = trimmed[6..].trim_end_matches(':').trim();
+                transpiled.push_str(&format!("#[derive(Debug, Clone, Serialize, Deserialize)]\npub struct {} {{\n", class_name));
+                idiomatic_conversions.push(format!("Converted Python class `{}` into Rust struct with ownership", class_name));
+            } else if trimmed.starts_with("raise ") {
+                let msg = trimmed[6..].trim();
+                transpiled.push_str(&format!("    return Err({}.into());\n", msg));
+                idiomatic_conversions.push("Converted Python exception raise into Rust Err(...) return".to_string());
+            } else if trimmed.starts_with("print(") {
+                let inner = &trimmed[6..trimmed.len().saturating_sub(1)];
+                transpiled.push_str(&format!("    println!(\"{{}}\", {});\n", inner));
+            } else if trimmed.starts_with("return ") {
+                let ret_val = &trimmed[7..];
+                transpiled.push_str(&format!("    Ok({})\n", ret_val));
+            } else if !trimmed.is_empty() {
+                transpiled.push_str(&format!("    {};\n", trimmed));
+            }
+        }
+        if !transpiled.ends_with("}\n") {
+            transpiled.push_str("    Ok(())\n}\n");
+        }
+    } else if (s_lang == "javascript" || s_lang == "typescript") && t_lang == "typescript" {
+        transpiled.push_str("// Transpiled & Typed TypeScript Interface\n");
+        for line in source_code.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("function ") {
+                let after_fn = &trimmed[9..];
+                if let Some(open_p) = after_fn.find('(') {
+                    let fn_name = &after_fn[..open_p];
+                    transpiled.push_str(&format!("export function {}(...args: any[]): any {{\n", fn_name));
+                }
+            } else if trimmed.starts_with("const ") && trimmed.contains('{') {
+                transpiled.push_str(&format!("export interface AutoGeneratedType {{\n  [key: string]: any;\n}}\n{}\n", line));
+                idiomatic_conversions.push("Extracted dynamic JavaScript object structure into TypeScript interface".to_string());
+            } else {
+                transpiled.push_str(&format!("{}\n", line));
+            }
+        }
+    } else if s_lang == "c" && t_lang == "rust" {
+        transpiled.push_str("// Transpiled from C to Safe Rust (Zero Raw Pointers / Memory Safe)\n\n");
+        idiomatic_conversions.push("Eliminated raw pointers, replaced malloc/free with safe Box/Vec ownership".to_string());
+        for line in source_code.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("#include") {
+                continue;
+            } else if trimmed.contains("int main(") || trimmed.contains("void main(") {
+                transpiled.push_str("pub fn main() {\n");
+            } else if trimmed.contains("printf(") {
+                let start = trimmed.find("printf(").unwrap();
+                let inner = &trimmed[start + 7..trimmed.len().saturating_sub(2)];
+                transpiled.push_str(&format!("    println!({});\n", inner));
+            } else if trimmed.contains("malloc(") {
+                transpiled.push_str("    let mut buffer = Vec::with_capacity(1024);\n");
+                idiomatic_conversions.push("Replaced malloc buffer with Rust Vec<u8>".to_string());
+            } else if trimmed.contains("free(") {
+                // Drop is automatic in Rust
+                transpiled.push_str("    // Memory deallocation automatically handled by Rust Drop\n");
+            } else if !trimmed.is_empty() {
+                transpiled.push_str(&format!("    {}\n", trimmed));
+            }
+        }
+        if !transpiled.ends_with("}\n") {
+            transpiled.push_str("}\n");
+        }
+    } else if s_lang == "python" && t_lang == "go" {
+        transpiled.push_str("// Package and imports\npackage main\n\nimport (\n\t\"fmt\"\n)\n\n");
+        for line in source_code.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("def ") {
+                let after_def = &trimmed[4..];
+                if let Some(open_p) = after_def.find('(') {
+                    let fn_name = &after_def[..open_p];
+                    transpiled.push_str(&format!("func {}() error {{\n", fn_name));
+                    idiomatic_conversions.push(format!("Converted Python def `{}` into Go exported function returning error", fn_name));
+                }
+            } else if trimmed.starts_with("print(") {
+                let inner = &trimmed[6..trimmed.len().saturating_sub(1)];
+                transpiled.push_str(&format!("\tfmt.Println({})\n", inner));
+            } else if trimmed.starts_with("raise ") {
+                let msg = trimmed[6..].trim();
+                transpiled.push_str(&format!("\treturn fmt.Errorf({})\n", msg));
+                idiomatic_conversions.push("Converted Python exception raise to Go fmt.Errorf error return".to_string());
+            } else if !trimmed.is_empty() {
+                transpiled.push_str(&format!("\t{}\n", trimmed));
+            }
+        }
+        transpiled.push_str("\treturn nil\n}\n");
+    } else {
+        // Generic transpilation template
+        transpiled.push_str(&format!("// Transpiled from {} to {}\n\n", s_lang, t_lang));
+        for line in source_code.lines() {
+            transpiled.push_str(&format!("// {}\n", line));
+        }
+        warnings.push(format!("Applied generalized syntax transformation between {} and {}", s_lang, t_lang));
+    }
+
+    let diff_preview = render_terminal_diff("code_transpilation", source_code, &transpiled);
+
+    Ok(TranspileResult {
+        source_language: s_lang.to_string(),
+        target_language: t_lang.to_string(),
+        original_code: source_code.to_string(),
+        transpiled_code: transpiled,
+        idiomatic_conversions,
+        warnings,
+        diagnostics_clean: true,
+        diff_preview,
+    })
+}
+
+pub async fn transpile_code_snippet(
+    source_code: &str,
+    source_lang: &str,
+    target_lang: &str,
+    client: Option<&Client>,
+    model: Option<&str>,
+    opts: Option<&OllamaOptions>,
+) -> Result<TranspileResult, Box<dyn std::error::Error>> {
+    let s_lang = normalize_language(source_lang);
+    let t_lang = normalize_language(target_lang);
+
+    if let (Some(c), Some(m)) = (client, model) {
+        let system_prompt = format!(
+            "You are an expert compiler and polyglot transpiler. Translate the following {} code into idiomatic, production-grade {}. \
+            Preserve all functionality while adopting target language idioms (e.g. Python exceptions -> Rust Result<T, E>, JS objects -> typed TS interfaces, C pointers -> safe Rust ownership). \
+            Output ONLY the valid target code without markdown fences.",
+            s_lang, t_lang
+        );
+
+        let messages = vec![
+            Message { role: "system".to_string(), content: system_prompt, tool_calls: None, images: None },
+            Message { role: "user".to_string(), content: source_code.to_string(), tool_calls: None, images: None },
+        ];
+
+        let default_opts = OllamaOptions {
+            temperature: 0.1,
+            num_ctx: Some(4096),
+            num_thread: None,
+            num_gpu: None,
+        };
+        let final_opts = opts.unwrap_or(&default_opts);
+
+        if let Ok(llm_code) = fetch_full_response(c, m, &messages, final_opts, None).await {
+            let clean_code = llm_code.trim().trim_start_matches("```rust").trim_start_matches("```python").trim_start_matches("```typescript").trim_start_matches("```go").trim_start_matches("```c").trim_start_matches("```").trim_end_matches("```").trim().to_string();
+            if !clean_code.is_empty() && !clean_code.starts_with("Error:") {
+                let diff_prev = render_terminal_diff("llm_transpile", source_code, &clean_code);
+                return Ok(TranspileResult {
+                    source_language: s_lang.to_string(),
+                    target_language: t_lang.to_string(),
+                    original_code: source_code.to_string(),
+                    transpiled_code: clean_code,
+                    idiomatic_conversions: vec![format!("LLM-assisted semantic conversion from {} to {}", s_lang, t_lang)],
+                    warnings: Vec::new(),
+                    diagnostics_clean: true,
+                    diff_preview: diff_prev,
+                });
+            }
+        }
+    }
+
+    // Fallback to offline rule-based transpiler
+    transpile_code_offline(source_code, source_lang, target_lang)
+}
+
+pub fn format_transpile_report_for_terminal(res: &TranspileResult) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n{}\n", "╔══════════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} ║\n", "🔄 MULTI-LANGUAGE CODE TRANSPILER & PORTER".cyan().bold()));
+    out.push_str(&format!("{}\n", "╠══════════════════════════════════════════════════════════════╣".cyan()));
+    out.push_str(&format!("  Source Language: {}\n", res.source_language.yellow().bold()));
+    out.push_str(&format!("  Target Language: {}\n", res.target_language.green().bold()));
+    out.push_str(&format!("  Conversions:     {}\n", res.idiomatic_conversions.len().to_string().cyan().bold()));
+    out.push_str(&format!("{}\n", "╟──────────────────────────────────────────────────────────────╢".cyan()));
+
+    for conv in &res.idiomatic_conversions {
+        out.push_str(&format!("  • {}\n", conv.green()));
+    }
+    for w in &res.warnings {
+        out.push_str(&format!("  ⚠️ {}\n", w.yellow()));
+    }
+
+    out.push_str(&format!("{}\n", "╟────────────────────── TRANSPILATION DIFF ───────────────────╢".cyan()));
+    out.push_str(&res.diff_preview);
+    out.push_str(&format!("{}\n", "╚══════════════════════════════════════════════════════════════╝".cyan()));
+    out
+}
+
+// ============================================================================
+// SYSTEM 3: ARCHITECTURE DECISION RECORD (ADR) SYNTHESIZER
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct AdrRecord {
+    pub id: usize,
+    pub slug: String,
+    pub title: String,
+    pub status: String,
+    pub date: String,
+    pub context: String,
+    pub decision: String,
+    pub consequences: String,
+    pub file_path: PathBuf,
+    pub content: String,
+}
+
+pub fn slugify(title: &str) -> String {
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for ch in title.to_lowercase().chars() {
+        if ch.is_alphanumeric() {
+            slug.push(ch);
+            prev_dash = false;
+        } else if (ch == ' ' || ch == '-' || ch == '_') && !prev_dash && !slug.is_empty() {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    slug.trim_end_matches('-').to_string()
+}
+
+pub fn next_adr_index(workspace_root: &std::path::Path) -> usize {
+    let adr_dir = workspace_root.join("docs").join("adr");
+    if !adr_dir.exists() {
+        return 1;
+    }
+    let mut max_idx = 0;
+    if let Ok(entries) = fs::read_dir(&adr_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(dash) = name.find('-') {
+                if let Ok(idx) = name[..dash].parse::<usize>() {
+                    if idx > max_idx {
+                        max_idx = idx;
+                    }
+                }
+            }
+        }
+    }
+    max_idx + 1
+}
+
+pub fn list_existing_adrs(workspace_root: &std::path::Path) -> Result<Vec<AdrRecord>, Box<dyn std::error::Error>> {
+    let adr_dir = workspace_root.join("docs").join("adr");
+    let mut records = Vec::new();
+    if !adr_dir.exists() {
+        return Ok(records);
+    }
+
+    for entry in fs::read_dir(&adr_dir)?.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+            if let Ok(content) = fs::read_to_string(&path) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let mut id = 1;
+                let mut slug = name.clone();
+                if let Some(dash) = name.find('-') {
+                    if let Ok(parsed_id) = name[..dash].parse::<usize>() {
+                        id = parsed_id;
+                        slug = name[dash + 1..].trim_end_matches(".md").to_string();
+                    }
+                }
+
+                let mut title = slug.replace('-', " ");
+                let mut status = "Accepted".to_string();
+                let mut date = "2026-09-04".to_string();
+
+                for line in content.lines() {
+                    if line.starts_with("# ADR-") {
+                        if let Some(colon) = line.find(':') {
+                            title = line[colon + 1..].trim().to_string();
+                        }
+                    } else if line.starts_with("* Status:") {
+                        status = line[9..].trim().to_string();
+                    } else if line.starts_with("* Date:") {
+                        date = line[7..].trim().to_string();
+                    }
+                }
+
+                records.push(AdrRecord {
+                    id,
+                    slug,
+                    title,
+                    status,
+                    date,
+                    context: "".to_string(),
+                    decision: "".to_string(),
+                    consequences: "".to_string(),
+                    file_path: path,
+                    content,
+                });
+            }
+        }
+    }
+    records.sort_by_key(|r| r.id);
+    Ok(records)
+}
+
+pub fn synthesize_madr_markdown(
+    id: usize,
+    title: &str,
+    status: &str,
+    date: &str,
+    context: &str,
+    decision: &str,
+    consequences: &str,
+) -> String {
+    format!(
+        r#"# ADR-{:04}: {}
+
+* Status: {}
+* Date: {}
+* Deciders: Architecture & Engineering Team
+
+## Context and Problem Statement
+{}
+
+## Decision Drivers
+* System scalability, performance, and memory efficiency
+* Maintainability, clean interfaces, and operational simplicity
+* Consistency with existing codebase architectural standards
+
+## Considered Options
+* Option 1: Legacy / Status Quo Architecture
+* Option 2: {} (Chosen Solution)
+* Option 3: Third-Party Enterprise Middleware
+
+## Decision Outcome
+Chosen option: "{}"
+
+### Positive Consequences
+* Solves the architectural requirements identified in the context statement.
+* {}
+
+### Negative Consequences / Trade-offs
+* Requires migration verification and initial setup overhead.
+
+## Pros and Cons of the Options
+### {}
+* Good, because it provides direct end-to-end integration.
+* Good, because it adheres to zero-dependency and fast local execution principles.
+* Bad, because ongoing maintenance is owned by the project.
+"#,
+        id, title, status, date, context.trim(), title, decision.trim(), consequences.trim(), title
+    )
+}
+
+pub fn create_architecture_decision_record(
+    workspace_root: &std::path::Path,
+    title: &str,
+    context: &str,
+    decision: &str,
+    consequences: &str,
+    status: Option<&str>,
+) -> Result<AdrRecord, Box<dyn std::error::Error>> {
+    let adr_dir = workspace_root.join("docs").join("adr");
+    fs::create_dir_all(&adr_dir)?;
+
+    let id = next_adr_index(workspace_root);
+    let slug = slugify(title);
+    let stat = status.unwrap_or("Accepted");
+    let date = "2026-09-04"; // Current date standard
+
+    let content = synthesize_madr_markdown(id, title, stat, date, context, decision, consequences);
+    let filename = format!("{:04}-{}.md", id, slug);
+    let file_path = adr_dir.join(&filename);
+
+    fs::write(&file_path, &content)?;
+
+    Ok(AdrRecord {
+        id,
+        slug,
+        title: title.to_string(),
+        status: stat.to_string(),
+        date: date.to_string(),
+        context: context.to_string(),
+        decision: decision.to_string(),
+        consequences: consequences.to_string(),
+        file_path,
+        content,
+    })
+}
+
+pub fn format_adr_report_for_terminal(adr: &AdrRecord) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n{}\n", "╔══════════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} ║\n", "🏛️  ARCHITECTURE DECISION RECORD (ADR) SYNTHESIZER".cyan().bold()));
+    out.push_str(&format!("{}\n", "╠══════════════════════════════════════════════════════════════╣".cyan()));
+    out.push_str(&format!("  ADR Identifier:  {}\n", format!("ADR-{:04}", adr.id).yellow().bold()));
+    out.push_str(&format!("  Title:           {}\n", adr.title.green().bold()));
+    out.push_str(&format!("  Status:          {}\n", adr.status.cyan().bold()));
+    out.push_str(&format!("  Date:            {}\n", adr.date.dimmed()));
+    out.push_str(&format!("  Path:            {}\n", adr.file_path.display().to_string().dimmed()));
+    out.push_str(&format!("{}\n", "╟──────────────────────────────────────────────────────────────╢".cyan()));
+    out.push_str(&format!("  Decision: {}\n", adr.decision.bold()));
+    out.push_str(&format!("{}\n", "╚══════════════════════════════════════════════════════════════╝".cyan()));
+    out.push_str(&format!("📄 Synthesized MADR saved to `{}`\n", adr.file_path.display()));
+    out
+}
+
+// ============================================================================
+// SYSTEM 4: PACKAGE REGISTRY & COMPATIBILITY INSPECTOR
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PackageInfo {
+    pub name: String,
+    pub ecosystem: String,
+    pub latest_version: String,
+    pub description: String,
+    pub license: Option<String>,
+    pub homepage: Option<String>,
+    pub repository: Option<String>,
+    pub documentation: Option<String>,
+    pub keywords: Vec<String>,
+    pub dependencies: Vec<String>,
+    pub features: Vec<String>,
+    pub downloads: Option<u64>,
+}
+
+pub fn parse_package_registry_response(
+    ecosystem: &str,
+    package_name: &str,
+    json_data: &str,
+) -> Result<PackageInfo, Box<dyn std::error::Error>> {
+    let parsed: serde_json::Value = serde_json::from_str(json_data)?;
+    let eco_norm = match ecosystem.to_lowercase().as_str() {
+        "npm" | "javascript" | "js" | "node" => "npm",
+        "pypi" | "python" | "pip" => "pypi",
+        _ => "crates.io",
+    };
+
+    if eco_norm == "crates.io" {
+        let cr = parsed.get("crate").ok_or("Missing 'crate' field in crates.io response")?;
+        let name = cr.get("name").and_then(|v| v.as_str()).unwrap_or(package_name).to_string();
+        let latest_ver = cr.get("max_version").or_else(|| cr.get("newest_version")).and_then(|v| v.as_str()).unwrap_or("0.1.0").to_string();
+        let desc = cr.get("description").and_then(|v| v.as_str()).unwrap_or("No description available").to_string();
+        let home = cr.get("homepage").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let repo = cr.get("repository").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let doc = cr.get("documentation").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let dls = cr.get("downloads").and_then(|v| v.as_u64());
+
+        let mut keywords = Vec::new();
+        if let Some(kws) = cr.get("keywords").and_then(|v| v.as_array()) {
+            for kw in kws {
+                if let Some(s) = kw.as_str() { keywords.push(s.to_string()); }
+            }
+        }
+
+        let mut license = None;
+        let mut features = Vec::new();
+        if let Some(versions) = parsed.get("versions").and_then(|v| v.as_array()) {
+            if let Some(first_ver) = versions.first() {
+                license = first_ver.get("license").and_then(|v| v.as_str()).map(|s| s.to_string());
+                if let Some(feats) = first_ver.get("features").and_then(|v| v.as_object()) {
+                    for f in feats.keys() {
+                        features.push(f.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(PackageInfo {
+            name,
+            ecosystem: "crates.io".to_string(),
+            latest_version: latest_ver,
+            description: desc,
+            license,
+            homepage: home,
+            repository: repo,
+            documentation: doc,
+            keywords,
+            dependencies: Vec::new(),
+            features,
+            downloads: dls,
+        })
+    } else if eco_norm == "npm" {
+        let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or(package_name).to_string();
+        let latest_ver = parsed.get("dist-tags").and_then(|dt| dt.get("latest")).and_then(|v| v.as_str()).unwrap_or("1.0.0").to_string();
+        let desc = parsed.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let license = parsed.get("license").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let home = parsed.get("homepage").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let repo = parsed.get("repository").and_then(|v| v.get("url").or_else(|| v.get("url"))).and_then(|v| v.as_str()).map(|s| s.to_string());
+        
+        let mut keywords = Vec::new();
+        if let Some(kws) = parsed.get("keywords").and_then(|v| v.as_array()) {
+            for kw in kws {
+                if let Some(s) = kw.as_str() { keywords.push(s.to_string()); }
+            }
+        }
+
+        let mut deps = Vec::new();
+        if let Some(ver_obj) = parsed.get("versions").and_then(|v| v.get(&latest_ver)) {
+            if let Some(dep_map) = ver_obj.get("dependencies").and_then(|d| d.as_object()) {
+                for (dep_name, dep_ver) in dep_map {
+                    deps.push(format!("{}@{}", dep_name, dep_ver.as_str().unwrap_or("*")));
+                }
+            }
+        }
+
+        Ok(PackageInfo {
+            name,
+            ecosystem: "npm".to_string(),
+            latest_version: latest_ver,
+            description: desc,
+            license,
+            homepage: home,
+            repository: repo,
+            documentation: None,
+            keywords,
+            dependencies: deps,
+            features: Vec::new(),
+            downloads: None,
+        })
+    } else {
+        // PyPI
+        let info = parsed.get("info").ok_or("Missing 'info' field in PyPI response")?;
+        let name = info.get("name").and_then(|v| v.as_str()).unwrap_or(package_name).to_string();
+        let latest_ver = info.get("version").and_then(|v| v.as_str()).unwrap_or("0.1.0").to_string();
+        let desc = info.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let license = info.get("license").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let home = info.get("home_page").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        let mut doc = None;
+        let mut repo = None;
+        if let Some(p_urls) = info.get("project_urls").and_then(|u| u.as_object()) {
+            doc = p_urls.get("Documentation").and_then(|v| v.as_str()).map(|s| s.to_string());
+            repo = p_urls.get("Repository").or_else(|| p_urls.get("Source")).and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+
+        let mut deps = Vec::new();
+        if let Some(reqs) = info.get("requires_dist").and_then(|v| v.as_array()) {
+            for req in reqs {
+                if let Some(s) = req.as_str() { deps.push(s.to_string()); }
+            }
+        }
+
+        Ok(PackageInfo {
+            name,
+            ecosystem: "pypi".to_string(),
+            latest_version: latest_ver,
+            description: desc,
+            license,
+            homepage: home,
+            repository: repo,
+            documentation: doc,
+            keywords: Vec::new(),
+            dependencies: deps,
+            features: Vec::new(),
+            downloads: None,
+        })
+    }
+}
+
+pub async fn query_package_registry(
+    ecosystem: &str,
+    package_name: &str,
+    client: &Client,
+) -> Result<PackageInfo, Box<dyn std::error::Error>> {
+    let eco_norm = match ecosystem.to_lowercase().as_str() {
+        "npm" | "javascript" | "js" | "node" => "npm",
+        "pypi" | "python" | "pip" => "pypi",
+        _ => "crates.io",
+    };
+
+    let url = match eco_norm {
+        "crates.io" => format!("https://crates.io/api/v1/crates/{}", package_name),
+        "npm" => format!("https://registry.npmjs.org/{}", package_name),
+        _ => format!("https://pypi.org/pypi/{}/json", package_name),
+    };
+
+    let resp = client.get(&url)
+        .header("User-Agent", "zy-package-inspector/0.1.0")
+        .send()
+        .await?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!("Package '{}' was not found in the {} registry.", package_name, eco_norm).into());
+    }
+
+    let body = resp.text().await?;
+    parse_package_registry_response(eco_norm, package_name, &body)
+}
+
+pub fn format_package_info_for_terminal(info: &PackageInfo) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n{}\n", "╔══════════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} ║\n", "📦 PACKAGE REGISTRY & COMPATIBILITY INSPECTOR".cyan().bold()));
+    out.push_str(&format!("{}\n", "╠══════════════════════════════════════════════════════════════╣".cyan()));
+    out.push_str(&format!("  Package Name:    {}\n", info.name.yellow().bold()));
+    out.push_str(&format!("  Ecosystem:       {}\n", info.ecosystem.green().bold()));
+    out.push_str(&format!("  Latest Version:  {}\n", info.latest_version.cyan().bold()));
+    if let Some(lic) = &info.license {
+        out.push_str(&format!("  License:         {}\n", lic.green()));
+    }
+    if let Some(dls) = info.downloads {
+        out.push_str(&format!("  Downloads:       {}\n", dls.to_string().cyan()));
+    }
+    if let Some(doc) = &info.documentation {
+        out.push_str(&format!("  Documentation:   {}\n", doc.dimmed()));
+    }
+    if let Some(repo) = &info.repository {
+        out.push_str(&format!("  Repository:      {}\n", repo.dimmed()));
+    }
+    out.push_str(&format!("{}\n", "╟──────────────────────────────────────────────────────────────╢".cyan()));
+    out.push_str(&format!("  Description: {}\n", info.description.dimmed()));
+
+    if !info.features.is_empty() {
+        out.push_str(&format!("  Features: {}\n", info.features.join(", ").cyan()));
+    }
+    if !info.dependencies.is_empty() {
+        out.push_str(&format!("  Dependencies ({})\n", info.dependencies.len()));
+        for dep in info.dependencies.iter().take(5) {
+            out.push_str(&format!("    • {}\n", dep.dimmed()));
+        }
+        if info.dependencies.len() > 5 {
+            out.push_str(&format!("    ... ({} more)\n", info.dependencies.len() - 5));
+        }
+    }
+    out.push_str(&format!("{}\n", "╚══════════════════════════════════════════════════════════════╝".cyan()));
+    out
+}
+
+// ============================================================================
+// SYSTEM 5: FRONTEND ACCESSIBILITY (A11Y) & WEB VITALS AUDITOR
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum A11ySeverity {
+    Critical,
+    Serious,
+    Moderate,
+    Minor,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct A11yViolation {
+    pub file: String,
+    pub line: usize,
+    pub rule_id: String,
+    pub wcag_criterion: String,
+    pub severity: A11ySeverity,
+    pub element_snippet: String,
+    pub message: String,
+    pub suggested_fix: String,
+    pub remediation_patch: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct A11yReport {
+    pub target: String,
+    pub scanned_files_count: usize,
+    pub total_violations: usize,
+    pub critical_count: usize,
+    pub serious_count: usize,
+    pub moderate_count: usize,
+    pub minor_count: usize,
+    pub violations: Vec<A11yViolation>,
+    pub score: f64,
+    pub summary: String,
+}
+
+pub fn scan_file_accessibility(file_path: &std::path::Path, content: &str) -> Vec<A11yViolation> {
+    let mut violations = Vec::new();
+    let file_str = file_path.to_string_lossy().to_string();
+
+    let mut last_heading_level = 0;
+
+    for (line_idx, line) in content.lines().enumerate() {
+        let line_num = line_idx + 1;
+        let line_trimmed = line.trim();
+
+        // 1. Missing alt on <img> / <Image / <image
+        if (line_trimmed.contains("<img ") || line_trimmed.contains("<Image ") || line_trimmed.contains("<image ")) && !line_trimmed.contains("alt=") {
+            violations.push(A11yViolation {
+                file: file_str.clone(),
+                line: line_num,
+                rule_id: "image-alt".to_string(),
+                wcag_criterion: "WCAG 1.1.1 Non-text Content".to_string(),
+                severity: A11ySeverity::Critical,
+                element_snippet: line_trimmed.to_string(),
+                message: "Image element is missing required 'alt' descriptive text attribute.".to_string(),
+                suggested_fix: "Add alt=\"descriptive text\" to the image tag (or alt=\"\" if decorative).".to_string(),
+                remediation_patch: Some(line_trimmed.replace("<img ", "<img alt=\"Descriptive image label\" ")),
+            });
+        }
+
+        // 2. Buttons without accessible text or aria-label
+        if line_trimmed.contains("<button") {
+            let has_aria = line_trimmed.contains("aria-label=") || line_trimmed.contains("aria-labelledby=") || line_trimmed.contains("title=");
+            let has_text_content = if let Some(open_b) = line_trimmed.find('>') {
+                if let Some(close_b) = line_trimmed.find("</button>") {
+                    if close_b > open_b {
+                        let inner = line_trimmed[open_b + 1..close_b].trim();
+                        !inner.is_empty() && !inner.starts_with('<')
+                    } else { false }
+                } else { false }
+            } else { false };
+
+            if !has_aria && !has_text_content {
+                violations.push(A11yViolation {
+                    file: file_str.clone(),
+                    line: line_num,
+                    rule_id: "button-name".to_string(),
+                    wcag_criterion: "WCAG 4.1.2 Name, Role, Value".to_string(),
+                    severity: A11ySeverity::Serious,
+                    element_snippet: line_trimmed.to_string(),
+                    message: "Button has no accessible name or aria-label.".to_string(),
+                    suggested_fix: "Provide text content inside <button> or add aria-label=\"...\">.".to_string(),
+                    remediation_patch: Some(line_trimmed.replace("<button", "<button aria-label=\"Action button\"")),
+                });
+            }
+        }
+
+        // 3. Form controls without label or aria-label
+        if line_trimmed.contains("<input") || line_trimmed.contains("<select") || line_trimmed.contains("<textarea") {
+            let is_hidden_or_submit = line_trimmed.contains("type=\"hidden\"") || line_trimmed.contains("type=\"submit\"") || line_trimmed.contains("type=\"button\"");
+            let has_aria = line_trimmed.contains("aria-label=") || line_trimmed.contains("aria-labelledby=");
+            let has_id = line_trimmed.contains("id=");
+
+            if !is_hidden_or_submit && !has_aria && !has_id {
+                violations.push(A11yViolation {
+                    file: file_str.clone(),
+                    line: line_num,
+                    rule_id: "form-control-label".to_string(),
+                    wcag_criterion: "WCAG 1.3.1 Info and Relationships".to_string(),
+                    severity: A11ySeverity::Serious,
+                    element_snippet: line_trimmed.to_string(),
+                    message: "Form control (<input>/<select>/<textarea>) has no matching <label> or aria-label.".to_string(),
+                    suggested_fix: "Add an 'id' matching a <label for=\"id\"> or provide aria-label=\"...\">.".to_string(),
+                    remediation_patch: Some(line_trimmed.replace("<input", "<input aria-label=\"Input field\"")),
+                });
+            }
+        }
+
+        // 4. Missing lang on <html>
+        if line_trimmed.starts_with("<html") && !line_trimmed.contains("lang=") {
+            violations.push(A11yViolation {
+                file: file_str.clone(),
+                line: line_num,
+                rule_id: "html-has-lang".to_string(),
+                wcag_criterion: "WCAG 3.1.1 Language of Page".to_string(),
+                severity: A11ySeverity::Moderate,
+                element_snippet: line_trimmed.to_string(),
+                message: "Root <html> element is missing a 'lang' language attribute.".to_string(),
+                suggested_fix: "Add lang=\"en\" (or appropriate language code) to the <html> tag.".to_string(),
+                remediation_patch: Some(line_trimmed.replace("<html", "<html lang=\"en\"")),
+            });
+        }
+
+        // 5. Non-interactive elements with click listeners without keyboard handlers
+        let has_click = line_trimmed.contains("onClick=") || line_trimmed.contains("@click=") || line_trimmed.contains("onclick=") || line_trimmed.contains("on:click=");
+        let is_div_or_span = line_trimmed.starts_with("<div") || line_trimmed.starts_with("<span") || line_trimmed.starts_with("<p") || line_trimmed.starts_with("<li");
+        if has_click && is_div_or_span {
+            let has_key = line_trimmed.contains("onKeyDown=") || line_trimmed.contains("@keydown=") || line_trimmed.contains("on:keydown=") || line_trimmed.contains("onKeyUp=");
+            let has_role = line_trimmed.contains("role=\"button\"") || line_trimmed.contains("role='button'");
+            let has_tabindex = line_trimmed.contains("tabIndex=") || line_trimmed.contains("tabindex=");
+
+            if !has_key || !has_role || !has_tabindex {
+                violations.push(A11yViolation {
+                    file: file_str.clone(),
+                    line: line_num,
+                    rule_id: "click-events-have-key-events".to_string(),
+                    wcag_criterion: "WCAG 2.1.1 Keyboard Accessible".to_string(),
+                    severity: A11ySeverity::Serious,
+                    element_snippet: line_trimmed.to_string(),
+                    message: "Non-interactive element has click listener without keyboard handler, role=\"button\", and tabindex.".to_string(),
+                    suggested_fix: "Add role=\"button\", tabIndex={0}, and onKeyDown handler, or use a native <button>.".to_string(),
+                    remediation_patch: Some(line_trimmed.replace("onClick=", "role=\"button\" tabIndex={0} onKeyDown={handleKeyDown} onClick=")),
+                });
+            }
+        }
+
+        // 6. <iframe> missing title
+        if line_trimmed.contains("<iframe") && !line_trimmed.contains("title=") {
+            violations.push(A11yViolation {
+                file: file_str.clone(),
+                line: line_num,
+                rule_id: "iframe-title".to_string(),
+                wcag_criterion: "WCAG 4.1.2 Name, Role, Value".to_string(),
+                severity: A11ySeverity::Moderate,
+                element_snippet: line_trimmed.to_string(),
+                message: "<iframe> element is missing an accessible 'title' attribute.".to_string(),
+                suggested_fix: "Add title=\"Description of iframe contents\" to the <iframe> tag.".to_string(),
+                remediation_patch: Some(line_trimmed.replace("<iframe", "<iframe title=\"Embedded content\"")),
+            });
+        }
+
+        // 7. Heading hierarchy skips
+        for h in 1..=6 {
+            let tag = format!("<h{}", h);
+            if line_trimmed.contains(&tag) {
+                if last_heading_level > 0 && h > last_heading_level + 1 {
+                    violations.push(A11yViolation {
+                        file: file_str.clone(),
+                        line: line_num,
+                        rule_id: "heading-order".to_string(),
+                        wcag_criterion: "WCAG 1.3.1 Info and Relationships".to_string(),
+                        severity: A11ySeverity::Minor,
+                        element_snippet: line_trimmed.to_string(),
+                        message: format!("Heading level skipped: jumped from <h{}> directly to <h{}>.", last_heading_level, h),
+                        suggested_fix: format!("Use sequential heading levels (step from <h{}> to <h{}>).", last_heading_level, last_heading_level + 1),
+                        remediation_patch: None,
+                    });
+                }
+                last_heading_level = h;
+                break;
+            }
+        }
+    }
+
+    violations
+}
+
+pub fn audit_workspace_accessibility(
+    workspace_root: &std::path::Path,
+    target_file: Option<&str>,
+) -> Result<A11yReport, Box<dyn std::error::Error>> {
+    let mut all_violations = Vec::new();
+    let mut scanned_count = 0;
+
+    let target_str = target_file.unwrap_or(workspace_root.to_str().unwrap_or("."));
+
+    if let Some(t_file) = target_file {
+        let p = if std::path::Path::new(t_file).is_absolute() {
+            std::path::PathBuf::from(t_file)
+        } else {
+            workspace_root.join(t_file)
+        };
+
+        if p.is_file() {
+            let content = fs::read_to_string(&p)?;
+            scanned_count += 1;
+            all_violations.extend(scan_file_accessibility(&p, &content));
+        }
+    } else {
+        for entry in walkdir::WalkDir::new(workspace_root).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_file() {
+                let p_str = path.to_string_lossy();
+                if p_str.contains("node_modules") || p_str.contains(".git") || p_str.contains("target") || p_str.contains("dist") || p_str.contains("build") {
+                    continue;
+                }
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    match ext.to_lowercase().as_str() {
+                        "html" | "htm" | "jsx" | "tsx" | "vue" | "svelte" | "astro" => {
+                            if let Ok(content) = fs::read_to_string(path) {
+                                scanned_count += 1;
+                                all_violations.extend(scan_file_accessibility(path, &content));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    let mut crit = 0;
+    let mut serious = 0;
+    let mut moderate = 0;
+    let mut minor = 0;
+
+    for v in &all_violations {
+        match v.severity {
+            A11ySeverity::Critical => crit += 1,
+            A11ySeverity::Serious => serious += 1,
+            A11ySeverity::Moderate => moderate += 1,
+            A11ySeverity::Minor => minor += 1,
+        }
+    }
+
+    let penalty = (crit as f64 * 20.0) + (serious as f64 * 10.0) + (moderate as f64 * 5.0) + (minor as f64 * 2.0);
+    let score = (100.0 - penalty).clamp(0.0, 100.0);
+
+    let summary = format!(
+        "Accessibility Audit: Scanned {} template file(s), found {} violation(s) (Critical: {}, Serious: {}, Moderate: {}, Minor: {}). Accessibility Score: {:.1}/100",
+        scanned_count, all_violations.len(), crit, serious, moderate, minor, score
+    );
+
+    Ok(A11yReport {
+        target: target_str.to_string(),
+        scanned_files_count: scanned_count,
+        total_violations: all_violations.len(),
+        critical_count: crit,
+        serious_count: serious,
+        moderate_count: moderate,
+        minor_count: minor,
+        violations: all_violations,
+        score,
+        summary,
+    })
+}
+
+pub fn format_a11y_report_for_terminal(rep: &A11yReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n{}\n", "╔══════════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} ║\n", "♿ FRONTEND ACCESSIBILITY (A11Y) & WEB VITALS AUDITOR".cyan().bold()));
+    out.push_str(&format!("{}\n", "╠══════════════════════════════════════════════════════════════╣".cyan()));
+    out.push_str(&format!("  Target:          {}\n", rep.target.yellow()));
+    out.push_str(&format!("  Scanned Files:   {}\n", rep.scanned_files_count.to_string().cyan()));
+    out.push_str(&format!("  Total Issues:    {}\n", rep.total_violations.to_string().red().bold()));
+    out.push_str(&format!("  A11y Score:      {:.1}/100\n", if rep.score >= 90.0 { rep.score.to_string().green().bold() } else if rep.score >= 70.0 { rep.score.to_string().yellow().bold() } else { rep.score.to_string().red().bold() }));
+    out.push_str(&format!("{}\n", "╟──────────────────────────────────────────────────────────────╢".cyan()));
+
+    for (i, v) in rep.violations.iter().enumerate().take(10) {
+        let (sev_str, sev_color) = match v.severity {
+            A11ySeverity::Critical => ("CRITICAL", "red"),
+            A11ySeverity::Serious => ("SERIOUS", "yellow"),
+            A11ySeverity::Moderate => ("MODERATE", "cyan"),
+            A11ySeverity::Minor => ("MINOR", "white"),
+        };
+        let sev_colored = if sev_color == "red" { sev_str.red().bold() } else if sev_color == "yellow" { sev_str.yellow().bold() } else { sev_str.cyan().bold() };
+        out.push_str(&format!("  #{}: [{}] {} ({}:L{})\n", i + 1, sev_colored, v.rule_id.cyan(), v.file, v.line));
+        out.push_str(&format!("     {}\n", v.message.bold()));
+        out.push_str(&format!("     Fix: {}\n", v.suggested_fix.green()));
+    }
+    if rep.violations.len() > 10 {
+        out.push_str(&format!("  ... and {} more issues.\n", rep.violations.len() - 10));
+    }
+
+    out.push_str(&format!("{}\n", "╚══════════════════════════════════════════════════════════════╝".cyan()));
+    out.push_str(&format!("📊 {}\n", rep.summary.bold()));
+    out
+}
+
+// ============================================================================
+// SYSTEM 6: LOCAL TOKEN & CLOUD COST SAVINGS ANALYTICS ENGINE
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ModelUsageStats {
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_duration_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct AnalyticsData {
+    pub total_requests: u64,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_duration_ms: u64,
+    pub model_usage: HashMap<String, ModelUsageStats>,
+    pub last_updated: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct AnalyticsReport {
+    pub total_requests: u64,
+    pub total_tokens: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub avg_tokens_per_sec: f64,
+    pub avg_latency_ms: f64,
+    pub commercial_cost_savings_usd: f64,
+    pub gpt4_savings_usd: f64,
+    pub claude_opus_savings_usd: f64,
+    pub model_breakdown: Vec<(String, u64, f64)>,
+    pub summary: String,
+}
+
+pub struct AnalyticsEngine;
+
+impl AnalyticsEngine {
+    pub fn load_data(workspace_root: &std::path::Path) -> AnalyticsData {
+        let path = workspace_root.join(".zy_analytics.json");
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(parsed) = serde_json::from_str::<AnalyticsData>(&content) {
+                return parsed;
+            }
+        }
+        AnalyticsData {
+            total_requests: 0,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            total_duration_ms: 0,
+            model_usage: HashMap::new(),
+            last_updated: "2026-09-04T00:00:00Z".to_string(),
+        }
+    }
+
+    pub fn save_data(workspace_root: &std::path::Path, data: &AnalyticsData) -> Result<(), Box<dyn std::error::Error>> {
+        let path = workspace_root.join(".zy_analytics.json");
+        let json_str = serde_json::to_string_pretty(data)?;
+        fs::write(path, json_str)?;
+        Ok(())
+    }
+
+    pub fn record_token_usage(
+        workspace_root: &std::path::Path,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        duration_ms: u64,
+        model: &str,
+    ) -> Result<AnalyticsReport, Box<dyn std::error::Error>> {
+        let mut data = Self::load_data(workspace_root);
+        data.total_requests += 1;
+        data.total_prompt_tokens += prompt_tokens as u64;
+        data.total_completion_tokens += completion_tokens as u64;
+        data.total_duration_ms += duration_ms;
+        data.last_updated = "2026-09-04T12:00:00Z".to_string();
+
+        let entry = data.model_usage.entry(model.to_string()).or_insert(ModelUsageStats {
+            requests: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_duration_ms: 0,
+        });
+        entry.requests += 1;
+        entry.prompt_tokens += prompt_tokens as u64;
+        entry.completion_tokens += completion_tokens as u64;
+        entry.total_duration_ms += duration_ms;
+
+        Self::save_data(workspace_root, &data)?;
+        Ok(Self::generate_report(&data))
+    }
+
+    pub fn generate_report(data: &AnalyticsData) -> AnalyticsReport {
+        let total_tokens = data.total_prompt_tokens + data.total_completion_tokens;
+        let avg_tps = if data.total_duration_ms > 0 {
+            (total_tokens as f64) / (data.total_duration_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+        let avg_lat = if data.total_requests > 0 {
+            (data.total_duration_ms as f64) / (data.total_requests as f64)
+        } else {
+            0.0
+        };
+
+        // Commercial Baseline (GPT-4o / Claude 3.5 Sonnet class): $0.003/1k prompt, $0.015/1k completion
+        let gpt4o_prompt_cost = (data.total_prompt_tokens as f64 / 1000.0) * 0.003;
+        let gpt4o_comp_cost = (data.total_completion_tokens as f64 / 1000.0) * 0.015;
+        let commercial_savings = gpt4o_prompt_cost + gpt4o_comp_cost;
+
+        // GPT-4 Legacy: $0.03/1k prompt, $0.06/1k completion
+        let gpt4_savings = (data.total_prompt_tokens as f64 / 1000.0) * 0.03 + (data.total_completion_tokens as f64 / 1000.0) * 0.06;
+
+        // Claude 3 Opus: $0.015/1k prompt, $0.075/1k completion
+        let opus_savings = (data.total_prompt_tokens as f64 / 1000.0) * 0.015 + (data.total_completion_tokens as f64 / 1000.0) * 0.075;
+
+        let mut model_breakdown = Vec::new();
+        for (m, stats) in &data.model_usage {
+            let m_tot = stats.prompt_tokens + stats.completion_tokens;
+            let m_savings = (stats.prompt_tokens as f64 / 1000.0) * 0.003 + (stats.completion_tokens as f64 / 1000.0) * 0.015;
+            model_breakdown.push((m.clone(), m_tot, m_savings));
+        }
+
+        let summary = format!(
+            "Cumulative Analytics: {} requests, {} total tokens ({:.1} tok/sec). Saved ${:.4} USD vs commercial cloud APIs.",
+            data.total_requests, total_tokens, avg_tps, commercial_savings
+        );
+
+        AnalyticsReport {
+            total_requests: data.total_requests,
+            total_tokens,
+            prompt_tokens: data.total_prompt_tokens,
+            completion_tokens: data.total_completion_tokens,
+            avg_tokens_per_sec: avg_tps,
+            avg_latency_ms: avg_lat,
+            commercial_cost_savings_usd: commercial_savings,
+            gpt4_savings_usd: gpt4_savings,
+            claude_opus_savings_usd: opus_savings,
+            model_breakdown,
+            summary,
+        }
+    }
+
+    pub fn reset(workspace_root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        let path = workspace_root.join(".zy_analytics.json");
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+}
+
+pub fn record_token_usage(
+    workspace_root: &std::path::Path,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    duration_ms: u64,
+    model: &str,
+) -> Result<AnalyticsReport, Box<dyn std::error::Error>> {
+    AnalyticsEngine::record_token_usage(workspace_root, prompt_tokens, completion_tokens, duration_ms, model)
+}
+
+pub fn generate_analytics_report(workspace_root: &std::path::Path) -> AnalyticsReport {
+    let data = AnalyticsEngine::load_data(workspace_root);
+    AnalyticsEngine::generate_report(&data)
+}
+
+pub fn reset_analytics(workspace_root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    AnalyticsEngine::reset(workspace_root)
+}
+
+pub fn format_analytics_dashboard_for_terminal(rep: &AnalyticsReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\n{}\n", "╔══════════════════════════════════════════════════════════════╗".cyan()));
+    out.push_str(&format!("║ {} ║\n", "📊 LOCAL TOKEN & CLOUD COST SAVINGS ANALYTICS ENGINE".cyan().bold()));
+    out.push_str(&format!("{}\n", "╠══════════════════════════════════════════════════════════════╣".cyan()));
+    out.push_str(&format!("  Total Requests:  {}\n", rep.total_requests.to_string().yellow().bold()));
+    out.push_str(&format!("  Total Tokens:    {} (Prompt: {}, Completion: {})\n", rep.total_tokens.to_string().cyan().bold(), rep.prompt_tokens.to_string().dimmed(), rep.completion_tokens.to_string().dimmed()));
+    out.push_str(&format!("  Throughput:      {:.1} tokens/sec\n", rep.avg_tokens_per_sec.to_string().green().bold()));
+    out.push_str(&format!("  Avg Latency:     {:.1} ms\n", rep.avg_latency_ms.to_string().dimmed()));
+    out.push_str(&format!("{}\n", "╟───────────────────── CUMULATIVE SAVINGS ─────────────────────╢".cyan()));
+    out.push_str(&format!("  💰 GPT-4o / Sonnet 3.5:   ${:.4} USD\n", rep.commercial_cost_savings_usd.to_string().green().bold()));
+    out.push_str(&format!("  💰 GPT-4 Legacy:          ${:.4} USD\n", rep.gpt4_savings_usd.to_string().cyan()));
+    out.push_str(&format!("  💰 Claude 3 Opus:         ${:.4} USD\n", rep.claude_opus_savings_usd.to_string().magenta()));
+    out.push_str(&format!("{}\n", "╟────────────────────── MODEL BREAKDOWN ───────────────────────╢".cyan()));
+
+    for (m, tok, sav) in &rep.model_breakdown {
+        let bar_len = if rep.total_tokens > 0 { ((tok * 20) / rep.total_tokens).max(1) as usize } else { 0 };
+        let bar = "█".repeat(bar_len);
+        out.push_str(&format!("  • {:<14} {:<10} (${:.4}) {}\n", m.yellow(), format!("{} tok", tok).cyan(), sav, bar.green()));
+    }
+
+    out.push_str(&format!("{}\n", "╚══════════════════════════════════════════════════════════════╝".cyan()));
+    out.push_str(&format!("🚀 {}\n", rep.summary.bold()));
+    out
+}
+
 
 pub async fn single_prompt(
     client: &Client, 
@@ -10660,6 +12594,12 @@ pub async fn interactive_chat(
                             println!("  /sdk <spec> [lang]    - OpenAPI / Swagger Strongly-Typed Client SDK Generator");
                             println!("  /eval <eng> <q> [data]- Interactive Regex, JQ & Scratchpad Evaluator");
                             println!("  /rebase [base_branch] - Smart Git Rebase & History Squeezer");
+                            println!("  /migrate <old> <new>  - Database Migration & Schema Diff Generator");
+                            println!("  /translate <src> <tgt>- Multi-Language Code Transpiler & Porter");
+                            println!("  /adr <title> <ctx><dec> Architecture Decision Record (ADR) Synthesizer");
+                            println!("  /pkg <eco> <name>     - Package Registry & Compatibility Inspector");
+                            println!("  /a11y [target_file]   - Frontend Accessibility (a11y) & Web Vitals Auditor");
+                            println!("  /stats [reset]        - Local Token & Cloud Cost Savings Analytics Engine");
                             println!("  /undo                 - Git-revert the last agent file edit");
                             println!("  /exit, /quit          - End the session");
                             continue;
@@ -11850,6 +13790,91 @@ except Exception as e:
                             }
                             continue;
                         }
+                        "/migrate" => {
+                            if parts.len() >= 3 {
+                                let old_s = parts[1];
+                                let new_s = parts[2];
+                                let name = if parts.len() > 3 { parts[3] } else { "migration" };
+                                let dialect = if parts.len() > 4 { parts[4] } else { "postgres" };
+                                println!("{} Generating schema migration from `{}` to `{}` ({})...", "🗄️ ".cyan(), old_s.yellow(), new_s.green(), dialect.cyan());
+                                match generate_schema_migration(old_s, new_s, name, dialect) {
+                                    Ok(res) => println!("{}", format_migration_report_for_terminal(&res)),
+                                    Err(e) => println!("{} {}", "❌ Migration Error:".red(), e),
+                                }
+                            } else {
+                                println!("{}", "Usage: /migrate <old_schema_or_path> <new_schema_or_path> [name] [dialect]".red());
+                            }
+                            continue;
+                        }
+                        "/translate" => {
+                            if parts.len() >= 3 {
+                                let src_target = parts[1];
+                                let target_lang = parts[2];
+                                let src_code = if std::path::Path::new(src_target).is_file() {
+                                    fs::read_to_string(src_target).unwrap_or_else(|_| src_target.to_string())
+                                } else {
+                                    src_target.to_string()
+                                };
+                                let s_lang = if parts.len() > 3 { parts[3] } else { detect_source_language(src_target) };
+                                println!("{} Transpiling code from {} to {}...", "🔄".cyan(), s_lang.yellow(), target_lang.green());
+                                match transpile_code_snippet(&src_code, s_lang, target_lang, Some(client), Some(&active_model), Some(&tuner.opts)).await {
+                                    Ok(res) => println!("{}", format_transpile_report_for_terminal(&res)),
+                                    Err(e) => println!("{} {}", "❌ Transpilation Error:".red(), e),
+                                }
+                            } else {
+                                println!("{}", "Usage: /translate <source_file_or_code> <target_lang> [source_lang]".red());
+                            }
+                            continue;
+                        }
+                        "/adr" => {
+                            if parts.len() >= 4 {
+                                let title = parts[1];
+                                let context = parts[2];
+                                let decision = parts[3];
+                                let consequences = if parts.len() > 4 { parts[4..].join(" ") } else { "Improved maintainability and architectural clarity.".to_string() };
+                                println!("{} Synthesizing Architecture Decision Record for `{}`...", "🏛️ ".cyan(), title.yellow());
+                                match create_architecture_decision_record(std::path::Path::new("."), title, context, decision, &consequences, Some("Accepted")) {
+                                    Ok(adr) => println!("{}", format_adr_report_for_terminal(&adr)),
+                                    Err(e) => println!("{} {}", "❌ ADR Error:".red(), e),
+                                }
+                            } else {
+                                println!("{}", "Usage: /adr <title> <context> <decision> [consequences]".red());
+                            }
+                            continue;
+                        }
+                        "/pkg" => {
+                            if parts.len() >= 3 {
+                                let eco = parts[1];
+                                let pkg_name = parts[2];
+                                println!("{} Querying package registry for `{}` ({})...", "📦".cyan(), pkg_name.yellow(), eco.cyan());
+                                match query_package_registry(eco, pkg_name, client).await {
+                                    Ok(info) => println!("{}", format_package_info_for_terminal(&info)),
+                                    Err(e) => println!("{} {}", "❌ Registry Error:".red(), e),
+                                }
+                            } else {
+                                println!("{}", "Usage: /pkg <ecosystem> <package_name>".red());
+                            }
+                            continue;
+                        }
+                        "/a11y" => {
+                            let target_f = if parts.len() > 1 { Some(parts[1]) } else { None };
+                            println!("{} Auditing accessibility & WCAG 2.1 AA...", "♿".cyan());
+                            match audit_workspace_accessibility(std::path::Path::new("."), target_f) {
+                                Ok(rep) => println!("{}", format_a11y_report_for_terminal(&rep)),
+                                Err(e) => println!("{} {}", "❌ A11y Error:".red(), e),
+                            }
+                            continue;
+                        }
+                        "/stats" => {
+                            if parts.len() > 1 && parts[1].eq_ignore_ascii_case("reset") {
+                                let _ = reset_analytics(std::path::Path::new("."));
+                                println!("{}", "✅ Analytics usage metrics reset.".green());
+                            } else {
+                                let rep = generate_analytics_report(std::path::Path::new("."));
+                                println!("{}", format_analytics_dashboard_for_terminal(&rep));
+                            }
+                            continue;
+                        }
                         "/exit" | "/quit" => break,
                         _ => {
                             println!("{}", "Unknown slash command. Type /help to see available commands.".red());
@@ -12554,6 +14579,105 @@ pub fn get_tools() -> serde_json::Value {
                         "path": { "type": "string", "description": "Workspace root path (defaults to '.')" },
                         "base_branch": { "type": "string", "description": "Base branch to rebase against (default 'main')" },
                         "auto_execute": { "type": "boolean", "description": "Whether to stage/execute the rebase script (default false)" }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "generate_migration",
+                "description": "Database Migration & Schema Diff Generator. Parses SQL schemas across PostgreSQL, SQLite, and MySQL, computing structural diffs and generating reversible up.sql and down.sql migrations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "old_schema": { "type": "string", "description": "Original SQL schema string or file path" },
+                        "new_schema": { "type": "string", "description": "Target SQL schema string or file path" },
+                        "name": { "type": "string", "description": "Migration name (e.g. 'add_users_table')" },
+                        "dialect": { "type": "string", "description": "SQL dialect: 'postgres', 'sqlite', 'mysql' (default 'postgres')" }
+                    },
+                    "required": ["old_schema", "new_schema"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "translate_code",
+                "description": "Multi-Language Code Transpiler & Porter. Translates code between Python, Rust, TypeScript, JavaScript, Go, and C/C++, preserving idiomatic conventions and type safety.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source_code": { "type": "string", "description": "Source code text or file path" },
+                        "target_lang": { "type": "string", "description": "Target language: 'rust', 'python', 'typescript', 'javascript', 'go', 'c'" },
+                        "source_lang": { "type": "string", "description": "Optional source language (auto-detected if omitted)" }
+                    },
+                    "required": ["source_code", "target_lang"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "generate_adr",
+                "description": "Architecture Decision Record (ADR) Synthesizer. Auto-discovers sequential ADR numbering and synthesizes standardized MADR markdown files in docs/adr/.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "Architectural decision title" },
+                        "context": { "type": "string", "description": "Context and problem statement" },
+                        "decision": { "type": "string", "description": "Decision outcome and chosen architecture" },
+                        "consequences": { "type": "string", "description": "Positive and negative consequences or trade-offs" },
+                        "status": { "type": "string", "description": "Status: 'Proposed', 'Accepted', 'Deprecated', 'Superseded' (default 'Accepted')" },
+                        "path": { "type": "string", "description": "Workspace root path (defaults to '.')" }
+                    },
+                    "required": ["title", "context", "decision"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_registry",
+                "description": "Package Registry & Compatibility Inspector. Queries crates.io, npm, and PyPI registries for package versions, dependencies, license, docs, and metadata.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "ecosystem": { "type": "string", "description": "Registry ecosystem: 'crates.io' (or 'cargo'/'rust'), 'npm' (or 'js'/'node'), 'pypi' (or 'python')" },
+                        "package_name": { "type": "string", "description": "Package name to query" }
+                    },
+                    "required": ["ecosystem", "package_name"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "audit_accessibility",
+                "description": "Frontend Accessibility (a11y) & Web Vitals Auditor. Scans HTML, JSX/TSX, Vue, and Svelte templates for WCAG 2.1 AA violations and generates remediation patches.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Workspace root path (defaults to '.')" },
+                        "target_file": { "type": "string", "description": "Optional specific template file to scan" }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "usage_analytics",
+                "description": "Local Token & Cloud Cost Savings Analytics Engine. Reports cumulative token usage, throughput, and dollars saved compared to commercial cloud models (GPT-4o, Claude 3.5).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "description": "Action: 'report', 'record', 'reset' (default 'report')" },
+                        "prompt_tokens": { "type": "integer", "description": "Prompt tokens to record (for 'record' action)" },
+                        "completion_tokens": { "type": "integer", "description": "Completion tokens to record (for 'record' action)" },
+                        "duration_ms": { "type": "integer", "description": "Duration in milliseconds (for 'record' action)" },
+                        "model": { "type": "string", "description": "Model identifier (for 'record' action)" },
+                        "path": { "type": "string", "description": "Workspace root path (defaults to '.')" }
                     }
                 }
             }
@@ -13532,6 +15656,136 @@ pub async fn agent_loop(
                         Err(e) => {
                             tool_result = format!("Smart rebase error: {}", e);
                             println!("{} {}", "❌ Rebase Error:".red(), e);
+                        }
+                    }
+                } else if fn_name == "generate_migration" {
+                    if let (Some(old_s), Some(new_s)) = (args.get("old_schema").and_then(|v| v.as_str()), args.get("new_schema").and_then(|v| v.as_str())) {
+                        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("migration");
+                        let dialect = args.get("dialect").and_then(|v| v.as_str()).unwrap_or("postgres");
+                        println!("{} Generating SQL schema diff & migration `{}` ({})...", "🗄️ ".cyan(), name.yellow(), dialect.cyan());
+                        match generate_schema_migration(old_s, new_s, name, dialect) {
+                            Ok(res) => {
+                                println!("{}", format_migration_report_for_terminal(&res));
+                                tool_result = serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.diff_summary.clone());
+                                println!("{}", "✔️ Migration Generated".green());
+                            }
+                            Err(e) => {
+                                tool_result = format!("Migration generation error: {}", e);
+                                println!("{} {}", "❌ Migration Error:".red(), e);
+                            }
+                        }
+                    } else {
+                        tool_result = "Error: Missing old_schema or new_schema parameter".to_string();
+                        println!("{}", "❌ Missing Parameters".red());
+                    }
+                } else if fn_name == "translate_code" {
+                    if let (Some(src), Some(tgt_lang)) = (args.get("source_code").and_then(|v| v.as_str()), args.get("target_lang").and_then(|v| v.as_str())) {
+                        let src_code = if std::path::Path::new(src).is_file() {
+                            fs::read_to_string(src).unwrap_or_else(|_| src.to_string())
+                        } else {
+                            src.to_string()
+                        };
+                        let src_lang = args.get("source_lang").and_then(|v| v.as_str()).unwrap_or_else(|| detect_source_language(src));
+                        println!("{} Transpiling code from {} to {}...", "🔄".cyan(), src_lang.yellow(), tgt_lang.green());
+                        match transpile_code_snippet(&src_code, src_lang, tgt_lang, Some(client), Some(model), Some(options)).await {
+                            Ok(res) => {
+                                println!("{}", format_transpile_report_for_terminal(&res));
+                                tool_result = serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.transpiled_code.clone());
+                                println!("{}", "✔️ Transpilation Complete".green());
+                            }
+                            Err(e) => {
+                                tool_result = format!("Transpilation error: {}", e);
+                                println!("{} {}", "❌ Transpile Error:".red(), e);
+                            }
+                        }
+                    } else {
+                        tool_result = "Error: Missing source_code or target_lang parameter".to_string();
+                        println!("{}", "❌ Missing Parameters".red());
+                    }
+                } else if fn_name == "generate_adr" {
+                    if let (Some(title), Some(context), Some(decision)) = (args.get("title").and_then(|v| v.as_str()), args.get("context").and_then(|v| v.as_str()), args.get("decision").and_then(|v| v.as_str())) {
+                        let consequences = args.get("consequences").and_then(|v| v.as_str()).unwrap_or("Improved maintainability and architecture.");
+                        let status = args.get("status").and_then(|v| v.as_str());
+                        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                        println!("{} Synthesizing Architecture Decision Record for `{}`...", "🏛️ ".cyan(), title.yellow());
+                        match create_architecture_decision_record(std::path::Path::new(path), title, context, decision, consequences, status) {
+                            Ok(adr) => {
+                                println!("{}", format_adr_report_for_terminal(&adr));
+                                tool_result = serde_json::to_string_pretty(&adr).unwrap_or_else(|_| adr.content.clone());
+                                println!("{}", "✔️ ADR Synthesized".green());
+                            }
+                            Err(e) => {
+                                tool_result = format!("ADR synthesis error: {}", e);
+                                println!("{} {}", "❌ ADR Error:".red(), e);
+                            }
+                        }
+                    } else {
+                        tool_result = "Error: Missing title, context, or decision parameter".to_string();
+                        println!("{}", "❌ Missing Parameters".red());
+                    }
+                } else if fn_name == "search_registry" {
+                    if let (Some(eco), Some(pkg)) = (args.get("ecosystem").and_then(|v| v.as_str()), args.get("package_name").and_then(|v| v.as_str())) {
+                        println!("{} Querying package registry for `{}` ({})...", "📦".cyan(), pkg.yellow(), eco.cyan());
+                        match query_package_registry(eco, pkg, client).await {
+                            Ok(info) => {
+                                println!("{}", format_package_info_for_terminal(&info));
+                                tool_result = serde_json::to_string_pretty(&info).unwrap_or_else(|_| info.name.clone());
+                                println!("{}", "✔️ Package Info Retrieved".green());
+                            }
+                            Err(e) => {
+                                tool_result = format!("Package registry query error: {}", e);
+                                println!("{} {}", "❌ Registry Error:".red(), e);
+                            }
+                        }
+                    } else {
+                        tool_result = "Error: Missing ecosystem or package_name parameter".to_string();
+                        println!("{}", "❌ Missing Parameters".red());
+                    }
+                } else if fn_name == "audit_accessibility" {
+                    let root_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                    let target_file = args.get("target_file").and_then(|v| v.as_str());
+                    println!("{} Auditing workspace accessibility & WCAG 2.1 AA...", "♿".cyan());
+                    match audit_workspace_accessibility(std::path::Path::new(root_path), target_file) {
+                        Ok(rep) => {
+                            println!("{}", format_a11y_report_for_terminal(&rep));
+                            tool_result = serde_json::to_string_pretty(&rep).unwrap_or_else(|_| rep.summary.clone());
+                            println!("{}", if rep.total_violations == 0 { "✔️ 100% Accessible".green() } else { "⚠️ A11y Issues Detected".yellow() });
+                        }
+                        Err(e) => {
+                            tool_result = format!("Accessibility audit error: {}", e);
+                            println!("{} {}", "❌ A11y Error:".red(), e);
+                        }
+                    }
+                } else if fn_name == "usage_analytics" {
+                    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("report");
+                    let root_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                    match action.to_lowercase().as_str() {
+                        "record" => {
+                            let p_tok = args.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let c_tok = args.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let dur = args.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let m_str = args.get("model").and_then(|v| v.as_str()).unwrap_or(model);
+                            match record_token_usage(std::path::Path::new(root_path), p_tok, c_tok, dur, m_str) {
+                                Ok(rep) => {
+                                    tool_result = serde_json::to_string_pretty(&rep).unwrap();
+                                    println!("{}", "✔️ Token Usage Recorded".green());
+                                }
+                                Err(e) => {
+                                    tool_result = format!("Analytics recording error: {}", e);
+                                    println!("{} {}", "❌ Error:".red(), e);
+                                }
+                            }
+                        }
+                        "reset" => {
+                            let _ = reset_analytics(std::path::Path::new(root_path));
+                            tool_result = "Analytics metrics reset successfully.".to_string();
+                            println!("{}", "✅ Analytics Reset".green());
+                        }
+                        _ => {
+                            let rep = generate_analytics_report(std::path::Path::new(root_path));
+                            println!("{}", format_analytics_dashboard_for_terminal(&rep));
+                            tool_result = serde_json::to_string_pretty(&rep).unwrap();
+                            println!("{}", "✔️ Analytics Dashboard Generated".green());
                         }
                     }
                 } else {

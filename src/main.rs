@@ -196,6 +196,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("{}", format_rebase_plan_for_terminal(&plan));
         }
+        Some(Commands::Migrate { old_schema, new_schema, name, dialect, write_files }) => {
+            let res = generate_schema_migration(old_schema, new_schema, name, dialect)?;
+            if *write_files {
+                let dir = std::path::Path::new("migrations");
+                let _ = std::fs::create_dir_all(dir);
+                let up_file = dir.join(format!("{}_up.sql", name));
+                let down_file = dir.join(format!("{}_down.sql", name));
+                std::fs::write(&up_file, &res.up_sql)?;
+                std::fs::write(&down_file, &res.down_sql)?;
+                println!("Saved migration files:\n  - {}\n  - {}", up_file.display(), down_file.display());
+            }
+            println!("{}", format_migration_report_for_terminal(&res));
+        }
+        Some(Commands::Translate { source, target_lang, source_lang, output }) => {
+            let src_code = if std::path::Path::new(source).is_file() {
+                std::fs::read_to_string(source)?
+            } else {
+                source.clone()
+            };
+            let s_lang = source_lang.as_deref().unwrap_or_else(|| detect_source_language(source));
+            let res = transpile_code_snippet(&src_code, s_lang, target_lang, Some(&client), Some(&cli.model), None).await?;
+            if let Some(out_p) = output {
+                std::fs::write(out_p, &res.transpiled_code)?;
+                println!("Saved transpiled code to {}", out_p);
+            }
+            println!("{}", format_transpile_report_for_terminal(&res));
+        }
+        Some(Commands::Adr { title, context, decision, consequences, status, path }) => {
+            let res = create_architecture_decision_record(std::path::Path::new(path), title, context, decision, consequences, Some(status.as_str()))?;
+            println!("{}", format_adr_report_for_terminal(&res));
+        }
+        Some(Commands::Pkg { ecosystem, package }) => {
+            let info = query_package_registry(ecosystem, package, &client).await?;
+            println!("{}", format_package_info_for_terminal(&info));
+        }
+        Some(Commands::A11y { target, path }) => {
+            let rep = audit_workspace_accessibility(std::path::Path::new(path), target.as_deref())?;
+            println!("{}", format_a11y_report_for_terminal(&rep));
+        }
+        Some(Commands::Stats { path, reset }) => {
+            if *reset {
+                reset_analytics(std::path::Path::new(path))?;
+                println!("Analytics usage metrics reset successfully.");
+            } else {
+                let rep = generate_analytics_report(std::path::Path::new(path));
+                println!("{}", format_analytics_dashboard_for_terminal(&rep));
+            }
+        }
         None => {
             if cli.tui {
                 let tuner = run_ai_tuner(0.1, true);

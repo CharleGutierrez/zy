@@ -3379,3 +3379,612 @@ fn test_brutal_edge_cases_across_6_new_systems() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+// ============================================================================
+// SYSTEM 8: DATABASE MIGRATION & SCHEMA DIFF GENERATOR TESTS
+// ============================================================================
+
+#[test]
+fn test_database_migration_and_schema_diff_generator() {
+    let old_schema = r#"
+        -- Initial Schema
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            username VARCHAR(50) NOT NULL,
+            email VARCHAR(100) UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE posts (
+            id INTEGER PRIMARY KEY,
+            author_id INTEGER REFERENCES users(id),
+            title VARCHAR(200) NOT NULL,
+            content TEXT
+        );
+
+        CREATE INDEX idx_users_email ON users (email);
+    "#;
+
+    let new_schema = r#"
+        -- Target Schema with additions and modifications
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            username VARCHAR(50) NOT NULL,
+            email VARCHAR(100) UNIQUE,
+            role VARCHAR(20) DEFAULT 'member',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE posts (
+            id INTEGER PRIMARY KEY,
+            author_id INTEGER REFERENCES users(id),
+            title VARCHAR(200) NOT NULL,
+            body TEXT,
+            view_count INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE comments (
+            id INTEGER PRIMARY KEY,
+            post_id INTEGER REFERENCES posts(id),
+            commenter VARCHAR(50) NOT NULL,
+            text TEXT NOT NULL
+        );
+
+        CREATE INDEX idx_users_email ON users (email);
+        CREATE INDEX idx_posts_author ON posts (author_id);
+    "#;
+
+    // 1. Test Schema Parsing
+    let old_parsed = parse_sql_schema(old_schema);
+    assert_eq!(old_parsed.tables.len(), 2);
+    assert!(old_parsed.tables.contains_key("users"));
+    assert!(old_parsed.tables.contains_key("posts"));
+    assert_eq!(old_parsed.standalone_indexes.len(), 1);
+
+    let new_parsed = parse_sql_schema(new_schema);
+    assert_eq!(new_parsed.tables.len(), 3);
+    assert!(new_parsed.tables.contains_key("comments"));
+    assert_eq!(new_parsed.standalone_indexes.len(), 2);
+
+    // 2. Test Schema Diff Computation
+    let diff = compute_schema_diff(&old_parsed, &new_parsed, "postgres");
+    assert_eq!(diff.added_tables.len(), 1);
+    assert_eq!(diff.added_tables[0].name, "comments");
+    assert_eq!(diff.dropped_tables.len(), 0);
+    assert_eq!(diff.added_indexes.len(), 1);
+    assert_eq!(diff.added_indexes[0].name, "idx_posts_author");
+
+    // 3. Test Migration Generation (Postgres)
+    let migration_pg = generate_schema_migration(old_schema, new_schema, "v2_add_comments_and_roles", "postgres").expect("Postgres migration generation failed");
+    assert_eq!(migration_pg.name, "v2_add_comments_and_roles");
+    assert_eq!(migration_pg.dialect, "postgres");
+    assert!(migration_pg.up_sql.contains("CREATE TABLE comments"));
+    assert!(migration_pg.up_sql.contains("ALTER TABLE users ADD COLUMN role"));
+    assert!(migration_pg.up_sql.contains("CREATE INDEX IF NOT EXISTS idx_posts_author"));
+    assert!(migration_pg.down_sql.contains("DROP TABLE IF EXISTS comments"));
+    assert!(migration_pg.down_sql.contains("ALTER TABLE users DROP COLUMN role"));
+    assert!(migration_pg.down_sql.contains("DROP INDEX IF EXISTS idx_posts_author"));
+
+    // 4. Test Migration Generation (SQLite)
+    let migration_sqlite = generate_schema_migration(old_schema, new_schema, "v2_sqlite", "sqlite").expect("SQLite migration failed");
+    assert_eq!(migration_sqlite.dialect, "sqlite");
+    assert!(migration_sqlite.up_sql.contains("CREATE TABLE comments"));
+
+    // 5. Test Migration from File Paths
+    let temp_dir = std::env::temp_dir().join(format!("zy_mig_test_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let old_file = temp_dir.join("schema_v1.sql");
+    let new_file = temp_dir.join("schema_v2.sql");
+    std::fs::write(&old_file, old_schema).unwrap();
+    std::fs::write(&new_file, new_schema).unwrap();
+
+    let file_mig = generate_schema_migration(old_file.to_str().unwrap(), new_file.to_str().unwrap(), "file_based_mig", "postgres").expect("File based migration failed");
+    assert_eq!(file_mig.added_tables.len(), 1);
+    assert_eq!(file_mig.added_tables[0], "comments");
+
+    // 6. Test Terminal Formatting
+    let term_out = format_migration_report_for_terminal(&migration_pg);
+    assert!(term_out.contains("DATABASE MIGRATION & SCHEMA DIFF GENERATOR"));
+    assert!(term_out.contains("v2_add_comments_and_roles"));
+    assert!(term_out.contains("comments"));
+
+    // 7. Verify generate_migration in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("generate_migration"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 9: MULTI-LANGUAGE CODE TRANSPILER & PORTER TESTS
+// ============================================================================
+
+#[test]
+fn test_multilanguage_code_transpiler_and_porter() {
+    // 1. Test Language Detection
+    assert_eq!(detect_source_language("app.py"), "python");
+    assert_eq!(detect_source_language("main.rs"), "rust");
+    assert_eq!(detect_source_language("service.ts"), "typescript");
+    assert_eq!(detect_source_language("index.js"), "javascript");
+    assert_eq!(detect_source_language("server.go"), "go");
+    assert_eq!(detect_source_language("driver.c"), "c");
+
+    // 2. Test Python to Rust Transpilation (Offline Rule Engine)
+    let py_code = r#"
+def calculate_tax(amount: float, rate: float):
+    if amount < 0:
+        raise ValueError("Amount cannot be negative")
+    print(amount * rate)
+    return amount * rate
+"#;
+    let py_res = transpile_code_offline(py_code, "python", "rust").expect("Py to Rust transpilation failed");
+    assert_eq!(py_res.source_language, "python");
+    assert_eq!(py_res.target_language, "rust");
+    assert!(py_res.transpiled_code.contains("pub fn calculate_tax"));
+    assert!(py_res.transpiled_code.contains("Result<"));
+    assert!(py_res.transpiled_code.contains("println!"));
+    assert!(py_res.transpiled_code.contains("return Err"));
+    assert!(!py_res.idiomatic_conversions.is_empty());
+    assert!(!py_res.diff_preview.is_empty());
+
+    // 3. Test C to Safe Rust Transpilation
+    let c_code = r#"
+#include <stdio.h>
+#include <stdlib.h>
+
+int main() {
+    char* buffer = (char*)malloc(1024);
+    printf("Hello from C\n");
+    free(buffer);
+    return 0;
+}
+"#;
+    let c_res = transpile_code_offline(c_code, "c", "rust").expect("C to Rust transpilation failed");
+    assert_eq!(c_res.source_language, "c");
+    assert_eq!(c_res.target_language, "rust");
+    assert!(c_res.transpiled_code.contains("pub fn main"));
+    assert!(c_res.transpiled_code.contains("println!"));
+    assert!(c_res.transpiled_code.contains("Vec::with_capacity") || c_res.transpiled_code.contains("buffer"));
+    assert!(c_res.transpiled_code.contains("Drop") || !c_res.transpiled_code.contains("free("));
+
+    // 4. Test Python to Go Transpilation
+    let py_go_code = r#"
+def process_data():
+    print("processing...")
+    raise Exception("Failed to process")
+"#;
+    let go_res = transpile_code_offline(py_go_code, "python", "go").expect("Py to Go transpilation failed");
+    assert_eq!(go_res.target_language, "go");
+    assert!(go_res.transpiled_code.contains("package main"));
+    assert!(go_res.transpiled_code.contains("func process_data() error"));
+    assert!(go_res.transpiled_code.contains("fmt.Println"));
+    assert!(go_res.transpiled_code.contains("fmt.Errorf"));
+
+    // 5. Test JavaScript to TypeScript Transpilation
+    let js_code = r#"
+const user = { name: "Alice", age: 30 };
+function getUser() {
+    return user;
+}
+"#;
+    let ts_res = transpile_code_offline(js_code, "javascript", "typescript").expect("JS to TS transpilation failed");
+    assert_eq!(ts_res.target_language, "typescript");
+    assert!(ts_res.transpiled_code.contains("interface"));
+    assert!(ts_res.transpiled_code.contains("export function getUser"));
+
+    // 6. Test Terminal Formatting
+    let term_out = format_transpile_report_for_terminal(&py_res);
+    assert!(term_out.contains("MULTI-LANGUAGE CODE TRANSPILER & PORTER"));
+    assert!(term_out.contains("Source Language:"));
+    assert!(term_out.contains("python"));
+    assert!(term_out.contains("rust"));
+
+    // 7. Verify translate_code in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("translate_code"));
+}
+
+// ============================================================================
+// SYSTEM 10: ARCHITECTURE DECISION RECORD (ADR) SYNTHESIZER TESTS
+// ============================================================================
+
+#[test]
+fn test_architecture_decision_record_synthesizer() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_adr_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Test Slugify
+    assert_eq!(slugify("Use PostgreSQL for Primary Storage"), "use-postgresql-for-primary-storage");
+    assert_eq!(slugify("Adopt Rust & WebAssembly (Wasm)!"), "adopt-rust-webassembly-wasm");
+    assert_eq!(slugify("  Multiple   Spaces --- And Symbols #123  "), "multiple-spaces-and-symbols-123");
+
+    // 2. Test Sequential ADR Creation
+    let adr1 = create_architecture_decision_record(
+        &temp_dir,
+        "Adopt PostgreSQL as Core Relational Store",
+        "The system requires ACID guarantees, concurrent transactional consistency, and rich JSONB querying capabilities.",
+        "We choose PostgreSQL 16 as the primary relational database system.",
+        "Ensures ACID compliance and rich indexing; requires managed infrastructure maintenance.",
+        Some("Accepted"),
+    ).expect("Creating ADR 1 failed");
+
+    assert_eq!(adr1.id, 1);
+    assert_eq!(adr1.slug, "adopt-postgresql-as-core-relational-store");
+    assert_eq!(adr1.status, "Accepted");
+    assert!(adr1.file_path.exists());
+    assert!(adr1.content.contains("# ADR-0001: Adopt PostgreSQL as Core Relational Store"));
+    assert!(adr1.content.contains("Context and Problem Statement"));
+    assert!(adr1.content.contains("ACID guarantees"));
+
+    // 3. Test Next Index Discovery for ADR 2
+    let adr2 = create_architecture_decision_record(
+        &temp_dir,
+        "Implement Ephemeral In-Memory Cache with Redis",
+        "High frequency read endpoints require sub-millisecond response latency.",
+        "Deploy standalone Redis cluster for session caching and rate-limiting.",
+        "Reduces database read load by 80%; adds cache invalidation complexity.",
+        Some("Proposed"),
+    ).expect("Creating ADR 2 failed");
+
+    assert_eq!(adr2.id, 2);
+    assert_eq!(adr2.slug, "implement-ephemeral-in-memory-cache-with-redis");
+    assert_eq!(adr2.status, "Proposed");
+    assert!(adr2.content.contains("# ADR-0002: Implement Ephemeral In-Memory Cache with Redis"));
+
+    // 4. Test List Existing ADRs
+    let adr_list = list_existing_adrs(&temp_dir).expect("Listing ADRs failed");
+    assert_eq!(adr_list.len(), 2);
+    assert_eq!(adr_list[0].id, 1);
+    assert_eq!(adr_list[1].id, 2);
+
+    // 5. Test Terminal Formatting
+    let term_out = format_adr_report_for_terminal(&adr1);
+    assert!(term_out.contains("ARCHITECTURE DECISION RECORD (ADR) SYNTHESIZER"));
+    assert!(term_out.contains("ADR-0001"));
+    assert!(term_out.contains("Adopt PostgreSQL"));
+
+    // 6. Verify generate_adr in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("generate_adr"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 11: PACKAGE REGISTRY & COMPATIBILITY INSPECTOR TESTS
+// ============================================================================
+
+#[test]
+fn test_package_registry_and_compatibility_inspector() {
+    // 1. Test crates.io Registry JSON Parser
+    let crates_io_raw = r#"{
+        "crate": {
+            "name": "serde",
+            "max_version": "1.0.210",
+            "description": "A generic serialization/deserialization framework",
+            "homepage": "https://serde.rs",
+            "repository": "https://github.com/serde-rs/serde",
+            "documentation": "https://docs.rs/serde",
+            "downloads": 450000000,
+            "keywords": ["serde", "serialization", "no_std"]
+        },
+        "versions": [
+            {
+                "num": "1.0.210",
+                "license": "MIT OR Apache-2.0",
+                "features": {
+                    "derive": ["serde_derive"],
+                    "std": [],
+                    "alloc": []
+                }
+            }
+        ]
+    }"#;
+
+    let crate_info = parse_package_registry_response("crates.io", "serde", crates_io_raw).expect("Parsing crates.io response failed");
+    assert_eq!(crate_info.name, "serde");
+    assert_eq!(crate_info.ecosystem, "crates.io");
+    assert_eq!(crate_info.latest_version, "1.0.210");
+    assert_eq!(crate_info.license.as_deref(), Some("MIT OR Apache-2.0"));
+    assert_eq!(crate_info.homepage.as_deref(), Some("https://serde.rs"));
+    assert!(crate_info.features.contains(&"derive".to_string()));
+    assert_eq!(crate_info.downloads, Some(450000000));
+
+    // 2. Test npm Registry JSON Parser
+    let npm_raw = r#"{
+        "name": "react",
+        "description": "React is a JavaScript library for building user interfaces.",
+        "dist-tags": { "latest": "18.3.1" },
+        "license": "MIT",
+        "homepage": "https://react.dev/",
+        "repository": { "type": "git", "url": "https://github.com/facebook/react.git" },
+        "keywords": ["react", "ui", "virtual-dom"],
+        "versions": {
+            "18.3.1": {
+                "dependencies": {
+                    "loose-envify": "^1.1.0"
+                }
+            }
+        }
+    }"#;
+
+    let npm_info = parse_package_registry_response("npm", "react", npm_raw).expect("Parsing npm response failed");
+    assert_eq!(npm_info.name, "react");
+    assert_eq!(npm_info.ecosystem, "npm");
+    assert_eq!(npm_info.latest_version, "18.3.1");
+    assert_eq!(npm_info.license.as_deref(), Some("MIT"));
+    assert!(npm_info.dependencies.iter().any(|d| d.starts_with("loose-envify")));
+
+    // 3. Test PyPI Registry JSON Parser
+    let pypi_raw = r#"{
+        "info": {
+            "name": "requests",
+            "version": "2.32.3",
+            "summary": "Python HTTP for Humans.",
+            "license": "Apache-2.0",
+            "home_page": "https://requests.readthedocs.io",
+            "project_urls": {
+                "Documentation": "https://requests.readthedocs.io",
+                "Repository": "https://github.com/psf/requests"
+            },
+            "requires_dist": [
+                "charset-normalizer<4,>=2",
+                "idna<4,>=2.5",
+                "urllib3<3,>=1.21.1",
+                "certifi>=2017.4.17"
+            ]
+        }
+    }"#;
+
+    let pypi_info = parse_package_registry_response("pypi", "requests", pypi_raw).expect("Parsing pypi response failed");
+    assert_eq!(pypi_info.name, "requests");
+    assert_eq!(pypi_info.ecosystem, "pypi");
+    assert_eq!(pypi_info.latest_version, "2.32.3");
+    assert_eq!(pypi_info.license.as_deref(), Some("Apache-2.0"));
+    assert_eq!(pypi_info.dependencies.len(), 4);
+
+    // 4. Test Terminal Formatting
+    let term_out = format_package_info_for_terminal(&crate_info);
+    assert!(term_out.contains("PACKAGE REGISTRY & COMPATIBILITY INSPECTOR"));
+    assert!(term_out.contains("serde"));
+    assert!(term_out.contains("1.0.210"));
+
+    // 5. Verify search_registry in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("search_registry"));
+}
+
+// ============================================================================
+// SYSTEM 12: FRONTEND ACCESSIBILITY (A11Y) & WEB VITALS AUDITOR TESTS
+// ============================================================================
+
+#[test]
+fn test_frontend_accessibility_and_web_vitals_auditor() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_a11y_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    let bad_html_content = r#"
+<html>
+<head><title>Test Page</title></head>
+<body>
+    <h1>Welcome to Dashboard</h1>
+    <h3>Skipped heading level 2 directly to 3</h3>
+
+    <!-- Missing alt on img -->
+    <img src="/avatar.png" />
+
+    <!-- Button without accessible name -->
+    <button class="icon-btn"><svg></svg></button>
+
+    <!-- Form control without label -->
+    <input type="text" placeholder="Enter username" />
+
+    <!-- Non-interactive element with click listener without key listener or role -->
+    <div onClick={handleClick}>Clickable Card</div>
+
+    <!-- Iframe without title -->
+    <iframe src="https://example.com/embed"></iframe>
+</body>
+</html>
+"#;
+
+    let bad_file = temp_dir.join("index.html");
+    std::fs::write(&bad_file, bad_html_content).unwrap();
+
+    // 1. Audit Target File
+    let report = audit_workspace_accessibility(&temp_dir, Some("index.html")).expect("Auditing accessibility failed");
+    assert_eq!(report.scanned_files_count, 1);
+    assert!(report.total_violations >= 5);
+    assert!(report.critical_count >= 1); // missing alt
+    assert!(report.serious_count >= 2);  // button without name, input without label, non-interactive click
+    assert!(report.moderate_count >= 1); // html missing lang, iframe missing title
+    assert!(report.score < 80.0);
+
+    // 2. Verify Violation Rules
+    let rule_ids: Vec<String> = report.violations.iter().map(|v| v.rule_id.clone()).collect();
+    assert!(rule_ids.contains(&"image-alt".to_string()));
+    assert!(rule_ids.contains(&"button-name".to_string()));
+    assert!(rule_ids.contains(&"form-control-label".to_string()));
+    assert!(rule_ids.contains(&"html-has-lang".to_string()));
+    assert!(rule_ids.contains(&"click-events-have-key-events".to_string()));
+    assert!(rule_ids.contains(&"iframe-title".to_string()));
+    assert!(rule_ids.contains(&"heading-order".to_string()));
+
+    // 3. Test Clean Accessible Component
+    let clean_jsx_content = r#"
+<html lang="en">
+<body>
+    <h1>Profile</h1>
+    <h2>Personal Details</h2>
+    <img src="/avatar.png" alt="User profile avatar photo" />
+    <button aria-label="Submit profile form">Submit</button>
+    <label for="uname">Username</label>
+    <input id="uname" type="text" />
+</body>
+</html>
+"#;
+    let clean_file = temp_dir.join("clean.html");
+    std::fs::write(&clean_file, clean_jsx_content).unwrap();
+
+    let clean_report = audit_workspace_accessibility(&temp_dir, Some("clean.html")).expect("Auditing clean file failed");
+    assert_eq!(clean_report.total_violations, 0);
+    assert_eq!(clean_report.score, 100.0);
+
+    // 4. Test Terminal Formatting
+    let term_out = format_a11y_report_for_terminal(&report);
+    assert!(term_out.contains("FRONTEND ACCESSIBILITY (A11Y) & WEB VITALS AUDITOR"));
+    assert!(term_out.contains("image-alt"));
+    assert!(term_out.contains("button-name"));
+
+    // 5. Verify audit_accessibility in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("audit_accessibility"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 13: LOCAL TOKEN & CLOUD COST SAVINGS ANALYTICS ENGINE TESTS
+// ============================================================================
+
+#[test]
+fn test_local_token_and_cloud_cost_savings_analytics_engine() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_analytics_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Reset initial analytics
+    reset_analytics(&temp_dir).expect("Reset analytics failed");
+
+    // 2. Record First Inference Batch
+    // 500 prompt tokens, 200 completion tokens, 1000ms latency, model "llama3:8b"
+    let rep1 = record_token_usage(&temp_dir, 500, 200, 1000, "llama3:8b").expect("Recording token usage 1 failed");
+    assert_eq!(rep1.total_requests, 1);
+    assert_eq!(rep1.prompt_tokens, 500);
+    assert_eq!(rep1.completion_tokens, 200);
+    assert_eq!(rep1.total_tokens, 700);
+    assert!((rep1.avg_tokens_per_sec - 700.0).abs() < 1.0);
+
+    // Savings computation check:
+    // (500 / 1000 * 0.003) + (200 / 1000 * 0.015) = 0.0015 + 0.0030 = 0.0045 USD
+    assert!((rep1.commercial_cost_savings_usd - 0.0045).abs() < 0.0001);
+
+    // 3. Record Second Inference Batch (accumulative persistence)
+    // 1500 prompt tokens, 800 completion tokens, 2000ms latency, model "qwen2.5-coder:7b"
+    let rep2 = record_token_usage(&temp_dir, 1500, 800, 2000, "qwen2.5-coder:7b").expect("Recording token usage 2 failed");
+    assert_eq!(rep2.total_requests, 2);
+    assert_eq!(rep2.prompt_tokens, 2000);
+    assert_eq!(rep2.completion_tokens, 1000);
+    assert_eq!(rep2.total_tokens, 3000);
+    assert_eq!(rep2.model_breakdown.len(), 2);
+
+    // Total savings:
+    // Prompt: 2000 / 1000 * 0.003 = 0.006
+    // Completion: 1000 / 1000 * 0.015 = 0.015
+    // Total = 0.021 USD
+    assert!((rep2.commercial_cost_savings_usd - 0.021).abs() < 0.0001);
+    assert!(rep2.gpt4_savings_usd > rep2.commercial_cost_savings_usd);
+    assert!(rep2.claude_opus_savings_usd > rep2.commercial_cost_savings_usd);
+
+    // 4. Generate Report on workspace
+    let final_rep = generate_analytics_report(&temp_dir);
+    assert_eq!(final_rep.total_requests, 2);
+    assert_eq!(final_rep.total_tokens, 3000);
+
+    // 5. Test Terminal Formatting Dashboard
+    let term_out = format_analytics_dashboard_for_terminal(&final_rep);
+    assert!(term_out.contains("LOCAL TOKEN & CLOUD COST SAVINGS ANALYTICS ENGINE"));
+    assert!(term_out.contains("Total Requests:"));
+    assert!(term_out.contains("CUMULATIVE SAVINGS"));
+    assert!(term_out.contains("MODEL BREAKDOWN"));
+    assert!(term_out.contains("llama3:8b"));
+    assert!(term_out.contains("qwen2.5-coder:7b"));
+
+    // 6. Test Analytics Reset
+    reset_analytics(&temp_dir).expect("Resetting analytics failed");
+    let after_reset = generate_analytics_report(&temp_dir);
+    assert_eq!(after_reset.total_requests, 0);
+    assert_eq!(after_reset.total_tokens, 0);
+
+    // 7. Verify usage_analytics in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("usage_analytics"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ============================================================================
+// SYSTEM 14: BRUTAL EDGE CASES ACROSS ALL 6 LATEST SYSTEMS
+// ============================================================================
+
+#[test]
+fn test_brutal_edge_cases_across_6_latest_systems() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_brutal_latest6_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Migration: completely empty and malformed SQL
+    let empty_mig = generate_schema_migration("", "", "empty_mig", "postgres").unwrap();
+    assert_eq!(empty_mig.added_tables.len(), 0);
+    assert_eq!(empty_mig.dropped_tables.len(), 0);
+
+    // Complex nested types and comments
+    let complex_sql = r#"
+        /* Big Block Comment */
+        CREATE TABLE complex (
+            id SERIAL PRIMARY KEY,
+            balance NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+            metadata JSONB,
+            CONSTRAINT check_positive CHECK (balance >= 0)
+        );
+    "#;
+    let parsed_complex = parse_sql_schema(complex_sql);
+    assert!(parsed_complex.tables.contains_key("complex"));
+    let col_balance = parsed_complex.tables["complex"].columns.iter().find(|c| c.name == "balance").unwrap();
+    assert!(!col_balance.nullable);
+
+    // 2. Transpiler: empty string and unknown languages
+    let empty_trans = transpile_code_offline("", "unknown", "unknown").unwrap();
+    assert_eq!(empty_trans.original_code, "");
+
+    // 3. ADR: Slugify empty and weird characters
+    assert_eq!(slugify(""), "");
+    assert_eq!(slugify("$$$###@@@"), "");
+    let adr_weird = create_architecture_decision_record(&temp_dir, "ADR Title With & Symbols $100", "Ctx", "Dec", "Con", None).unwrap();
+    assert_eq!(adr_weird.id, 1);
+    assert!(adr_weird.file_path.exists());
+
+    // 4. Package Registry: malformed and partial JSON
+    let bad_json = parse_package_registry_response("crates.io", "bad", "{}");
+    assert!(bad_json.is_err());
+
+    let mini_pypi = parse_package_registry_response("pypi", "mini", r#"{"info": {"name": "mini", "version": "0.0.1"}}"#).unwrap();
+    assert_eq!(mini_pypi.latest_version, "0.0.1");
+
+    // 5. A11y: Empty directory audit
+    let empty_dir = temp_dir.join("empty_dir");
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let empty_a11y = audit_workspace_accessibility(&empty_dir, None).unwrap();
+    assert_eq!(empty_a11y.scanned_files_count, 0);
+    assert_eq!(empty_a11y.total_violations, 0);
+    assert_eq!(empty_a11y.score, 100.0);
+
+    // 6. Analytics: Zero requests calculations
+    let zero_report = AnalyticsEngine::generate_report(&AnalyticsData {
+        total_requests: 0,
+        total_prompt_tokens: 0,
+        total_completion_tokens: 0,
+        total_duration_ms: 0,
+        model_usage: std::collections::HashMap::new(),
+        last_updated: "2026-09-04T00:00:00Z".to_string(),
+    });
+    assert_eq!(zero_report.avg_tokens_per_sec, 0.0);
+    assert_eq!(zero_report.commercial_cost_savings_usd, 0.0);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+
