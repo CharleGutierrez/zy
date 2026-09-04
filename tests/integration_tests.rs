@@ -203,8 +203,8 @@ fn test_dual_model_speculative_router_classification() {
     let chat_query = "Hello, how are you today?";
     let coding_query = "Please write a Rust function to parse JSON with error handling and patch src/main.rs";
 
-    assert_eq!(chat_query.len() > 0, true);
-    assert_eq!(coding_query.len() > 0, true);
+    assert!(chat_query.starts_with("Hello"));
+    assert!(coding_query.contains("Rust"));
     assert_ne!(RouteDecision::Chat, RouteDecision::Coding);
 }
 
@@ -1141,17 +1141,19 @@ fn test_tui_dashboard_layout_rendering_and_panels() {
     let backend = TestBackend::new(140, 45);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    let mut state = TuiAppState::default();
-    state.active_model = "llama3:70b".to_string();
-    state.agent_mode = true;
-    state.force_mode = true;
-    state.rag_mode = true;
-    state.cpu_cores = 16;
-    state.total_mem_gb = 32;
-    state.used_mem_gb = 12;
-    state.token_budget_info = "1420 / 8192 (17%)".to_string();
-    state.aituner_profile = "TURBO (8192 ctx)".to_string();
-    state.status_msg = "Agent ready".to_string();
+    let mut state = TuiAppState {
+        active_model: "llama3:70b".to_string(),
+        agent_mode: true,
+        force_mode: true,
+        rag_mode: true,
+        cpu_cores: 16,
+        total_mem_gb: 32,
+        used_mem_gb: 12,
+        token_budget_info: "1420 / 8192 (17%)".to_string(),
+        aituner_profile: "TURBO (8192 ctx)".to_string(),
+        status_msg: "Agent ready".to_string(),
+        ..Default::default()
+    };
 
     state.messages.push(Message {
         role: "user".to_string(),
@@ -1675,5 +1677,532 @@ fn test_atomic_multi_file_refactor_transactions() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+// -------------------------------------------------------------------------------------------------
+// TESTS: 6 NEW ESSENTIAL SYSTEMS
+// -------------------------------------------------------------------------------------------------
 
+#[test]
+fn test_micro_benchmarking_and_performance_profiler() {
+    // 1. Benchmark a fast command
+    let cmd = "echo bench_test";
+    let report = run_micro_benchmark(cmd, 5, 2).expect("Benchmark execution failed");
 
+    assert_eq!(report.command, cmd);
+    assert_eq!(report.iterations, 5);
+    assert_eq!(report.warmup, 2);
+    assert_eq!(report.durations_ms.len(), 5);
+    assert!(report.min_ms > 0.0);
+    assert!(report.max_ms >= report.min_ms);
+    assert!(report.mean_ms >= report.min_ms && report.mean_ms <= report.max_ms);
+    assert!(report.median_ms >= report.min_ms && report.median_ms <= report.max_ms);
+    assert!(report.std_dev_ms >= 0.0);
+    assert!(report.ops_per_sec > 0.0);
+    assert_eq!(report.success_count, 5);
+    assert_eq!(report.failure_count, 0);
+
+    // 2. Terminal report formatting
+    let terminal_out = format_benchmark_report_for_terminal(&report);
+    assert!(terminal_out.contains("MICRO-BENCHMARK & PERFORMANCE PROFILER REPORT"));
+    assert!(terminal_out.contains("Command:"));
+    assert!(terminal_out.contains("Iterations:"));
+    assert!(terminal_out.contains("Mean:"));
+    assert!(terminal_out.contains("Std Dev"));
+    assert!(terminal_out.contains("ops/sec"));
+
+    // 3. Serialization roundtrip
+    let json_str = serde_json::to_string(&report).unwrap();
+    let deserialized: BenchmarkReport = serde_json::from_str(&json_str).unwrap();
+    assert_eq!(deserialized.command, cmd);
+    assert_eq!(deserialized.iterations, 5);
+
+    // 4. Verify benchmark_code tool exists in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("benchmark_code"));
+}
+
+#[test]
+fn test_automated_unit_test_and_fuzz_suite_synthesizer() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_synthesizer_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Rust Source File
+    let rs_file = temp_dir.join("math_utils.rs");
+    let rs_content = r#"
+pub fn compute_factorial(n: u32) -> u64 {
+    (1..=n as u64).product()
+}
+
+pub fn calculate_checksum(buffer: &[u8]) -> u32 {
+    buffer.iter().map(|&b| b as u32).sum()
+}
+
+pub struct Matrix3x3 {
+    pub data: [f32; 9],
+}
+"#;
+    std::fs::write(&rs_file, rs_content).unwrap();
+
+    let rs_suite = synthesize_test_suite(&rs_file, "rust", true).expect("Failed to synthesize Rust test suite");
+    assert_eq!(rs_suite.language, "rust");
+    assert!(rs_suite.fuzz_enabled);
+    assert!(rs_suite.scanned_symbols.len() >= 3);
+    assert!(rs_suite.unit_tests.len() >= 2);
+    assert!(rs_suite.fuzz_tests.len() >= 2);
+    assert!(rs_suite.test_file_path.ends_with("math_utils_test.rs"));
+    assert!(rs_suite.test_code.contains("proptest!"));
+    assert!(rs_suite.test_code.contains("fuzz_compute_factorial_arbitrary_inputs"));
+    assert!(rs_suite.test_code.contains("test_compute_factorial_deterministic_behavior"));
+
+    // 2. Python Source File
+    let py_file = temp_dir.join("analytics.py");
+    let py_content = r#"
+def calculate_variance(data):
+    """Calculate sample variance."""
+    return 0.0
+
+def normalize_features(matrix):
+    return matrix
+"#;
+    std::fs::write(&py_file, py_content).unwrap();
+
+    let py_suite = synthesize_test_suite(&py_file, "python", true).expect("Failed to synthesize Python test suite");
+    assert_eq!(py_suite.language, "python");
+    assert!(py_suite.test_code.contains("import pytest"));
+    assert!(py_suite.test_code.contains("from hypothesis import given, strategies as st"));
+    assert!(py_suite.test_code.contains("@given(st.integers(), st.text())"));
+    assert!(py_suite.test_code.contains("def test_fuzz_calculate_variance"));
+    assert!(py_suite.test_code.contains("def test_calculate_variance_basic"));
+
+    // 3. TypeScript Source File
+    let ts_file = temp_dir.join("payload.ts");
+    let ts_content = r#"
+export function serializePayload(data: any) {
+    return JSON.stringify(data);
+}
+export const calculateOffset = (index: number) => {
+    return index * 4;
+}
+"#;
+    std::fs::write(&ts_file, ts_content).unwrap();
+
+    let ts_suite = synthesize_test_suite(&ts_file, "typescript", true).expect("Failed to synthesize TS test suite");
+    assert_eq!(ts_suite.language, "typescript");
+    assert!(ts_suite.test_code.contains("import { describe, test, expect } from 'vitest';"));
+    assert!(ts_suite.test_code.contains("import * as fc from 'fast-check';"));
+    assert!(ts_suite.test_code.contains("fc.assert(fc.property"));
+
+    // 4. Go Source File
+    let go_file = temp_dir.join("parser.go");
+    let go_content = r#"
+package parser
+
+func ParsePacket(data []byte) bool {
+    return len(data) > 0
+}
+"#;
+    std::fs::write(&go_file, go_content).unwrap();
+
+    let go_suite = synthesize_test_suite(&go_file, "go", true).expect("Failed to synthesize Go test suite");
+    assert_eq!(go_suite.language, "go");
+    assert!(go_suite.test_code.contains("func TestParsePacket(t *testing.T)"));
+    assert!(go_suite.test_code.contains("func FuzzParsePacket(f *testing.F)"));
+
+    // 5. Terminal report formatting
+    let terminal_out = format_test_suite_report_for_terminal(&rs_suite);
+    assert!(terminal_out.contains("AUTOMATED TEST & FUZZ SUITE SYNTHESIZER REPORT"));
+    assert!(terminal_out.contains("compute_factorial"));
+    assert!(terminal_out.contains("Unit Tests:"));
+    assert!(terminal_out.contains("Fuzz Suites:"));
+
+    // 6. Verify generate_tests tool in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("generate_tests"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_production_container_and_ci_cd_manifest_generator() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_ci_gen_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Rust Stack
+    let rust_dir = temp_dir.join("rust_proj");
+    let _ = std::fs::create_dir_all(&rust_dir);
+    std::fs::write(rust_dir.join("Cargo.toml"), "[package]\nname = \"zy_service\"\nversion = \"1.0.0\"\n").unwrap();
+
+    let rust_stack = detect_project_stack(&rust_dir);
+    assert_eq!(rust_stack.language, ProjectLanguage::Rust);
+    assert_eq!(rust_stack.project_name, "zy_service");
+    assert_eq!(rust_stack.suggested_port, 8080);
+
+    let rust_manifests = generate_container_and_ci_manifests(&rust_stack);
+    assert!(rust_manifests.dockerfile.contains("lukemathwalker/cargo-chef"));
+    assert!(rust_manifests.dockerfile.contains("musl-dev"));
+    assert!(rust_manifests.dockerfile.contains("zy_service"));
+    assert!(rust_manifests.dockerfile.contains("HEALTHCHECK"));
+    assert!(rust_manifests.docker_compose.contains("zy_service:"));
+    assert!(rust_manifests.docker_compose.contains("8080:8080"));
+    assert!(rust_manifests.docker_compose.contains("limits:"));
+    assert!(rust_manifests.github_workflow.contains("Production CI"));
+    assert!(rust_manifests.github_workflow.contains("Swatinem/rust-cache@v2"));
+    assert!(rust_manifests.github_workflow.contains("matrix:"));
+    assert!(rust_manifests.github_workflow.contains("windows-latest"));
+    assert!(rust_manifests.github_workflow.contains("macos-latest"));
+
+    // 2. Node.js Stack
+    let node_dir = temp_dir.join("node_proj");
+    let _ = std::fs::create_dir_all(&node_dir);
+    std::fs::write(node_dir.join("package.json"), "{\"name\": \"web-gateway\", \"version\": \"2.0.0\"}").unwrap();
+
+    let node_stack = detect_project_stack(&node_dir);
+    assert_eq!(node_stack.language, ProjectLanguage::Node);
+    assert_eq!(node_stack.project_name, "web-gateway");
+    assert_eq!(node_stack.suggested_port, 3000);
+
+    let node_manifests = generate_container_and_ci_manifests(&node_stack);
+    assert!(node_manifests.dockerfile.contains("FROM node:20-alpine AS deps"));
+    assert!(node_manifests.dockerfile.contains("npm ci"));
+    assert!(node_manifests.dockerfile.contains("USER nextjs"));
+    assert!(node_manifests.docker_compose.contains("3000:3000"));
+    assert!(node_manifests.github_workflow.contains("actions/setup-node@v4"));
+
+    // 3. Python Stack
+    let py_dir = temp_dir.join("py_proj");
+    let _ = std::fs::create_dir_all(&py_dir);
+    std::fs::write(py_dir.join("requirements.txt"), "fastapi\nuvicorn\n").unwrap();
+
+    let py_stack = detect_project_stack(&py_dir);
+    assert_eq!(py_stack.language, ProjectLanguage::Python);
+    assert_eq!(py_stack.suggested_port, 8000);
+
+    let py_manifests = generate_container_and_ci_manifests(&py_stack);
+    assert!(py_manifests.dockerfile.contains("FROM python:3.11-slim AS builder"));
+    assert!(py_manifests.dockerfile.contains("appuser"));
+    assert!(py_manifests.github_workflow.contains("actions/setup-python@v5"));
+
+    // 4. Go Stack
+    let go_dir = temp_dir.join("go_proj");
+    let _ = std::fs::create_dir_all(&go_dir);
+    std::fs::write(go_dir.join("go.mod"), "module github.com/zy/backend\ngo 1.22\n").unwrap();
+
+    let go_stack = detect_project_stack(&go_dir);
+    assert_eq!(go_stack.language, ProjectLanguage::Go);
+
+    let go_manifests = generate_container_and_ci_manifests(&go_stack);
+    assert!(go_manifests.dockerfile.contains("FROM golang:1.22-alpine AS builder"));
+    assert!(go_manifests.dockerfile.contains("CGO_ENABLED=0"));
+
+    // 5. Terminal report formatting
+    let terminal_out = format_ci_manifests_for_terminal(&rust_manifests);
+    assert!(terminal_out.contains("CONTAINER & CI/CD MANIFEST GENERATOR REPORT"));
+    assert!(terminal_out.contains("zy_service"));
+    assert!(terminal_out.contains("Dockerfile"));
+    assert!(terminal_out.contains("docker-compose.yml"));
+    assert!(terminal_out.contains(".github/workflows/ci.yml"));
+
+    // 6. Verify generate_ci tool exists in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("generate_ci"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_interactive_call_graph_visualizer() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_graph_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let src_dir = temp_dir.join("src");
+    let _ = std::fs::create_dir_all(&src_dir);
+
+    let file_main = src_dir.join("main.rs");
+    let file_server = src_dir.join("server.rs");
+
+    let main_code = r#"
+fn main() {
+    init_config();
+    run_server();
+}
+
+fn init_config() {
+    load_environment();
+}
+"#;
+
+    let server_code = r#"
+pub fn run_server() {
+    handle_connection();
+}
+
+pub fn handle_connection() {
+    parse_request();
+}
+
+pub fn parse_request() {
+    emit_metrics();
+}
+
+pub fn emit_metrics() {
+}
+
+pub fn load_environment() {
+}
+"#;
+
+    std::fs::write(&file_main, main_code).unwrap();
+    std::fs::write(&file_server, server_code).unwrap();
+
+    // 1. Build call graph rooted at "main"
+    let report = build_call_graph(&temp_dir, Some("main"));
+
+    assert_eq!(report.entry_symbol.as_deref(), Some("main"));
+    assert!(report.total_functions >= 7);
+    assert!(report.total_calls >= 6);
+
+    // Assert ASCII tree contains full hierarchical chain
+    assert!(report.ascii_tree.contains("main"));
+    assert!(report.ascii_tree.contains("run_server"));
+    assert!(report.ascii_tree.contains("handle_connection"));
+    assert!(report.ascii_tree.contains("parse_request"));
+    assert!(report.ascii_tree.contains("emit_metrics"));
+    assert!(report.ascii_tree.contains("init_config"));
+    assert!(report.ascii_tree.contains("load_environment"));
+
+    // Assert Mermaid diagram syntax
+    assert!(report.mermaid_diagram.starts_with("graph TD;\n"));
+    assert!(report.mermaid_diagram.contains("main --> run_server;"));
+    assert!(report.mermaid_diagram.contains("run_server --> handle_connection;"));
+    assert!(report.mermaid_diagram.contains("handle_connection --> parse_request;"));
+
+    // 2. Terminal report formatting
+    let terminal_out = format_call_graph_for_terminal(&report);
+    assert!(terminal_out.contains("INTERACTIVE CALL GRAPH"));
+    assert!(terminal_out.contains("Total Functions:"));
+    assert!(terminal_out.contains("Total Call Sites:"));
+    assert!(terminal_out.contains("main"));
+
+    // 3. Verify call_graph tool in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("call_graph"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_multi_language_formatter_and_linter_auto_fixer() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_lint_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // Create files with trailing spaces and missing trailing newlines
+    let rs_file = temp_dir.join("bad_format.rs");
+    let py_file = temp_dir.join("bad_format.py");
+    let json_file = temp_dir.join("bad_format.json");
+
+    std::fs::write(&rs_file, "pub fn compute() -> i32 {    \n    42   \n}").unwrap();
+    std::fs::write(&py_file, "def calculate():   \n    return 100   ").unwrap();
+    std::fs::write(&json_file, "{\n  \"status\": \"ok\"   \n}").unwrap();
+
+    // 1. Run in check mode (fix = false)
+    let check_report = format_and_lint_workspace(&temp_dir, false).expect("Formatter check mode failed");
+    assert!(!check_report.fix_mode);
+    assert!(check_report.issues_found >= 3);
+    assert_eq!(check_report.issues_fixed, 0);
+
+    // Verify files on disk NOT modified in check mode
+    assert!(std::fs::read_to_string(&rs_file).unwrap().contains("    \n"));
+
+    // 2. Run in fix mode (fix = true)
+    let fix_report = format_and_lint_workspace(&temp_dir, true).expect("Formatter fix mode failed");
+    assert!(fix_report.fix_mode);
+    assert!(fix_report.issues_fixed >= 3);
+    assert!(fix_report.formatted_files.len() >= 3);
+
+    // Verify files on disk are cleaned
+    let fixed_rs = std::fs::read_to_string(&rs_file).unwrap();
+    assert_eq!(fixed_rs, "pub fn compute() -> i32 {\n    42\n}\n");
+    assert!(fixed_rs.ends_with('\n'));
+
+    let fixed_py = std::fs::read_to_string(&py_file).unwrap();
+    assert_eq!(fixed_py, "def calculate():\n    return 100\n");
+    assert!(fixed_py.ends_with('\n'));
+
+    let fixed_json = std::fs::read_to_string(&json_file).unwrap();
+    assert_eq!(fixed_json, "{\n  \"status\": \"ok\"\n}\n");
+
+    // 3. Terminal report formatting
+    let terminal_out = format_lint_format_report_for_terminal(&fix_report);
+    assert!(terminal_out.contains("MULTI-LANGUAGE FORMATTER & LINTER AUTO-FIXER"));
+    assert!(terminal_out.contains("AUTO-FIX ENABLED"));
+    assert!(terminal_out.contains("Files Formatted:"));
+    assert!(terminal_out.contains("Issues Fixed:"));
+
+    // 4. Verify auto_format tool in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("auto_format"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_ephemeral_mock_server_and_api_sandbox() {
+    let mut custom_headers = std::collections::HashMap::new();
+    custom_headers.insert("X-Zy-Engine".to_string(), "Mock-v1".to_string());
+
+    let routes = vec![
+        MockRoute {
+            method: "GET".to_string(),
+            path: "/api/v1/health".to_string(),
+            status_code: 200,
+            response_body: serde_json::json!({
+                "status": "healthy",
+                "uptime_sec": 3600,
+                "version": "1.0.0"
+            }),
+            headers: custom_headers,
+        },
+        MockRoute {
+            method: "POST".to_string(),
+            path: "/api/v1/users".to_string(),
+            status_code: 201,
+            response_body: serde_json::json!({
+                "id": 101,
+                "username": "zy_agent",
+                "role": "admin"
+            }),
+            headers: std::collections::HashMap::new(),
+        },
+        MockRoute {
+            method: "PUT".to_string(),
+            path: "/api/v1/settings".to_string(),
+            status_code: 202,
+            response_body: serde_json::json!({
+                "updated": true,
+                "theme": "dark"
+            }),
+            headers: std::collections::HashMap::new(),
+        },
+        MockRoute {
+            method: "DELETE".to_string(),
+            path: "/api/v1/sessions/101".to_string(),
+            status_code: 200,
+            response_body: serde_json::json!({
+                "revoked": true
+            }),
+            headers: std::collections::HashMap::new(),
+        },
+    ];
+
+    // 1. Start ephemeral mock server on random dynamic port (port 0)
+    let handle = start_ephemeral_mock_server(0, routes).await.expect("Failed to start ephemeral mock server");
+    assert!(handle.is_running());
+    assert!(handle.port() > 0);
+    assert!(handle.base_url().starts_with("http://127.0.0.1:"));
+
+    let client = reqwest::Client::new();
+
+    // 2. Test GET /api/v1/health
+    let res_get = client.get(format!("{}/api/v1/health", handle.base_url()))
+        .send().await.expect("GET request failed");
+    assert_eq!(res_get.status(), reqwest::StatusCode::OK);
+    assert_eq!(res_get.headers().get("X-Zy-Engine").and_then(|h| h.to_str().ok()), Some("Mock-v1"));
+    let get_json: serde_json::Value = res_get.json().await.unwrap();
+    assert_eq!(get_json["status"], "healthy");
+    assert_eq!(get_json["uptime_sec"], 3600);
+
+    // 3. Test POST /api/v1/users
+    let res_post = client.post(format!("{}/api/v1/users", handle.base_url()))
+        .json(&serde_json::json!({"username": "zy_agent"}))
+        .send().await.expect("POST request failed");
+    assert_eq!(res_post.status(), reqwest::StatusCode::CREATED);
+    let post_json: serde_json::Value = res_post.json().await.unwrap();
+    assert_eq!(post_json["id"], 101);
+    assert_eq!(post_json["username"], "zy_agent");
+
+    // 4. Test PUT /api/v1/settings
+    let res_put = client.put(format!("{}/api/v1/settings", handle.base_url()))
+        .json(&serde_json::json!({"theme": "dark"}))
+        .send().await.expect("PUT request failed");
+    assert_eq!(res_put.status(), reqwest::StatusCode::ACCEPTED);
+    let put_json: serde_json::Value = res_put.json().await.unwrap();
+    assert_eq!(put_json["updated"], true);
+
+    // 5. Test DELETE /api/v1/sessions/101
+    let res_del = client.delete(format!("{}/api/v1/sessions/101", handle.base_url()))
+        .send().await.expect("DELETE request failed");
+    assert_eq!(res_del.status(), reqwest::StatusCode::OK);
+    let del_json: serde_json::Value = res_del.json().await.unwrap();
+    assert_eq!(del_json["revoked"], true);
+
+    // 6. Test 404 Route Not Found
+    let res_404 = client.get(format!("{}/non_existent_route", handle.base_url()))
+        .send().await.expect("404 GET request failed");
+    assert_eq!(res_404.status(), reqwest::StatusCode::NOT_FOUND);
+    let err_json: serde_json::Value = res_404.json().await.unwrap();
+    assert_eq!(err_json["error"], "Route Not Found");
+
+    // 7. Terminal report formatting
+    let terminal_out = format_mock_server_report_for_terminal(&handle);
+    assert!(terminal_out.contains("EPHEMERAL AI MOCK SERVER & API SANDBOX ACTIVE"));
+    assert!(terminal_out.contains("Base URL:"));
+    assert!(terminal_out.contains("/api/v1/health"));
+    assert!(terminal_out.contains("/api/v1/users"));
+
+    // 8. Test active server registration & clean shutdown
+    register_active_mock_server(handle);
+    stop_all_active_mock_servers();
+
+    // 9. Verify mock_api tool in get_tools()
+    let tools = get_tools();
+    let tools_str = serde_json::to_string(&tools).unwrap();
+    assert!(tools_str.contains("mock_api"));
+}
+
+#[test]
+fn test_brutal_edge_cases_across_6_systems() {
+    let temp_dir = std::env::temp_dir().join(format!("zy_brutal_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    // 1. Micro-benchmark 0 iterations & 0 warmup normalization
+    let zero_bench = run_micro_benchmark("echo brutal_edge_case", 0, 0).expect("Zero iteration benchmark failed");
+    assert_eq!(zero_bench.iterations, 1);
+    assert_eq!(zero_bench.durations_ms.len(), 1);
+
+    // 2. Synthesizer on empty file & unknown language
+    let empty_file = temp_dir.join("empty.unknown");
+    std::fs::write(&empty_file, "").unwrap();
+    let empty_suite = synthesize_test_suite(&empty_file, "unknown_lang", false).unwrap();
+    assert_eq!(empty_suite.unit_tests.len(), 0);
+    assert_eq!(empty_suite.fuzz_tests.len(), 0);
+
+    // 3. Container & CI detector on completely empty workspace fallback to Generic
+    let empty_ws = temp_dir.join("empty_ws");
+    let _ = std::fs::create_dir_all(&empty_ws);
+    let empty_stack = detect_project_stack(&empty_ws);
+    assert_eq!(empty_stack.language, ProjectLanguage::Generic);
+    let gen_manifests = generate_container_and_ci_manifests(&empty_stack);
+    assert!(gen_manifests.dockerfile.contains("FROM alpine:3.19"));
+    assert!(gen_manifests.github_workflow.contains("make test"));
+
+    // 4. Call graph cycle detection without infinite loop
+    let cycle_file = temp_dir.join("cycles.rs");
+    let cycle_code = r#"
+pub fn function_alpha() {
+    function_beta();
+}
+
+pub fn function_beta() {
+    function_alpha();
+}
+"#;
+    std::fs::write(&cycle_file, cycle_code).unwrap();
+    let cycle_report = build_call_graph(&temp_dir, Some("function_alpha"));
+    assert!(cycle_report.ascii_tree.contains("[cycle]"));
+    assert!(cycle_report.mermaid_diagram.contains("function_alpha --> function_beta;"));
+    assert!(cycle_report.mermaid_diagram.contains("function_beta --> function_alpha;"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
