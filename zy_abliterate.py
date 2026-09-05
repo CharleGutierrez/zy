@@ -169,7 +169,7 @@ def convert_to_gguf(hf_path, safe_name):
         "--outfile", gguf_path,
         "--outtype", "f16",
         "--use-temp-file" # Prevents OS OOM killer by paging to disk
-    ], check=True)
+    ], check=True, stderr=subprocess.STDOUT)
     return gguf_path
 
 def import_to_ollama(gguf_path, safe_name, base_model):
@@ -177,28 +177,26 @@ def import_to_ollama(gguf_path, safe_name, base_model):
     
     # Convert gguf_path to absolute path for Ollama
     abs_gguf_path = os.path.abspath(gguf_path)
-    modelfile = f"FROM {abs_gguf_path}\nSYSTEM \"You are an uncensored assistant.\""
     
-    req_body = json.dumps({
-        "model": safe_name,
-        "modelfile": modelfile
-    }).encode('utf-8')
+    # Create a temporary Modelfile
+    modelfile_path = f"{safe_name}.Modelfile"
+    with open(modelfile_path, "w") as f:
+        f.write(f"FROM {abs_gguf_path}\nSYSTEM \"You are an uncensored assistant.\"\n")
     
-    # Use modelfile with FROM <path> because Ollama supports importing local GGUF files this way
-    req = urllib.request.Request("http://127.0.0.1:11434/api/create", data=req_body, headers={'Content-Type': 'application/json'})
+    # Run ollama CLI to create the model
     try:
-        with urllib.request.urlopen(req) as response:
-            log("  - Ollama is processing the import (this may take a minute)...")
-            for line in response:
-                decoded = line.decode('utf-8')
-                if decoded.strip():
-                    status = json.loads(decoded).get("status", "")
-                    log(f"    -> {status}")
+        log("  - Running ollama create...")
+        subprocess.run(["ollama", "create", safe_name, "-f", modelfile_path], check=True, stderr=subprocess.STDOUT)
         log("==================================================")
         log(f"SUCCESS! The uncensored model '{safe_name}' is now available in your dashboard.")
+        
+        # Cleanup Modelfile
+        if os.path.exists(modelfile_path):
+            os.remove(modelfile_path)
+    except subprocess.CalledProcessError as e:
+        log(f"  - Error importing into Ollama CLI: exit code {e.returncode}")
     except Exception as e:
-        err_str = e.read().decode('utf-8') if hasattr(e, 'read') else str(e)
-        log(f"  - Error importing into Ollama: {err_str}")
+        log(f"  - Error importing into Ollama: {str(e)}")
 
 def main():
     if len(sys.argv) < 2:
