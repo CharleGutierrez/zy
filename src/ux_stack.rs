@@ -1656,10 +1656,6 @@ impl EmbeddedWebDashboard {
       <select id="model-select" class="model-select" onchange="updateGlobalModel()">
         <option value="{default_model}">{default_model}</option>
       </select>
-      <label style="font-size: 0.8rem; color: var(--accent); margin-left: 0.5rem; display: flex; align-items: center; gap: 0.2rem; cursor: pointer;" title="Clear conversation history when changing models to prevent context contamination">
-        <input type="checkbox" id="clear-on-switch" checked />
-        Clear on switch
-      </label>
       <span class="badge" id="tuner-badge">DYNAMIC AITUNER: ACTIVE</span>
       <span class="badge" style="color: var(--success);" id="status-badge">● ONLINE</span>
     </div>
@@ -1890,9 +1886,16 @@ impl EmbeddedWebDashboard {
         if (msg.role === 'user') {
           chat.insertAdjacentHTML('beforeend', `<div class="msg user">${msg.content.replace(/\\n/g, '<br/>')}</div>`);
         } else {
-          let formattedHtml = msg.content;
-          try { formattedHtml = typeof marked !== 'undefined' ? marked.parse(msg.content) : msg.content; } catch(e) {}
-          chat.insertAdjacentHTML('beforeend', `<div class="msg agent">⚡ <b>zy:</b><br/>${formattedHtml}</div>`);
+          let text = msg.content;
+          let modelLabel = "";
+          const modelMatch = text.match(/^\\[Model: (.*?)\\]\\n/);
+          if (modelMatch) {
+              modelLabel = ` (${modelMatch[1]})`;
+              text = text.substring(modelMatch[0].length);
+          }
+          let formattedHtml = text;
+          try { formattedHtml = typeof marked !== 'undefined' ? marked.parse(text) : text; } catch(e) {}
+          chat.insertAdjacentHTML('beforeend', `<div class="msg agent">⚡ <b>zy${modelLabel}:</b><br/>${formattedHtml}</div>`);
         }
       });
       window.scrollTo(0, document.body.scrollHeight);
@@ -1923,15 +1926,6 @@ impl EmbeddedWebDashboard {
     
     async function updateGlobalModel() {
         const model = document.getElementById('model-select').value;
-        const shouldClear = document.getElementById('clear-on-switch')?.checked;
-        if (shouldClear) {
-            chatHistory = [];
-            localStorage.removeItem('zy_chat');
-            const chat = document.getElementById('chat-box');
-            if (chat) {
-                chat.innerHTML = '<div class="msg agent">⚡ <b>zy agent ready.</b> Session cleared for new model.</div>';
-            }
-        }
         try {
             await fetch('/api/config/model', {
                 method: 'POST',
@@ -1998,7 +1992,8 @@ impl EmbeddedWebDashboard {
             }
             let currentMsg = document.getElementById('agent-msg');
             if (!currentMsg) {
-                chat.insertAdjacentHTML('beforeend', `<div class="msg agent" id="agent-msg">⚡ <b>zy:</b><br/></div>`);
+                const currentModel = document.getElementById('model-select').value;
+                chat.insertAdjacentHTML('beforeend', `<div class="msg agent" id="agent-msg">⚡ <b>zy (${currentModel}):</b><br/></div>`);
                 currentMsg = document.getElementById('agent-msg');
             }
             const safeText = data.msg.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, '<br/>');
@@ -2011,12 +2006,13 @@ impl EmbeddedWebDashboard {
            if (aMsg) { aMsg.remove(); }
            
            if (data.msg && data.msg.trim() !== '') {
-               chatHistory.push({ role: 'assistant', content: data.msg });
+               const currentModel = document.getElementById('model-select').value;
+               chatHistory.push({ role: 'assistant', content: `[Model: ${currentModel}]\\n${data.msg}` });
                localStorage.setItem('zy_chat', JSON.stringify(chatHistory));
                
                let formattedHtml = data.msg;
                try { formattedHtml = typeof marked !== 'undefined' ? marked.parse(data.msg) : data.msg; } catch(e) {}
-               chat.insertAdjacentHTML('beforeend', `<div class="msg agent">⚡ <b>zy:</b><br/>${formattedHtml}</div>`);
+               chat.insertAdjacentHTML('beforeend', `<div class="msg agent">⚡ <b>zy (${currentModel}):</b><br/>${formattedHtml}</div>`);
                chat.scrollTop = chat.scrollHeight;
                
                if (isVoiceModeEnabled) {
