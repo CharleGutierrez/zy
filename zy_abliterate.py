@@ -117,16 +117,19 @@ def run_math_pipeline(model_id, safe_name):
     refusal_vector = refusal_vector / torch.norm(refusal_vector)
     
     log("  - SVD projection complete. Modifying model weights in memory...")
-    # Project out the refusal vector from all layers
+    # Project out the refusal vector from the layers.
+    # We use an alpha of 0.6 (60%) instead of 1.0 (100%) to prevent model brain damage and hallucinations
+    alpha = 0.6
     I = torch.eye(refusal_vector.size(0))
-    P = I - torch.outer(refusal_vector, refusal_vector)
+    P = I - (alpha * torch.outer(refusal_vector, refusal_vector))
     
     modified_layers = 0
     with torch.no_grad():
         for i, layer in enumerate(model.model.layers):
             # Optimization: Only ablate middle-to-late layers where refusal solidifies
-            # This skips early and final layers, saving 50% of math.
-            if i < 10 or i > 24:
+            # Targeting too many layers causes severe hallucinations. 
+            # We restrict this to just 5 core layers (12-16) for a 1.5B model.
+            if i < 12 or i > 16:
                 continue
                 
             # Optimization: Only target the self-attention output (o_proj)
