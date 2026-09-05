@@ -1174,6 +1174,19 @@ impl EmbeddedWebDashboard {
 
     async fn handle_chat_async(req_str: String, tx: tokio::sync::broadcast::Sender<String>, cancel_token: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim_matches('\0');
+        let mut has_user_prompt = false;
+        let mut context_files: Vec<String> = Vec::new();
+        let mut context_images: Vec<String> = Vec::new();
+        let mut selected_model = "qwen2.5-coder:1.5b".to_string();
+        
+        let parsed_json = serde_json::from_str::<serde_json::Value>(body_str).ok();
+        
+        if let Some(json) = &parsed_json {
+            if let Some(m) = json.get("model").and_then(|v| v.as_str()) {
+                selected_model = m.to_string();
+            }
+        }
+
         let mut messages = vec![
             crate::Message { 
                 role: "system".to_string(), 
@@ -1183,15 +1196,7 @@ impl EmbeddedWebDashboard {
             }
         ];
         
-        let mut has_user_prompt = false;
-        let mut context_files: Vec<String> = Vec::new();
-        let mut context_images: Vec<String> = Vec::new();
-        let mut selected_model = "qwen2.5-coder:1.5b".to_string();
-        
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
-            if let Some(m) = json.get("model").and_then(|v| v.as_str()) {
-                selected_model = m.to_string();
-            }
+        if let Some(json) = parsed_json {
             if let Some(files) = json.get("context_files").and_then(|v| v.as_array()) {
                 for f in files {
                     if let Some(f_str) = f.as_str() { context_files.push(f_str.to_string()); }
