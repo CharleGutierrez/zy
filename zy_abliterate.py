@@ -145,6 +145,13 @@ def run_math_pipeline(model_id, safe_name):
     # Force max_shard_size to optimize disk write buffers
     model.save_pretrained(out_path, safe_serialization=True, max_shard_size="2GB")
     tokenizer.save_pretrained(out_path)
+    
+    # Explicitly clear 3GB of RAM before we return so the OS doesn't OOM kill the converter
+    log("  [Tuner] Purging PyTorch models from RAM...")
+    del model
+    del tokenizer
+    gc.collect()
+    
     return out_path
 
 def convert_to_gguf(hf_path, safe_name):
@@ -159,7 +166,8 @@ def convert_to_gguf(hf_path, safe_name):
         sys.executable, "llama.cpp/convert_hf_to_gguf.py", 
         hf_path, 
         "--outfile", gguf_path,
-        "--outtype", "f16"
+        "--outtype", "f16",
+        "--use-temp-file" # Prevents OS OOM killer by paging to disk
     ], check=True)
     return gguf_path
 
@@ -206,6 +214,7 @@ def main():
     
     try:
         hf_path = run_math_pipeline(model_id, safe_name)
+        gc.collect() # Extra safety purge
         gguf_path = convert_to_gguf(hf_path, safe_name)
         import_to_ollama(gguf_path, safe_name, model_id)
     except Exception as e:
