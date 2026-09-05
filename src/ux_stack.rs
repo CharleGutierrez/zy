@@ -1028,9 +1028,20 @@ impl EmbeddedWebDashboard {
         if stream.write_all(headers.as_bytes()).await.is_err() { return; }
 
         let mut rx = tx.subscribe();
-        while let Ok(msg) = rx.recv().await {
-            if stream.write_all(format!("data: {}\n\n", msg).as_bytes()).await.is_err() {
-                break;
+        loop {
+            match rx.recv().await {
+                Ok(msg) => {
+                    if stream.write_all(format!("data: {}\n\n", msg).as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Browser was too slow, missed some chunks, but keep connection alive
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
             }
         }
     }
@@ -2257,7 +2268,7 @@ impl EmbeddedWebDashboard {
         let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
         println!("{}", format!("⚡ zy Embedded Web Dashboard listening at http://127.0.0.1:{}", port).green().bold());
 
-        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(100);
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(10000);
         let cancel_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let handle = tokio::spawn(async move {
