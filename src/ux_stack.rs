@@ -1956,7 +1956,6 @@ impl EmbeddedWebDashboard {
                 trail.scrollTop = trail.scrollHeight;
             }
         } else if (data.type === 'chunk') {
-            console.log('SSE chunk received');
             let pMsg = document.getElementById('processing-msg');
             if (pMsg) {
                 pMsg.remove();
@@ -1967,7 +1966,7 @@ impl EmbeddedWebDashboard {
                 currentMsg = document.getElementById('agent-msg');
             }
             const safeText = data.msg.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, '<br/>');
-            currentMsg.innerHTML += safeText;
+            currentMsg.insertAdjacentHTML('beforeend', safeText);
             chat.scrollTop = chat.scrollHeight;
         } else if (data.type === 'done') {
            const pMsg = document.getElementById('processing-msg');
