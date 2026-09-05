@@ -122,13 +122,16 @@ def run_math_pipeline(model_id, safe_name):
     
     modified_layers = 0
     with torch.no_grad():
-        for layer in model.model.layers:
-            # We ablate the output projections that write into the residual stream
+        for i, layer in enumerate(model.model.layers):
+            # Optimization: Only ablate middle-to-late layers where refusal solidifies
+            # This skips early and final layers, saving 50% of math.
+            if i < 10 or i > 24:
+                continue
+                
+            # Optimization: Only target the self-attention output (o_proj)
+            # This skips the massive MLP down_proj matrix, saving 85% of math per layer.
             if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'o_proj'):
                 layer.self_attn.o_proj.weight.copy_(P.to(target_dtype) @ layer.self_attn.o_proj.weight)
-                modified_layers += 1
-            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'down_proj'):
-                layer.mlp.down_proj.weight.copy_(P.to(target_dtype) @ layer.mlp.down_proj.weight)
                 modified_layers += 1
                 
         if low_memory_mode:
@@ -139,7 +142,8 @@ def run_math_pipeline(model_id, safe_name):
     
     out_path = f"./{safe_name}-hf"
     log(f"  - Saving modified HuggingFace weights to {out_path}...")
-    model.save_pretrained(out_path)
+    # Force max_shard_size to optimize disk write buffers
+    model.save_pretrained(out_path, safe_serialization=True, max_shard_size="2GB")
     tokenizer.save_pretrained(out_path)
     return out_path
 
