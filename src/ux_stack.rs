@@ -1973,7 +1973,7 @@ impl EmbeddedWebDashboard {
            const pMsg = document.getElementById('processing-msg');
            if (pMsg) { pMsg.remove(); }
            const aMsg = document.getElementById('agent-msg');
-           if (aMsg) { aMsg.removeAttribute('id'); }
+           if (aMsg) { aMsg.remove(); }
            
            if (data.msg && data.msg.trim() !== '') {
                chatHistory.push({ role: 'assistant', content: data.msg });
