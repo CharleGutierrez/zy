@@ -2142,7 +2142,7 @@ impl EmbeddedWebDashboard {
         try {
           const payload = { 
             model: document.getElementById('model-select').value,
-            messages: chatHistory,
+            messages: chatHistory.slice(-10),
             context_files: contextFiles,
             context_images: contextImages
           };
