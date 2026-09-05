@@ -1674,6 +1674,18 @@ impl EmbeddedWebDashboard {
       <div class="metric-row"><span>Editor Bridge:</span><span class="metric-val">Port 8098 (Ready)</span></div>
       <div class="metric-row"><span>Duplex Audio:</span><span class="metric-val">16kHz VAD Active</span></div>
 
+      <div class="panel-section">
+        <h3>Memory Tuning</h3>
+        <p>Short-term buffer: <input type="number" id="windowSize" value="10" style="width:50px"></p>
+        <p>Context Injection: <button onclick="indexCodebase()">🔄 Index Codebase</button></p>
+      </div>
+      <div class="panel-section">
+        <h3>Model Lab</h3>
+        <p>Abliterate Refusal Weights (OBLITERATUS)</p>
+        <input type="text" id="hfModelId" placeholder="meta-llama/Meta-Llama-3-8B" style="width:100%; margin-bottom:5px;">
+        <button onclick="startAbliteration()" style="width:100%; background:linear-gradient(90deg, #ec4899, #8b5cf6); border:none; padding:8px; border-radius:4px; color:white; font-weight:bold; cursor:pointer;">Uncensor & Import</button>
+      </div>
+
       <h3 style="margin-top: 1rem;">📑 Quick Commands</h3>
       <button onclick="sendQuick('/radar')">📊 Code Health Radar</button>
       <button onclick="sendQuick('/dag')">🔀 Swarm DAG Flow</button>
@@ -2044,11 +2056,24 @@ impl EmbeddedWebDashboard {
         await fetch('/api/rag/index', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: document.getElementById('model-select').value })
+          body: JSON.stringify({ model: document.getElementById('globalModel')?.value || 'qwen2.5-coder:1.5b' })
         });
       } catch (e) {
         console.error('RAG Index error', e);
       }
+    }
+
+    async function startAbliteration() {
+        const modelId = document.getElementById('hfModelId').value || 'meta-llama/Meta-Llama-3-8B';
+        const chat = document.getElementById('chat-box');
+        chat.insertAdjacentHTML('beforeend', `<div class="msg agent" id="processing-msg">Initializing OBLITERATUS Pipeline... ${typingHtml}</div>`);
+        chat.scrollTop = chat.scrollHeight;
+        
+        await fetch('/api/models/abliterate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ hf_model: modelId })
+        });
     }
 
     async function sendPrompt() {
@@ -2339,7 +2364,48 @@ impl EmbeddedWebDashboard {
                             
                             if path == "/api/rag/index" {
                                 cancel_token.store(false, std::sync::atomic::Ordering::Relaxed);
-                                Self::handle_rag_index(req_str.to_string(), tx, cancel_token.clone()).await;
+                                Self::handle_rag_index(req_str.to_string(), tx.clone(), cancel_token.clone()).await;
+                                use tokio::io::AsyncWriteExt;
+                                let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}";
+                                let _ = stream.write_all(headers.as_bytes()).await;
+                                return;
+                            }
+                            
+                            if path == "/api/models/abliterate" {
+                                let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim_matches('\0');
+                                let mut hf_model = "meta-llama/Meta-Llama-3-8B".to_string();
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
+                                    if let Some(m) = json.get("hf_model").and_then(|v| v.as_str()) {
+                                        hf_model = m.to_string();
+                                    }
+                                }
+                                
+                                let tx_clone = tx.clone();
+                                tokio::spawn(async move {
+                                    use tokio::process::Command;
+                                    use std::process::Stdio;
+                                    use tokio::io::{AsyncBufReadExt, BufReader};
+
+                                    let _ = tx_clone.send(serde_json::json!({ "type": "status", "msg": format!("Initializing Python environment...") }).to_string());
+                                    
+                                    let mut child = Command::new("python3")
+                                        .arg("zy_abliterate.py")
+                                        .arg(hf_model)
+                                        .stdout(Stdio::piped())
+                                        .spawn()
+                                        .expect("failed to spawn zy_abliterate.py");
+                                        
+                                    if let Some(stdout) = child.stdout.take() {
+                                        let mut reader = BufReader::new(stdout).lines();
+                                        while let Ok(Some(line)) = reader.next_line().await {
+                                            let _ = tx_clone.send(serde_json::json!({ "type": "status", "msg": line }).to_string());
+                                        }
+                                    }
+                                    
+                                    let _ = child.wait().await;
+                                    let _ = tx_clone.send(serde_json::json!({ "type": "status", "msg": "Abliteration pipeline completed.".to_string() }).to_string());
+                                });
+                                
                                 use tokio::io::AsyncWriteExt;
                                 let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}";
                                 let _ = stream.write_all(headers.as_bytes()).await;
