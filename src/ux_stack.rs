@@ -1177,7 +1177,7 @@ impl EmbeddedWebDashboard {
         let mut messages = vec![
             crate::Message { 
                 role: "system".to_string(), 
-                content: "You are an autonomous AI coding agent. You can execute bash commands and read/write files to solve user requests. Once you have solved the request, output your final response in Markdown without using any tools.".to_string(), 
+                content: "You are an autonomous AI coding agent. You can execute bash commands and read/write files to solve user requests. Once you have solved the request, output your final response in Markdown without using any tools. When conversing or answering questions, output plain text or Markdown. Do NOT output empty JSON objects like `{}`.".to_string(), 
                 tool_calls: None, 
                 images: None 
             }
