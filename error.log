@@ -1,0 +1,56 @@
+warning: unused `Result` that must be used
+    --> src/lib.rs:2782:5
+     |
+2782 |     crate::AudioCueEngine::play_sound_cue("task_completed");
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+     = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+     |
+2782 |     let _ = crate::AudioCueEngine::play_sound_cue("task_completed");
+     |     +++++++
+
+warning: unused `Result` that must be used
+    --> src/lib.rs:2826:5
+     |
+2826 |     crate::AudioCueEngine::play_sound_cue("task_completed");
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+     |
+2826 |     let _ = crate::AudioCueEngine::play_sound_cue("task_completed");
+     |     +++++++
+
+warning: unused `Result` that must be used
+    --> src/lib.rs:2864:5
+     |
+2864 |     crate::AudioCueEngine::play_sound_cue("task_completed");
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+     |
+2864 |     let _ = crate::AudioCueEngine::play_sound_cue("task_completed");
+     |     +++++++
+
+warning: `zy` (lib) generated 3 warnings
+warning: unused variable: `apply`
+   --> src/main.rs:439:47
+    |
+439 |         Some(Commands::Stage { path, indices, apply, split }) => {
+    |                                               ^^^^^ help: try ignoring the field: `apply: _`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `hunk_indices`
+   --> src/main.rs:440:17
+    |
+440 |             let hunk_indices: Vec<usize> = indices.as_deref()
+    |                 ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_hunk_indices`
+
+warning: `zy` (bin "zy") generated 2 warnings (run `cargo fix --bin "zy" -p zy` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.34s
+     Running `target/debug/zy chat test`
+Error: reqwest::Error { kind: Request, url: Url { scheme: "http", cannot_be_a_base: false, username: "", password: None, host: Some(Domain("localhost")), port: Some(11434), path: "/api/chat", query: None, fragment: None }, source: hyper::Error(Canceled, "connection closed") }

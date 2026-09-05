@@ -766,6 +766,10 @@ pub struct ChatResponse {
     #[allow(dead_code)]
     pub done: Option<bool>,
     pub error: Option<String>,
+    pub prompt_eval_count: Option<u64>,
+    pub prompt_eval_duration: Option<u64>,
+    pub eval_count: Option<u64>,
+    pub eval_duration: Option<u64>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -21164,7 +21168,7 @@ pub async fn agent_loop(
                                 method: "textDocument/inlineCompletion".to_string(),
                                 params: Some(serde_json::json!({ "prefix": pfx, "suffix": sfx, "line": 0, "column": 0, "text_document_uri": "file:///active" })),
                             };
-                            let resp = EditorSidecarServer::handle_json_rpc_request(&req, Some(client), mdl);
+                            let resp = EditorSidecarServer::handle_json_rpc_request(&req, Some(client), mdl).await;
                             tool_result = serde_json::to_string_pretty(&resp).unwrap();
                         }
                         "action" => {
@@ -21175,7 +21179,7 @@ pub async fn agent_loop(
                                 method: "textDocument/codeAction".to_string(),
                                 params: Some(serde_json::json!({ "context_code": ctx, "text_document_uri": "file:///active", "start_line": 0, "start_col": 0, "end_line": 0, "end_col": 0, "diagnostics": [] })),
                             };
-                            let resp = EditorSidecarServer::handle_json_rpc_request(&req, Some(client), mdl);
+                            let resp = EditorSidecarServer::handle_json_rpc_request(&req, Some(client), mdl).await;
                             tool_result = serde_json::to_string_pretty(&resp).unwrap();
                         }
                         "chat" => {
@@ -21186,7 +21190,7 @@ pub async fn agent_loop(
                                 method: "zy/chat".to_string(),
                                 params: Some(serde_json::json!({ "prompt": prompt })),
                             };
-                            let resp = EditorSidecarServer::handle_json_rpc_request(&req, Some(client), mdl);
+                            let resp = EditorSidecarServer::handle_json_rpc_request(&req, Some(client), mdl).await;
                             tool_result = serde_json::to_string_pretty(&resp).unwrap();
                         }
                         _ => {

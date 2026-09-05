@@ -634,37 +634,53 @@ impl CodebaseRadarMetrics {
         let mut doc_comments = 0usize;
         let mut test_functions = 0usize;
         let mut unwrap_calls = 0usize;
+        let mut unsafe_blocks = 0usize;
+        let mut allocations_and_locks = 0usize;
+        let mut conditionals = 0usize;
+        let mut todos = 0usize;
 
-        if let Ok(entries) = fs::read_dir(workspace) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-                    rust_files += 1;
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        for line in content.lines() {
-                            total_lines += 1;
-                            let trimmed = line.trim();
-                            if trimmed.starts_with("///") || trimmed.starts_with("//!") {
-                                doc_comments += 1;
-                            }
-                            if trimmed.starts_with("#[test]") {
-                                test_functions += 1;
-                            }
-                            if trimmed.contains(".unwrap()") {
-                                unwrap_calls += 1;
-                            }
+        for entry in walkdir::WalkDir::new(workspace).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                rust_files += 1;
+                if let Ok(content) = fs::read_to_string(path) {
+                    for line in content.lines() {
+                        total_lines += 1;
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("///") || trimmed.starts_with("//!") {
+                            doc_comments += 1;
+                        }
+                        if trimmed.starts_with("#[test]") {
+                            test_functions += 1;
+                        }
+                        if trimmed.contains(".unwrap()") || trimmed.contains(".expect(") || trimmed.contains("panic!(") {
+                            unwrap_calls += 1;
+                        }
+                        if trimmed.contains("unsafe {") || trimmed.contains("unsafe fn ") {
+                            unsafe_blocks += 1;
+                        }
+                        if trimmed.contains(".clone()") || trimmed.contains("Box::new(") || trimmed.contains("Arc::new(") || trimmed.contains("Mutex::new(") {
+                            allocations_and_locks += 1;
+                        }
+                        if trimmed.starts_with("if ") || trimmed.starts_with("match ") || trimmed.starts_with("while ") || trimmed.starts_with("for ") {
+                            conditionals += 1;
+                        }
+                        if trimmed.contains("TODO") || trimmed.contains("FIXME") {
+                            todos += 1;
                         }
                     }
                 }
             }
         }
 
-        let maintainability = if total_lines > 0 { (100.0 - (unwrap_calls as f32 * 2.5)).clamp(40.0, 98.0) } else { 85.0 };
-        let complexity = (95.0 - (total_lines as f32 * 0.002)).clamp(50.0, 95.0);
-        let test_coverage = if rust_files > 0 { (test_functions as f32 * 12.0).clamp(30.0, 98.0) } else { 80.0 };
-        let security = if unwrap_calls > 10 { 82.0 } else { 96.0 };
-        let performance = 94.0; // Pure Rust with release LTO
-        let documentation = if total_lines > 0 { ((doc_comments as f32 / total_lines as f32) * 500.0).clamp(40.0, 95.0) } else { 85.0 };
+        let avg_file_len = if rust_files > 0 { total_lines as f32 / rust_files as f32 } else { 0.0 };
+        
+        let maintainability = if total_lines > 0 { (100.0 - (todos as f32 * 0.5) - (avg_file_len * 0.02)).clamp(40.0, 99.0) } else { 85.0 };
+        let complexity = if total_lines > 0 { (100.0 - (conditionals as f32 / total_lines as f32 * 500.0)).clamp(30.0, 99.0) } else { 95.0 };
+        let test_coverage = if rust_files > 0 { (test_functions as f32 * 8.0).clamp(10.0, 99.0) } else { 80.0 };
+        let security = if total_lines > 0 { (100.0 - (unsafe_blocks as f32 * 5.0) - (unwrap_calls as f32 * 0.5)).clamp(20.0, 99.0) } else { 96.0 };
+        let performance = if total_lines > 0 { (100.0 - (allocations_and_locks as f32 / total_lines as f32 * 200.0)).clamp(40.0, 99.0) } else { 95.0 };
+        let documentation = if total_lines > 0 { ((doc_comments as f32 / total_lines as f32) * 600.0).clamp(20.0, 99.0) } else { 85.0 };
 
         let overall = (maintainability + complexity + test_coverage + security + performance + documentation) / 6.0;
 
@@ -738,6 +754,11 @@ impl CodebaseRadarMetrics {
             size, size
         );
 
+        svg.push_str("  <style>\n");
+        svg.push_str("    @keyframes pulseRadar { 0% { filter: drop-shadow(0 0 4px #38bdf8); transform: scale(1); } 50% { filter: drop-shadow(0 0 15px #818cf8); transform: scale(1.02); } 100% { filter: drop-shadow(0 0 4px #38bdf8); transform: scale(1); } }\n");
+        svg.push_str("    .live-radar { animation: pulseRadar 3s ease-in-out infinite; transform-origin: center; }\n");
+        svg.push_str("  </style>\n");
+
         svg.push_str("  <defs>\n");
         svg.push_str("    <linearGradient id=\"radarGrad\" x1=\"0%\" y1=\"0%\" x2=\"100%\" y2=\"100%\">\n");
         svg.push_str("      <stop offset=\"0%\" stop-color=\"#38bdf8\" stop-opacity=\"0.6\" />\n");
@@ -754,7 +775,7 @@ impl CodebaseRadarMetrics {
         }
 
         svg.push_str(&format!(
-            "  <polygon points=\"{}\" fill=\"url(#radarGrad)\" stroke=\"#38bdf8\" stroke-width=\"2.5\" />\n",
+            "  <polygon class=\"live-radar\" points=\"{}\" fill=\"url(#radarGrad)\" stroke=\"#38bdf8\" stroke-width=\"2.5\" />\n",
             poly_str
         ));
 
@@ -852,6 +873,9 @@ impl EmbeddedWebDashboard {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>⚡ zy: Autonomous Local AI Agent Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/tokyo-night-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <style>
     :root {
       --bg: #0b0f19;
@@ -871,20 +895,38 @@ impl EmbeddedWebDashboard {
     .logo { font-size: 1.5rem; font-weight: 800; color: var(--accent); display: flex; align-items: center; gap: 0.5rem; }
     .badge { background: var(--border); color: var(--accent); padding: 0.25rem 0.6rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
     .container { display: grid; grid-template-columns: 320px 1fr 340px; gap: 1.5rem; padding: 1.5rem; flex: 1; }
-    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem; display: flex; flex-direction: column; gap: 1rem; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
-    .card h3 { font-size: 0.95rem; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.05em; }
-    .chat-box { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.75rem; min-height: 380px; max-height: 520px; background: #0b0f19; padding: 1rem; border-radius: 8px; border: 1px solid var(--border); }
+    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem; display: flex; flex-direction: column; gap: 1rem; box-shadow: 0 4px 20px rgba(0,0,0,0.3); min-height: 0; }
+    .card h3 { font-size: 0.95rem; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.05em; flex-shrink: 0; }
+    .chat-box { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.75rem; min-height: 0; background: #0b0f19; padding: 1rem; border-radius: 8px; border: 1px solid var(--border); }
     .msg { padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.88rem; line-height: 1.5; max-width: 85%; }
     .msg.user { background: #1e293b; color: #fff; align-self: flex-end; border-left: 3px solid var(--accent); }
     .msg.agent { background: #1e1b4b; color: #e0e7ff; align-self: flex-start; border-left: 3px solid #818cf8; }
-    .input-row { display: flex; gap: 0.5rem; }
-    input[type="text"] { flex: 1; background: #0b0f19; border: 1px solid var(--border); color: #fff; padding: 0.75rem 1rem; border-radius: 8px; outline: none; }
-    input[type="text"]:focus { border-color: var(--accent); box-shadow: 0 0 10px var(--accent-glow); }
-    button { background: var(--accent); color: #000; border: none; padding: 0.75rem 1.25rem; font-weight: 700; border-radius: 8px; cursor: pointer; transition: all 0.2s; }
-    button:hover { opacity: 0.9; transform: translateY(-1px); }
+    .input-row { display: flex; gap: 0.5rem; position: relative; align-items: flex-end; flex-shrink: 0; }
+    textarea { flex: 1; background: #0b0f19; border: 1px solid var(--border); color: #fff; padding: 0.8rem 1rem; border-radius: 8px; outline: none; resize: vertical; min-height: 48px; max-height: 400px; overflow-y: auto; line-height: 1.4; transition: border-color 0.2s; }
+    textarea:focus { border-color: var(--accent); box-shadow: 0 0 10px var(--accent-glow); }
+    .send-btn { background: var(--accent); color: #000; border: none; padding: 0 1.25rem; height: 48px; border-radius: 8px; cursor: pointer; transition: all 0.2s; display: flex; justify-content: center; align-items: center; }
+    .send-btn:hover { opacity: 0.9; transform: translateY(-1px); }
+    .send-btn svg { width: 20px; height: 20px; fill: currentColor; }
+    .autocomplete { position: absolute; bottom: 100%; left: 0; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 0.5rem; width: 300px; max-height: 200px; overflow-y: auto; box-shadow: 0 4px 12px rgba(0,0,0,0.5); z-index: 50; display: none; }
+    .ac-item { padding: 0.75rem 1rem; cursor: pointer; color: var(--text); font-size: 0.9rem; border-bottom: 1px solid var(--border); }
+    .ac-item:last-child { border-bottom: none; }
+    .ac-item:hover, .ac-item.active { background: #1e293b; color: var(--accent); }
+    
+    .typing-dots { display: inline-flex; align-items: center; gap: 4px; height: 1.5rem; vertical-align: middle; }
+    .typing-dots span { width: 6px; height: 6px; background-color: var(--accent); border-radius: 50%; animation: typing 1.4s infinite ease-in-out both; }
+    .typing-dots span:nth-child(1) { animation-delay: -0.32s; }
+    .typing-dots span:nth-child(2) { animation-delay: -0.16s; }
+    @keyframes typing { 0%, 80%, 100% { transform: scale(0); } 40% { transform: scale(1); } }
+    
+    .msg pre { background: #000; border-radius: 6px; padding: 1rem; margin: 0.5rem 0; overflow-x: auto; }
+    .msg code { font-family: monospace; }
+    .msg p { margin-bottom: 0.5rem; }
+    .msg p:last-child { margin-bottom: 0; }
     .metric-row { display: flex; justify-content: space-between; font-size: 0.85rem; color: var(--text-muted); }
     .metric-val { color: var(--text); font-weight: 600; }
-    .visual-frame { width: 100%; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); background: #080c14; display: flex; justify-content: center; align-items: center; min-height: 220px; }
+    .visual-frame { width: 100%; border-radius: 8px; border: 1px solid var(--border); background: #080c14; display: flex; justify-content: center; align-items: center; min-height: 220px; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); transform-origin: top right; position: relative; z-index: 1; cursor: zoom-in; }
+    .visual-frame:hover { transform: scale(1.8) translateX(-15%); z-index: 100; box-shadow: -10px 15px 40px rgba(0,0,0,0.9); border-color: var(--accent); }
+    .visual-frame svg { width: 100%; height: auto; display: block; }
   </style>
 </head>
 <body>
@@ -920,8 +962,11 @@ impl EmbeddedWebDashboard {
         <div class="msg agent">⚡ <b>zy agent ready.</b> 100% local, air-gapped, zero-latency pair programmer online. How can I assist you today?</div>
       </div>
       <div class="input-row">
-        <input type="text" id="user-input" placeholder="Type prompt or /slash command..." onkeydown="if(event.key==='Enter') sendPrompt()" />
-        <button onclick="sendPrompt()">Send</button>
+        <div id="autocomplete-box" class="autocomplete"></div>
+        <textarea id="user-input" rows="1" placeholder="Type prompt or /command... (Shift+Enter for new line)"></textarea>
+        <button class="send-btn" onclick="sendPrompt()" title="Send">
+          <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
+        </button>
       </div>
     </div>
 
@@ -938,31 +983,143 @@ impl EmbeddedWebDashboard {
   </div>
 
   <script>
+    const inp = document.getElementById('user-input');
+    const acBox = document.getElementById('autocomplete-box');
+    const commands = [
+      { cmd: '/radar', desc: 'Code Health Radar' },
+      { cmd: '/dag', desc: 'Swarm DAG Flow' },
+      { cmd: '/models', desc: 'Ollama Model List' },
+      { cmd: '/clear', desc: 'Clear Session' }
+    ];
+    let currentVisMode = null;
+
+    inp.addEventListener('input', function() {
+      this.style.height = '48px';
+      this.style.height = (this.scrollHeight) + 'px';
+      
+      const val = this.value;
+      if (val.startsWith('/')) {
+        const matches = commands.filter(c => c.cmd.startsWith(val));
+        if (matches.length > 0 && val.length < 10) {
+          acBox.innerHTML = matches.map(m => `<div class="ac-item" onclick="selectCmd('${m.cmd}')"><b>${m.cmd}</b> - ${m.desc}</div>`).join('');
+          acBox.style.display = 'block';
+        } else { acBox.style.display = 'none'; }
+      } else { acBox.style.display = 'none'; }
+    });
+
+    function selectCmd(cmd) {
+      inp.value = cmd + ' ';
+      inp.focus();
+      acBox.style.display = 'none';
+    }
+
+    inp.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        acBox.style.display = 'none';
+        sendPrompt();
+      }
+    });
+
+    marked.setOptions({
+      highlight: function(code, lang) {
+        if (lang && hljs.getLanguage(lang)) {
+          return hljs.highlight(code, { language: lang }).value;
+        }
+        return hljs.highlightAuto(code).value;
+      }
+    });
+
+    const typingHtml = `<div class="typing-dots"><span></span><span></span><span></span></div>`;
+
     async function sendPrompt() {
-      const inp = document.getElementById('user-input');
       const text = inp.value.trim();
       if (!text) return;
 
       const chat = document.getElementById('chat-box');
-      chat.innerHTML += `<div class="msg user">${text}</div>`;
+      chat.innerHTML += `<div class="msg user">${text.replace(/\\n/g, '<br/>')}</div>`;
       inp.value = '';
+      inp.style.height = '48px';
       chat.scrollTop = chat.scrollHeight;
 
       if (text.startsWith('/radar')) {
+        currentVisMode = 'radar';
+        chat.innerHTML += `<div class="msg agent" id="processing-msg">Scanning codebase health... ${typingHtml}</div>`;
         const res = await fetch('/api/radar/svg');
         const svg = await res.text();
+        const pMsg = document.getElementById('processing-msg');
+        if (pMsg) { pMsg.remove(); }
         document.getElementById('visual-container').innerHTML = svg;
-        chat.innerHTML += `<div class="msg agent">Rendered Codebase Health & Architecture Radar Chart.</div>`;
+        chat.innerHTML += `<div class="msg agent">Rendered Codebase Health & Architecture Radar Chart. Polling activated.</div>`;
       } else if (text.startsWith('/dag')) {
-        const res = await fetch('/api/dag/svg');
+        currentVisMode = 'dag';
+        chat.innerHTML += `<div class="msg agent" id="processing-msg">Planning swarm tasks via LLM... ${typingHtml}</div>`;
+        let prompt = text.replace('/dag', '').trim();
+        if (!prompt) prompt = "Refactor and optimize zy codebase";
+        const res = await fetch('/api/dag/svg', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ goal: prompt })
+        });
         const svg = await res.text();
+        const pMsg = document.getElementById('processing-msg');
+        if (pMsg) { pMsg.remove(); }
         document.getElementById('visual-container').innerHTML = svg;
-        chat.innerHTML += `<div class="msg agent">Rendered Swarm Workflow Topological DAG.</div>`;
+        chat.innerHTML += `<div class="msg agent">Rendered Swarm Workflow Topological DAG for "${prompt}".</div>`;
+      } else if (text.startsWith('/models')) {
+        chat.innerHTML += `<div class="msg agent" id="processing-msg">Fetching local models... ${typingHtml}</div>`;
+        const res = await fetch('/api/models');
+        const data = await res.json();
+        const pMsg = document.getElementById('processing-msg');
+        if (pMsg) { pMsg.remove(); }
+        let html = "<b>Available Local Models:</b><br/><ul>";
+        if (data.models) {
+          for (const m of data.models) {
+            html += `<li>${m.name}</li>`;
+          }
+        } else { html += "<li>No models found or Ollama is offline.</li>"; }
+        html += "</ul>";
+        chat.innerHTML += `<div class="msg agent">${html}</div>`;
+      } else if (text.startsWith('/clear')) {
+        chat.innerHTML = '<div class="msg agent">⚡ <b>zy agent ready.</b> Session cleared.</div>';
       } else {
-        chat.innerHTML += `<div class="msg agent">Processing request: "${text}" with local LLM engine...</div>`;
+        chat.innerHTML += `<div class="msg agent" id="processing-msg">Processing request: "${text}" with local LLM engine... ${typingHtml}</div>`;
+        chat.scrollTop = chat.scrollHeight;
+        
+        try {
+          const res = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt: text })
+          });
+          const data = await res.json();
+          const pMsg = document.getElementById('processing-msg');
+          if (pMsg) { pMsg.remove(); }
+          
+          let responseText = data.reply || "Error generating response.";
+          const formattedHtml = marked.parse(responseText);
+          chat.innerHTML += `<div class="msg agent">⚡ <b>zy:</b><br/>${formattedHtml}</div>`;
+        } catch (e) {
+          const pMsg = document.getElementById('processing-msg');
+          if (pMsg) { pMsg.remove(); }
+          chat.innerHTML += `<div class="msg agent" style="border-left-color:var(--danger)">⚡ <b>zy error:</b><br/>${e.message}</div>`;
+        }
       }
       chat.scrollTop = chat.scrollHeight;
     }
+
+    // Live telemetry background polling
+    setInterval(async () => {
+      if (currentVisMode === 'radar') {
+        try {
+          const res = await fetch('/api/radar/svg');
+          if (res.ok) {
+            const svg = await res.text();
+            document.getElementById('visual-container').innerHTML = svg;
+          }
+        } catch (e) { console.error('Radar polling failed', e); }
+      }
+    }, 5000);
 
     function sendQuick(cmd) {
       document.getElementById('user-input').value = cmd;
@@ -991,7 +1148,7 @@ impl EmbeddedWebDashboard {
                             let path = if parts.len() > 1 { parts[1] } else { "/" };
 
                             let (status, content_type, body) = match path {
-                                "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", Self::generate_dashboard_html()),
+                                "/" | "/index.html" => ("200 OK".to_string(), "text/html; charset=utf-8".to_string(), Self::generate_dashboard_html()),
                                 "/api/status" => {
                                     let json = serde_json::json!({
                                         "status": "healthy",
@@ -1000,19 +1157,38 @@ impl EmbeddedWebDashboard {
                                         "local": true,
                                         "tuner": "active"
                                     }).to_string();
-                                    ("200 OK", "application/json", json)
+                                    ("200 OK".to_string(), "application/json".to_string(), json)
                                 }
                                 "/api/radar/svg" => {
                                     let metrics = CodebaseRadarMetrics::calculate(Path::new("."));
-                                    ("200 OK", "image/svg+xml", metrics.to_svg())
+                                    ("200 OK".to_string(), "image/svg+xml".to_string(), metrics.to_svg())
                                 }
                                 "/api/dag/svg" => {
-                                    let dag = DagLayout::build_swarm_workflow_dag("Refactor and optimize zy codebase", &[
-                                        "Scan symbols and AST".to_string(),
-                                        "Run LSP diagnostics".to_string(),
-                                        "Generate automated tests".to_string(),
-                                    ]);
-                                    ("200 OK", "image/svg+xml", dag.to_svg())
+                                    let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim_matches('\0');
+                                    let mut target = "Refactor and optimize zy codebase".to_string();
+                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
+                                        if let Some(goal) = json.get("goal").and_then(|v| v.as_str()) {
+                                            if !goal.is_empty() { target = goal.to_string(); }
+                                        }
+                                    }
+                                    let mut subtasks = vec!["Scan symbols and AST".to_string(), "Run LSP diagnostics".to_string(), "Generate automated tests".to_string()];
+                                    let req = crate::ChatRequest {
+                                        model: "qwen2.5-coder:1.5b".to_string(),
+                                        messages: vec![crate::Message { role: "user".to_string(), content: format!("Break down this goal into 3-5 technical subtasks. Goal: {}\n\nReturn ONLY a JSON array of strings, nothing else. Example: [\"task 1\", \"task 2\"]", target), tool_calls: None, images: None }],
+                                        stream: false, tools: None, format: None, options: None, keep_alive: None,
+                                    };
+                                    let client = reqwest::Client::new();
+                                    if let Ok(res) = client.post(format!("{}/api/chat", crate::OLLAMA_URL)).json(&req).send().await {
+                                        if let Ok(chat_res) = res.json::<crate::ChatResponse>().await {
+                                            if let Some(msg) = chat_res.message {
+                                                if let Ok(parsed) = serde_json::from_str::<Vec<String>>(&msg.content) {
+                                                    if !parsed.is_empty() { subtasks = parsed; }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let dag = DagLayout::build_swarm_workflow_dag(&target, &subtasks);
+                                    ("200 OK".to_string(), "image/svg+xml".to_string(), dag.to_svg())
                                 }
                                 "/api/dag/json" => {
                                     let dag = DagLayout::build_swarm_workflow_dag("Refactor and optimize zy codebase", &[
@@ -1020,9 +1196,51 @@ impl EmbeddedWebDashboard {
                                         "Run LSP diagnostics".to_string(),
                                         "Generate automated tests".to_string(),
                                     ]);
-                                    ("200 OK", "application/json", serde_json::to_string(&dag).unwrap())
+                                    ("200 OK".to_string(), "application/json".to_string(), serde_json::to_string(&dag).unwrap())
                                 }
-                                _ => ("404 NOT FOUND", "text/plain", "Not Found".to_string()),
+                                "/api/models" => {
+                                    let client = reqwest::Client::new();
+                                    let mut reply = r#"{"models":[]}"#.to_string();
+                                    if let Ok(res) = client.get(format!("{}/api/tags", crate::OLLAMA_URL)).send().await {
+                                        if let Ok(text) = res.text().await {
+                                            reply = text;
+                                        }
+                                    }
+                                    ("200 OK".to_string(), "application/json".to_string(), reply)
+                                }
+                                "/api/chat" => {
+                                    let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim_matches('\0');
+                                    println!("HTTP BODY: {:?}", body_str);
+                                    let mut reply = "I didn't receive a prompt.".to_string();
+                                    
+                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
+                                        if let Some(prompt) = json.get("prompt").and_then(|v| v.as_str()) {
+                                            let req = crate::ChatRequest {
+                                                model: "qwen2.5-coder:1.5b".to_string(),
+                                                messages: vec![crate::Message { role: "user".to_string(), content: prompt.to_string(), tool_calls: None, images: None }],
+                                                stream: false,
+                                                tools: None,
+                                                format: None,
+                                                options: None,
+                                                keep_alive: None,
+                                            };
+                                            let client = reqwest::Client::new();
+                                            if let Ok(res) = client.post(format!("{}/api/chat", crate::OLLAMA_URL)).json(&req).send().await {
+                                                if let Ok(chat_res) = res.json::<crate::ChatResponse>().await {
+                                                    if let Some(msg) = chat_res.message {
+                                                        reply = msg.content;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    let json_res = serde_json::json!({
+                                        "reply": reply,
+                                    }).to_string();
+                                    ("200 OK".to_string(), "application/json".to_string(), json_res)
+                                }
+                                _ => ("404 NOT FOUND".to_string(), "text/plain".to_string(), "Not Found".to_string()),
                             };
 
                             let resp = format!(

@@ -25,7 +25,6 @@ pub fn create_optimized_ollama_client() -> Client {
         .pool_max_idle_per_host(64)
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(300))
-        .http2_prior_knowledge()
         .build()
         .unwrap_or_else(|_| Client::new())
 }
@@ -224,6 +223,8 @@ pub struct StreamTelemetry {
     pub total_duration_ms: u64,
     pub tokens_per_second: f64,
     pub reasoning_tokens: usize,
+    pub prompt_eval_count: u64,
+    pub prompt_eval_duration: u64,
 }
 
 pub struct StreamingTokenBuffer {
@@ -235,6 +236,8 @@ pub struct StreamingTokenBuffer {
     pub reasoning_token_count: usize,
     pub start_time: Instant,
     pub first_token_time: Option<Instant>,
+    pub prompt_eval_count: u64,
+    pub prompt_eval_duration: u64,
 }
 
 impl StreamingTokenBuffer {
@@ -248,6 +251,8 @@ impl StreamingTokenBuffer {
             reasoning_token_count: 0,
             start_time: Instant::now(),
             first_token_time: None,
+            prompt_eval_count: 0,
+            prompt_eval_duration: 0,
         }
     }
 
@@ -267,6 +272,13 @@ impl StreamingTokenBuffer {
             }
 
             if let Ok(parsed) = serde_json::from_str::<ChatResponse>(&line) {
+                if let Some(count) = parsed.prompt_eval_count {
+                    self.prompt_eval_count = count;
+                }
+                if let Some(duration) = parsed.prompt_eval_duration {
+                    self.prompt_eval_duration = duration;
+                }
+
                 if let Some(msg) = parsed.message {
                     let content = msg.content;
                     if !content.is_empty() {
@@ -318,6 +330,8 @@ impl StreamingTokenBuffer {
             total_duration_ms: total_ms,
             tokens_per_second: tps,
             reasoning_tokens: self.reasoning_token_count,
+            prompt_eval_count: self.prompt_eval_count,
+            prompt_eval_duration: self.prompt_eval_duration,
         }
     }
 }
@@ -468,9 +482,15 @@ impl OllamaBenchmarkEngine {
 
         let telemetry = buffer.finalize();
 
+        let prompt_eval_tps = if telemetry.prompt_eval_duration > 0 {
+            (telemetry.prompt_eval_count as f64) / (telemetry.prompt_eval_duration as f64 / 1_000_000_000.0)
+        } else {
+            0.0
+        };
+
         Ok(OllamaBenchmarkReport {
             model: model.to_string(),
-            prompt_eval_tps: 120.0, // Synthetic/estimated prompt eval bandwidth
+            prompt_eval_tps,
             generation_tps: telemetry.tokens_per_second,
             time_to_first_token_ms: telemetry.time_to_first_token_ms,
             total_latency_ms: telemetry.total_duration_ms,

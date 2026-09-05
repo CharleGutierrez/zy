@@ -3,7 +3,19 @@ use colored::Colorize;
 use zy::*;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(e) = run_cli().await {
+        let err_msg = e.to_string();
+        if err_msg.contains("connection closed") || err_msg.contains("Connection refused") {
+            eprintln!("\n{} Failed to connect to Ollama on localhost:11434.\n{} Please ensure Ollama is installed and running (`ollama serve`).", "❌".red().bold(), "💡".yellow());
+        } else {
+            eprintln!("{} Error: {}", "❌".red().bold(), e);
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let client = create_optimized_ollama_client();
 
@@ -91,9 +103,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let text = prompt.join(" ");
                 if cli.cloud_handoff && text.len() > 50 {
-                    println!("{} Payload exceeds threshold ({} bytes). Transparently chunking and routing to Cloud/Edge compute cluster...", "☁️".cyan().bold(), text.len());
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    println!("{} Edge server returned aggregated result successfully.", "✅".green());
+                    println!("{} Payload exceeds threshold ({} bytes). Routing to Cloud/Edge compute cluster...", "☁️".cyan().bold(), text.len());
+                    if let Ok(cloud_url) = std::env::var("ZY_CLOUD_API_URL") {
+                        let res = client.post(&cloud_url)
+                            .json(&serde_json::json!({ "prompt": text }))
+                            .send()
+                            .await;
+                        match res {
+                            Ok(resp) if resp.status().is_success() => {
+                                let body = resp.text().await.unwrap_or_default();
+                                println!("{} Edge server responded:\n{}", "✅".green(), body);
+                            }
+                            _ => {
+                                eprintln!("{} Cloud API request failed.", "❌".red().bold());
+                            }
+                        }
+                    } else {
+                        eprintln!("{} Error: ZY_CLOUD_API_URL is not set. Cannot perform real cloud handoff.", "❌".red().bold());
+                    }
                     return Ok(());
                 }
                 single_prompt(&client, model_name, final_sys_prompt, file, &text, *agent, session.as_deref(), *rag, *markdown, &tuner, *force, executor.clone(), *strategist, scout_model, format_schema, map_flag, sandbox_flag).await?;
@@ -735,11 +762,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("  Overall Rating:   {}", format!("{:.1}%", metrics.overall_score).green().bold());
                 }
                 "dag" => {
-                    let dag = DagLayout::build_swarm_workflow_dag(target, &[
+                    let mut subtasks = vec![
                         "Scan repository symbols".to_string(),
                         "Analyze architectural dependencies".to_string(),
                         "Execute automated verifications".to_string(),
-                    ]);
+                    ];
+                    
+                    let prompt = format!("Break down this goal into 3 to 5 discrete technical subtasks. Return ONLY a JSON array of strings. Goal: {}", target);
+                    let req = ChatRequest {
+                        model: cli.model.clone(),
+                        messages: vec![Message { role: "user".to_string(), content: prompt, tool_calls: None, images: None }],
+                        stream: false,
+                        tools: None,
+                        format: Some(serde_json::json!("json")),
+                        options: None,
+                        keep_alive: None,
+                    };
+                    
+                    if let Ok(res) = client.post(format!("{}/api/chat", OLLAMA_URL)).json(&req).send().await {
+                        if let Ok(chat_res) = res.json::<ChatResponse>().await {
+                            if let Some(msg) = chat_res.message {
+                                if let Ok(parsed_tasks) = serde_json::from_str::<Vec<String>>(&msg.content) {
+                                    if !parsed_tasks.is_empty() {
+                                        subtasks = parsed_tasks;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    let dag = DagLayout::build_swarm_workflow_dag(target, &subtasks);
                     println!("\n{}", "🔀 SWARM TOPOLOGICAL DAG MERMAID:".cyan().bold());
                     println!("{}\n", dag.to_mermaid().cyan());
                 }
