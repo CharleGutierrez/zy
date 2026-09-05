@@ -25,7 +25,7 @@ def setup_environment():
         # We install cpu-only torch to save massive download times unless CUDA is explicitly requested, 
         # but for SVD math, CPU torch is perfectly fine and uses system RAM which is what we need.
         subprocess.run([pip_path, "install", "--quiet", "torch", "--index-url", "https://download.pytorch.org/whl/cpu"], check=True)
-        subprocess.run([pip_path, "install", "--quiet", "transformers", "huggingface_hub", "safetensors", "gguf", "accelerate"], check=True)
+        subprocess.run([pip_path, "install", "--quiet", "transformers", "huggingface_hub", "safetensors", "gguf", "accelerate", "psutil"], check=True)
         
         log("  - Restarting pipeline inside the virtual environment...")
         # Re-launch script inside venv
@@ -35,14 +35,41 @@ def setup_environment():
 def run_math_pipeline(model_id, safe_name):
     # This function only runs inside the venv where torch is available
     import torch
+    import gc
+    import psutil
     from transformers import AutoModelForCausalLM, AutoTokenizer
     
+    # ----------------------------------------
+    # AI Memory & Processes Tuner
+    # ----------------------------------------
+    total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+    low_memory_mode = total_ram_gb < 12.0
+    
+    log(f"  [Tuner] Detected system RAM: {total_ram_gb:.1f} GB")
+    
+    if low_memory_mode:
+        log("  [Tuner] Low-Memory Mode ACTIVATED.")
+        log("  [Tuner] Restricting CPU threads to 4 to prevent OS lockup.")
+        torch.set_num_threads(4)
+        os.environ["OMP_NUM_THREADS"] = "4"
+        
+        log("  [Tuner] Downgrading precision to float16 to halve memory footprint (~3GB for 1.5B model).")
+        target_dtype = torch.float16
+    else:
+        log("  [Tuner] High-Memory Mode active. Using stable float32 precision.")
+        target_dtype = torch.float32
+
     log(f"[2/5] Downloading and loading weights for {model_id}...")
     log("  - This will consume significant RAM. Please wait...")
     
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    # Load in float32 for math stability on CPU
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32, device_map="cpu")
+    # Load with selected precision and memory limits
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, 
+        torch_dtype=target_dtype, 
+        device_map="cpu",
+        low_cpu_mem_usage=True
+    )
     
     log("[3/5] Computing orthogonal projection for refusal directions...")
     
@@ -80,6 +107,10 @@ def run_math_pipeline(model_id, safe_name):
     mean_harmful = get_mean_activations(harmful_prompts)
     mean_harmless = get_mean_activations(harmless_prompts)
     
+    if low_memory_mode:
+        log("  [Tuner] Triggering Garbage Collection to free prompt activations...")
+        gc.collect()
+    
     # Calculate refusal vector
     refusal_vector = mean_harmful - mean_harmless
     refusal_vector = refusal_vector / torch.norm(refusal_vector)
@@ -94,11 +125,15 @@ def run_math_pipeline(model_id, safe_name):
         for layer in model.model.layers:
             # We ablate the output projections that write into the residual stream
             if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'o_proj'):
-                layer.self_attn.o_proj.weight.copy_(layer.self_attn.o_proj.weight @ P)
+                layer.self_attn.o_proj.weight.copy_(layer.self_attn.o_proj.weight @ P.to(target_dtype))
                 modified_layers += 1
             if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'down_proj'):
-                layer.mlp.down_proj.weight.copy_(layer.mlp.down_proj.weight @ P)
+                layer.mlp.down_proj.weight.copy_(layer.mlp.down_proj.weight @ P.to(target_dtype))
                 modified_layers += 1
+                
+        if low_memory_mode:
+            log("  [Tuner] Triggering Garbage Collection to free memory after projection...")
+            gc.collect()
                 
     log(f"  - Successfully orthogonalized {modified_layers} weight matrices.")
     
