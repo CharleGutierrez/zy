@@ -125,10 +125,10 @@ def run_math_pipeline(model_id, safe_name):
         for layer in model.model.layers:
             # We ablate the output projections that write into the residual stream
             if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'o_proj'):
-                layer.self_attn.o_proj.weight.copy_(layer.self_attn.o_proj.weight @ P.to(target_dtype))
+                layer.self_attn.o_proj.weight.copy_(P.to(target_dtype) @ layer.self_attn.o_proj.weight)
                 modified_layers += 1
             if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'down_proj'):
-                layer.mlp.down_proj.weight.copy_(layer.mlp.down_proj.weight @ P.to(target_dtype))
+                layer.mlp.down_proj.weight.copy_(P.to(target_dtype) @ layer.mlp.down_proj.weight)
                 modified_layers += 1
                 
         if low_memory_mode:
