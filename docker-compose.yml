@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  zy-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    network_mode: "host"
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./models:/app/models
+    restart: unless-stopped
+
+  zy-tuner:
+    build:
+      context: .
+      dockerfile: Dockerfile.tuner
+    network_mode: "host"
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    environment:
+      - OLLAMA_HOST=http://127.0.0.1:11434
+    volumes:
+      - ./models:/app/models
+    restart: unless-stopped

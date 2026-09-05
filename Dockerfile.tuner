@@ -1,0 +1,23 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies (curl for testing, git for cloning llama.cpp)
+RUN apt-get update && apt-get install -y curl git && rm -rf /var/lib/apt/lists/*
+
+# Clone llama.cpp for GGUF conversion scripts
+RUN git clone https://github.com/ggerganov/llama.cpp.git /app/llama.cpp
+RUN pip install --no-cache-dir -r /app/llama.cpp/requirements.txt
+
+# Install PyTorch (CPU only) and other ML dependencies
+RUN pip install --no-cache-dir torch transformers huggingface-hub gguf sentencepiece tiktoken flask
+
+# Install Ollama CLI so it can import models
+RUN curl -fsSL https://ollama.com/install.sh | sh
+
+COPY tuner_api.py /app/tuner_api.py
+COPY zy_abliterate.py /app/zy_abliterate.py
+
+EXPOSE 5000
+
+CMD ["python", "tuner_api.py"]

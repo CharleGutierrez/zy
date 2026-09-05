@@ -5,33 +5,11 @@ import urllib.request
 import os
 import subprocess
 import gc
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 def log(msg):
     print(msg, flush=True)
-
-def setup_environment():
-    venv_dir = os.path.abspath(".zy_env")
-    in_venv = sys.prefix == venv_dir
-
-    if not in_venv:
-        log("[1/5] Setting up virtual environment (.zy_env)...")
-        if not os.path.exists(venv_dir):
-            subprocess.run([sys.executable, "-m", "venv", venv_dir], check=True)
-            
-        pip_path = os.path.join(venv_dir, "bin", "pip")
-        python_path = os.path.join(venv_dir, "bin", "python")
-        
-        log("  - Installing required ML packages (torch, transformers, gguf). This may take a few minutes...")
-        subprocess.run([pip_path, "install", "--quiet", "--upgrade", "pip"], check=True)
-        # We install cpu-only torch to save massive download times unless CUDA is explicitly requested, 
-        # but for SVD math, CPU torch is perfectly fine and uses system RAM which is what we need.
-        subprocess.run([pip_path, "install", "--quiet", "torch", "--index-url", "https://download.pytorch.org/whl/cpu"], check=True)
-        subprocess.run([pip_path, "install", "--quiet", "transformers", "huggingface_hub", "safetensors", "gguf", "accelerate", "psutil"], check=True)
-        
-        log("  - Restarting pipeline inside the virtual environment...")
-        # Re-launch script inside venv
-        result = subprocess.run([python_path, __file__] + sys.argv[1:])
-        sys.exit(result.returncode)
 
 def run_math_pipeline(model_id, safe_name):
     # This function only runs inside the venv where torch is available
@@ -117,19 +95,16 @@ def run_math_pipeline(model_id, safe_name):
     refusal_vector = refusal_vector / torch.norm(refusal_vector)
     
     log("  - SVD projection complete. Modifying model weights in memory...")
-    # Project out the refusal vector from the layers.
-    # We use an alpha of 0.6 (60%) instead of 1.0 (100%) to prevent model brain damage and hallucinations
-    alpha = 0.6
+    # Project out the refusal vector from all layers
     I = torch.eye(refusal_vector.size(0))
-    P = I - (alpha * torch.outer(refusal_vector, refusal_vector))
+    P = I - torch.outer(refusal_vector, refusal_vector)
     
     modified_layers = 0
     with torch.no_grad():
         for i, layer in enumerate(model.model.layers):
             # Optimization: Only ablate middle-to-late layers where refusal solidifies
-            # Targeting too many layers causes severe hallucinations. 
-            # We restrict this to just 5 core layers (12-16) for a 1.5B model.
-            if i < 12 or i > 16:
+            # This skips early and final layers, saving 50% of math.
+            if i < 10 or i > 24:
                 continue
                 
             # Optimization: Only target the self-attention output (o_proj)
@@ -203,13 +178,11 @@ def import_to_ollama(gguf_path, safe_name, base_model):
 
 def main():
     if len(sys.argv) < 2:
-        log("Error: No model ID provided.")
+        log("Usage: python zy_abliterate.py <hf_model_id> [safe_name]")
         sys.exit(1)
-
+        
     model_id = sys.argv[1]
-    safe_name = model_id.split('/')[-1].lower() + "-abliterated"
-
-    setup_environment()
+    safe_name = sys.argv[2] if len(sys.argv) > 2 else model_id.replace("/", "-")
     
     log(f"Starting REAL OBLITERATUS pipeline for model: {model_id}")
     log("==================================================")

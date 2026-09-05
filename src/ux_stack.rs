@@ -1682,7 +1682,7 @@ impl EmbeddedWebDashboard {
       <div class="panel-section">
         <h3>Model Lab</h3>
         <p>Abliterate Refusal Weights (OBLITERATUS)</p>
-        <input type="text" id="hfModelId" placeholder="meta-llama/Meta-Llama-3-8B" style="width:100%; margin-bottom:5px;">
+        <input type="text" id="hfModelId" placeholder="Qwen/Qwen2.5-Coder-1.5B" style="width:100%; margin-bottom:5px;">
         <button onclick="startAbliteration()" style="width:100%; background:linear-gradient(90deg, #ec4899, #8b5cf6); border:none; padding:8px; border-radius:4px; color:white; font-weight:bold; cursor:pointer;">Uncensor & Import</button>
       </div>
 
@@ -2064,7 +2064,7 @@ impl EmbeddedWebDashboard {
     }
 
     async function startAbliteration() {
-        const modelId = document.getElementById('hfModelId').value || 'meta-llama/Meta-Llama-3-8B';
+        const modelId = document.getElementById('hfModelId').value || 'Qwen/Qwen2.5-Coder-1.5B';
         const chat = document.getElementById('chat-box');
         chat.insertAdjacentHTML('beforeend', `<div class="msg agent" id="processing-msg">Initializing OBLITERATUS Pipeline... ${typingHtml}</div>`);
         chat.scrollTop = chat.scrollHeight;
@@ -2309,7 +2309,7 @@ impl EmbeddedWebDashboard {
     }
 
     pub async fn start(port: u16) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
         println!("{}", format!("⚡ zy Embedded Web Dashboard listening at http://127.0.0.1:{}", port).green().bold());
 
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(10000);
@@ -2373,7 +2373,7 @@ impl EmbeddedWebDashboard {
                             
                             if path == "/api/models/abliterate" {
                                 let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim_matches('\0');
-                                let mut hf_model = "meta-llama/Meta-Llama-3-8B".to_string();
+                                let mut hf_model = "Qwen/Qwen2.5-Coder-1.5B".to_string();
                                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
                                     if let Some(m) = json.get("hf_model").and_then(|v| v.as_str()) {
                                         hf_model = m.to_string();
@@ -2382,28 +2382,31 @@ impl EmbeddedWebDashboard {
                                 
                                 let tx_clone = tx.clone();
                                 tokio::spawn(async move {
-                                    use tokio::process::Command;
-                                    use std::process::Stdio;
-                                    use tokio::io::{AsyncBufReadExt, BufReader};
-
-                                    let _ = tx_clone.send(serde_json::json!({ "type": "status", "msg": format!("Initializing Python environment...") }).to_string());
+                                    let _ = tx_clone.send(serde_json::json!({ "type": "status", "msg": format!("Initializing AI Tuner Microservice...") }).to_string());
                                     
-                                    let mut child = Command::new("python3")
-                                        .arg("zy_abliterate.py")
-                                        .arg(hf_model)
-                                        .stdout(Stdio::piped())
-                                        .spawn()
-                                        .expect("failed to spawn zy_abliterate.py");
-                                        
-                                    if let Some(stdout) = child.stdout.take() {
-                                        let mut reader = BufReader::new(stdout).lines();
-                                        while let Ok(Some(line)) = reader.next_line().await {
-                                            let _ = tx_clone.send(serde_json::json!({ "type": "status", "msg": line }).to_string());
+                                    let client = reqwest::Client::new();
+                                    let req_body = serde_json::json!({
+                                        "model_id": hf_model,
+                                        "safe_name": hf_model.replace("/", "-").to_lowercase() + "-abliterated"
+                                    });
+                                    
+                                    match client.post("http://127.0.0.1:5000/tune").json(&req_body).send().await {
+                                        Ok(mut res) => {
+                                            use futures_util::StreamExt;
+                                            while let Some(chunk) = res.chunk().await.unwrap_or(None) {
+                                                if let Ok(text) = String::from_utf8(chunk.to_vec()) {
+                                                    for line in text.lines() {
+                                                        if !line.is_empty() {
+                                                            let _ = tx_clone.send(line.to_string());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        Err(e) => {
+                                            let _ = tx_clone.send(serde_json::json!({ "type": "status", "msg": format!("FATAL ERROR connecting to zy-tuner: {}", e) }).to_string());
                                         }
                                     }
-                                    
-                                    let _ = child.wait().await;
-                                    let _ = tx_clone.send(serde_json::json!({ "type": "status", "msg": "Abliteration pipeline completed.".to_string() }).to_string());
                                 });
                                 
                                 use tokio::io::AsyncWriteExt;
