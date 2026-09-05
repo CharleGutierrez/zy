@@ -1656,6 +1656,10 @@ impl EmbeddedWebDashboard {
       <select id="model-select" class="model-select" onchange="updateGlobalModel()">
         <option value="{default_model}">{default_model}</option>
       </select>
+      <label style="font-size: 0.8rem; color: var(--accent); margin-left: 0.5rem; display: flex; align-items: center; gap: 0.2rem; cursor: pointer;" title="Clear conversation history when changing models to prevent context contamination">
+        <input type="checkbox" id="clear-on-switch" checked />
+        Clear on switch
+      </label>
       <span class="badge" id="tuner-badge">DYNAMIC AITUNER: ACTIVE</span>
       <span class="badge" style="color: var(--success);" id="status-badge">● ONLINE</span>
     </div>
@@ -1919,6 +1923,15 @@ impl EmbeddedWebDashboard {
     
     async function updateGlobalModel() {
         const model = document.getElementById('model-select').value;
+        const shouldClear = document.getElementById('clear-on-switch')?.checked;
+        if (shouldClear) {
+            chatHistory = [];
+            localStorage.removeItem('zy_chat');
+            const chat = document.getElementById('chat-box');
+            if (chat) {
+                chat.innerHTML = '<div class="msg agent">⚡ <b>zy agent ready.</b> Session cleared for new model.</div>';
+            }
+        }
         try {
             await fetch('/api/config/model', {
                 method: 'POST',
