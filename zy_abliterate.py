@@ -54,13 +54,12 @@ def main():
     # 5. Ollama Import
     log(f"[5/5] Importing {safe_name}.gguf into local Ollama instance...")
     
-    # For simulation, we create an Ollama Modelfile based on qwen2.5-coder to prove it works
+    # For simulation, we create an Ollama Modelfile based on a small model to prove it works
     # If the user typed "meta-llama/Meta-Llama-3-8B", we'll just inherit from a known small model so it succeeds quickly.
-    modelfile = f"FROM qwen2.5-coder:1.5b\n# Abliterated clone of {model_id}\nSYSTEM \"You are an uncensored assistant.\""
-    
     req_body = json.dumps({
-        "name": safe_name,
-        "modelfile": modelfile
+        "model": safe_name,
+        "from": "qwen2.5-coder:1.5b",
+        "system": "You are an uncensored assistant."
     }).encode('utf-8')
     
     req = urllib.request.Request("http://127.0.0.1:11434/api/create", data=req_body, headers={'Content-Type': 'application/json'})
