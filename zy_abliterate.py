@@ -4,6 +4,7 @@ import json
 import urllib.request
 import os
 import subprocess
+import gc
 
 def log(msg):
     print(msg, flush=True)
