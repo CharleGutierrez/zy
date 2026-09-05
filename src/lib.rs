@@ -685,6 +685,7 @@ pub struct ToolCall {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Message {
     pub role: String,
+    #[serde(default)]
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -21483,3 +21484,4 @@ pub async fn run_vertical_minimap(file: &str) -> Result<(), Box<dyn std::error::
     }
     Ok(())
 }
+

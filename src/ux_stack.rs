@@ -1327,29 +1327,71 @@ impl EmbeddedWebDashboard {
                 }
             };
 
+            if !res.status().is_success() {
+                let status = res.status();
+                let err_text = res.text().await.unwrap_or_default();
+                let err_msg = format!("Ollama API Error ({}): {}", status, err_text);
+                let err_json = serde_json::json!({ "type": "done", "msg": err_msg }).to_string();
+                let _ = tx.send(err_json);
+                break;
+            }
+
             use futures_util::StreamExt;
             let mut stream = res.bytes_stream();
             let mut full_content = String::new();
             let mut full_tool_calls = vec![];
+            let mut line_buf = String::new();
             
-            while let Some(item) = stream.next().await {
-                if let Ok(bytes) = item {
-                    let chunk_str = String::from_utf8_lossy(&bytes);
-                    for line in chunk_str.lines() {
-                        if line.trim().is_empty() { continue; }
-                        if let Ok(chat_res) = serde_json::from_str::<crate::ChatResponse>(line) {
-                            if let Some(msg) = chat_res.message {
-                                if !msg.content.is_empty() {
-                                    full_content.push_str(&msg.content);
-                                    let _ = tx.send(serde_json::json!({ "type": "chunk", "msg": msg.content }).to_string());
-                                }
-                                if let Some(mut tc) = msg.tool_calls {
-                                    full_tool_calls.append(&mut tc);
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        let chunk_str = String::from_utf8_lossy(&bytes);
+                        line_buf.push_str(&chunk_str);
+                        
+                        while let Some(idx) = line_buf.find('\n') {
+                            let line = line_buf[..idx].to_string();
+                            line_buf = line_buf[idx+1..].to_string();
+                            
+                            if line.trim().is_empty() { continue; }
+                            println!("RAW CHUNK: {}", line);
+                            match serde_json::from_str::<crate::ChatResponse>(&line) {
+                                Ok(chat_res) => {
+                                    if let Some(err_msg) = chat_res.error {
+                                        let err_json = serde_json::json!({ "type": "done", "msg": format!("Ollama Stream Error: {}", err_msg) }).to_string();
+                                        let _ = tx.send(err_json);
+                                        break;
+                                    }
+                                    if let Some(msg) = chat_res.message {
+                                        if !msg.content.is_empty() {
+                                            full_content.push_str(&msg.content);
+                                            let _ = tx.send(serde_json::json!({ "type": "chunk", "msg": msg.content }).to_string());
+                                        }
+                                        if let Some(mut tc) = msg.tool_calls {
+                                            full_tool_calls.append(&mut tc);
+                                        }
+                                    }
+                                    if chat_res.done.unwrap_or(false) {
+                                        break;
+                                    }
+                                },
+                                Err(e) => {
+                                    println!("JSON Parse Error: {}. Line: {}", e, line);
                                 }
                             }
                         }
                     }
+                    Err(e) => {
+                        let err_msg = format!("Stream read error: {}", e);
+                        println!("{}", err_msg);
+                        let err_json = serde_json::json!({ "type": "done", "msg": err_msg }).to_string();
+                        let _ = tx.send(err_json);
+                        break;
+                    }
                 }
+            }
+            
+            if !line_buf.trim().is_empty() {
+                println!("LEFTOVER BUF: {}", line_buf);
             }
             
             if true {
@@ -1616,7 +1658,7 @@ impl EmbeddedWebDashboard {
 
     <!-- Center Column: Agent Chat & REPL -->
     <div class="card">
-      <h3>🤖 Autonomous Agent REPL</h3>
+      <h3>🤖 Autonomous Agent REPL <span style="font-size: 0.6em; color: var(--accent);">(v1.1)</span></h3>
       <div class="chat-box" id="chat-box">
       </div>
       <div class="input-row">
@@ -1656,6 +1698,20 @@ impl EmbeddedWebDashboard {
   </div>
 
   <script>
+    window.onerror = function(msg, url, lineNo, columnNo, error) {
+      const chat = document.getElementById('chat-box');
+      if (chat) {
+        chat.insertAdjacentHTML('beforeend', `<div class="msg agent" style="border-left-color:red; color:red;"><b>GLOBAL ERROR:</b><br/>${msg}<br/>Line: ${lineNo}</div>`);
+      }
+      return false;
+    };
+    window.addEventListener("unhandledrejection", function(event) {
+      const chat = document.getElementById('chat-box');
+      if (chat) {
+        chat.insertAdjacentHTML('beforeend', `<div class="msg agent" style="border-left-color:red; color:red;"><b>PROMISE ERROR:</b><br/>${event.reason}</div>`);
+      }
+    });
+
     const inp = document.getElementById('user-input');
     const acBox = document.getElementById('autocomplete-box');
     const commands = [
@@ -1861,15 +1917,25 @@ impl EmbeddedWebDashboard {
         const chat = document.getElementById('chat-box');
         const trail = document.getElementById('event-trail');
         
-        if (data.type === 'thought') {
-            const pMsg = document.getElementById('processing-msg');
-            if (pMsg) {
-                pMsg.innerHTML = `<span style="color:var(--accent);">[Thinking]</span> ... ${typingHtml}`;
+        if (data.type === 'thought' || data.type === 'status') {
+            console.log('SSE thought/status:', data.msg);
+            let pMsg = document.getElementById('processing-msg');
+            if (!pMsg) {
+                chat.insertAdjacentHTML('beforeend', `<div class="msg agent" id="processing-msg"></div>`);
+                pMsg = document.getElementById('processing-msg');
+                chat.scrollTop = chat.scrollHeight;
             }
+            
+            if (data.type === 'thought') {
+                pMsg.innerHTML = `<span style="color:var(--accent);">[Thinking]</span> ... ${typingHtml}`;
+            } else {
+                pMsg.innerHTML = `<span style="color:var(--accent);">[Agent Action]</span> ${data.msg} ... ${typingHtml}`;
+            }
+
             if (trail && trail.parentElement.style.display !== 'none') {
                 const el = document.createElement('div');
                 el.style.color = 'var(--text-muted)';
-                el.innerText = `🤔 Thought: ${data.msg}`;
+                el.innerText = data.type === 'thought' ? `🤔 Thought: ${data.msg}` : `⚙️ Status: ${data.msg}`;
                 trail.appendChild(el);
                 trail.scrollTop = trail.scrollHeight;
             }
@@ -1890,10 +1956,10 @@ impl EmbeddedWebDashboard {
                 trail.scrollTop = trail.scrollHeight;
             }
         } else if (data.type === 'chunk') {
-            const pMsg = document.getElementById('processing-msg');
+            console.log('SSE chunk received');
+            let pMsg = document.getElementById('processing-msg');
             if (pMsg) {
-                pMsg.id = 'agent-msg';
-                pMsg.innerHTML = '⚡ <b>zy:</b><br/>';
+                pMsg.remove();
             }
             let currentMsg = document.getElementById('agent-msg');
             if (!currentMsg) {
@@ -1903,16 +1969,11 @@ impl EmbeddedWebDashboard {
             const safeText = data.msg.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, '<br/>');
             currentMsg.innerHTML += safeText;
             chat.scrollTop = chat.scrollHeight;
-        } else if (data.type === 'status') {
-           const pMsg = document.getElementById('processing-msg');
-           if (pMsg) {
-             pMsg.innerHTML = `<span style="color:var(--accent);">[Agent Action]</span> ${data.msg} ... ${typingHtml}`;
-           }
         } else if (data.type === 'done') {
            const pMsg = document.getElementById('processing-msg');
            if (pMsg) { pMsg.remove(); }
            const aMsg = document.getElementById('agent-msg');
-           if (aMsg) { aMsg.remove(); }
+           if (aMsg) { aMsg.removeAttribute('id'); }
            
            if (data.msg && data.msg.trim() !== '') {
                chatHistory.push({ role: 'assistant', content: data.msg });
@@ -1959,9 +2020,15 @@ impl EmbeddedWebDashboard {
     async function sendPrompt() {
       const text = inp.value.trim();
       if (!text) return;
+      
+      console.log('Sending prompt:', text);
 
       chatHistory.push({ role: 'user', content: text });
-      localStorage.setItem('zy_chat', JSON.stringify(chatHistory));
+      try {
+        localStorage.setItem('zy_chat', JSON.stringify(chatHistory));
+      } catch (e) {
+        console.warn('LocalStorage error:', e);
+      }
 
       const chat = document.getElementById('chat-box');
       chat.insertAdjacentHTML('beforeend', `<div class="msg user">${text.replace(/\\n/g, '<br/>')}</div>`);
@@ -1971,7 +2038,7 @@ impl EmbeddedWebDashboard {
 
       if (text.startsWith('/radar')) {
         currentVisMode = 'radar';
-        chat.innerHTML += `<div class="msg agent" id="processing-msg">Scanning codebase health... ${typingHtml}</div>`;
+        chat.insertAdjacentHTML('beforeend', `<div class="msg agent" id="processing-msg">Scanning codebase health... ${typingHtml}</div>`);
         const res = await fetch('/api/radar/svg');
         const svg = await res.text();
         const pMsg = document.getElementById('processing-msg');
@@ -1980,10 +2047,10 @@ impl EmbeddedWebDashboard {
         const msgHtml = "Rendered Codebase Health & Architecture Radar Chart. Polling activated.";
         chatHistory.push({ role: 'assistant', content: msgHtml });
         localStorage.setItem('zy_chat', JSON.stringify(chatHistory));
-        chat.innerHTML += `<div class="msg agent">⚡ <b>zy:</b><br/>${msgHtml}</div>`;
+        chat.insertAdjacentHTML('beforeend', `<div class="msg agent">⚡ <b>zy:</b><br/>${msgHtml}</div>`);
       } else if (text.startsWith('/dag')) {
         currentVisMode = 'dag';
-        chat.innerHTML += `<div class="msg agent" id="processing-msg">Planning swarm tasks via LLM... ${typingHtml}</div>`;
+        chat.insertAdjacentHTML('beforeend', `<div class="msg agent" id="processing-msg">Planning swarm tasks via LLM... ${typingHtml}</div>`);
         let prompt = text.replace('/dag', '').trim();
         if (!prompt) prompt = "Refactor and optimize zy codebase";
         
@@ -1999,7 +2066,7 @@ impl EmbeddedWebDashboard {
         document.getElementById('visual-container').innerHTML = data.svg;
         
         // 2. Trigger the true execution (which streams via SSE)
-        chat.innerHTML += `<div class="msg agent" id="processing-msg">Executing DAG with multiple parallel agents... ${typingHtml}</div>`;
+        chat.insertAdjacentHTML('beforeend', `<div class="msg agent" id="processing-msg">Executing DAG with multiple parallel agents... ${typingHtml}</div>`);
         chat.scrollTop = chat.scrollHeight;
         
         try {
@@ -2012,7 +2079,7 @@ impl EmbeddedWebDashboard {
             console.error('DAG execute error', e);
         }
       } else if (text.startsWith('/models')) {
-        chat.innerHTML += `<div class="msg agent" id="processing-msg">Fetching local models... ${typingHtml}</div>`;
+        chat.insertAdjacentHTML('beforeend', `<div class="msg agent" id="processing-msg">Fetching local models... ${typingHtml}</div>`);
         const res = await fetch('/api/models');
         const data = await res.json();
         const pMsg = document.getElementById('processing-msg');
@@ -2032,12 +2099,13 @@ impl EmbeddedWebDashboard {
         localStorage.removeItem('zy_chat');
         chat.innerHTML = '<div class="msg agent">⚡ <b>zy agent ready.</b> Session cleared.</div>';
       } else if (text.startsWith('/stop')) {
-        chat.innerHTML += `<div class="msg agent" id="processing-msg">Stopping agent... ${typingHtml}</div>`;
+        chat.insertAdjacentHTML('beforeend', `<div class="msg agent" id="processing-msg">Stopping agent... ${typingHtml}</div>`);
         const res = await fetch('/api/stop');
         const pMsg = document.getElementById('processing-msg');
         if (pMsg) { pMsg.remove(); }
       } else {
-        chat.innerHTML += `<div class="msg agent" id="processing-msg">Processing request with local LLM engine... ${typingHtml}</div>`;
+        console.log('Displaying processing msg');
+        chat.insertAdjacentHTML('beforeend', `<div class="msg agent" id="processing-msg">Processing request with local LLM engine... ${typingHtml}</div>`);
         chat.scrollTop = chat.scrollHeight;
         
         try {
@@ -2064,7 +2132,7 @@ impl EmbeddedWebDashboard {
           console.error('Chat error', e);
           const pMsg = document.getElementById('processing-msg');
           if (pMsg) { pMsg.remove(); }
-          chat.innerHTML += `<div class="msg agent" style="border-left-color:var(--danger)">⚡ <b>zy error:</b><br/>${e.message}</div>`;
+          chat.insertAdjacentHTML('beforeend', `<div class="msg agent" style="border-left-color:var(--danger)">⚡ <b>zy error:</b><br/>${e.message}</div>`);
         }
       }
       chat.scrollTop = chat.scrollHeight;
@@ -2342,7 +2410,7 @@ impl EmbeddedWebDashboard {
                             };
 
                             let resp = format!(
-                                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
+                                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate, max-age=0\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
                                 status,
                                 content_type,
                                 body.len(),
