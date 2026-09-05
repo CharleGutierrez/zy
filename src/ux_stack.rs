@@ -1258,6 +1258,13 @@ impl EmbeddedWebDashboard {
                 });
                 has_user_prompt = true;
             }
+
+            messages.push(crate::Message {
+                role: "system".to_string(),
+                content: format!("REMINDER: You are currently running on the '{}' model. Please act as this model, and disregard any conflicting model identities established in previous conversation turns.", selected_model),
+                tool_calls: None,
+                images: None
+            });
         }
         
         if !has_user_prompt { return; }
