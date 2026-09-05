@@ -1132,13 +1132,16 @@ impl EmbeddedWebDashboard {
         let extensions = vec!["rs", "md", "js", "html", "css", "toml", "json"];
         let mut count = 0;
         
-        for entry in walkdir::WalkDir::new(".") {
+        let walker = walkdir::WalkDir::new(".").into_iter().filter_entry(|e| {
+            let n = e.file_name().to_string_lossy();
+            !n.starts_with(".git") && n != "target" && n != "node_modules"
+        });
+        
+        for entry in walker {
             let entry = match entry { Ok(e) => e, Err(_) => continue };
             if entry.file_type().is_dir() { continue; }
             let path = entry.path();
             let path_str = path.to_string_lossy().to_string();
-            
-            if path_str.contains("/target/") || path_str.contains("/.git/") || path_str.contains("node_modules") { continue; }
             
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if !extensions.contains(&ext) { continue; }
@@ -2373,12 +2376,14 @@ impl EmbeddedWebDashboard {
                                 }
                                 "/api/files" => {
                                     let mut files = Vec::new();
-                                    for entry in walkdir::WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
+                                    let walker = walkdir::WalkDir::new(".").into_iter().filter_entry(|e| {
+                                        let n = e.file_name().to_string_lossy();
+                                        !n.starts_with(".git") && n != "target" && n != "node_modules"
+                                    });
+                                    for entry in walker.filter_map(|e| e.ok()) {
                                         if entry.file_type().is_file() {
                                             let path_str = entry.path().display().to_string();
-                                            if !path_str.contains("/.git/") && !path_str.contains("/target/") {
-                                                files.push(path_str.trim_start_matches("./").to_string());
-                                            }
+                                            files.push(path_str.trim_start_matches("./").to_string());
                                         }
                                     }
                                     let json = serde_json::json!({ "files": files }).to_string();
