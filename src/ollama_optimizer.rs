@@ -161,6 +161,7 @@ impl BatchedEmbeddingEngine {
             model: model.to_string(),
             prompt: text.to_string(),
             keep_alive: Some(-1),
+            options: None,
         };
 
         let res = self.client.post(format!("{}/api/embeddings", OLLAMA_URL))

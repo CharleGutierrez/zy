@@ -866,7 +866,652 @@ impl EmbeddedWebDashboard {
         }
     }
 
+    fn create_checkpoint(name: &str) -> String {
+        let cp_dir = std::path::Path::new("zy_checkpoints").join(name);
+        if cp_dir.exists() {
+            return format!("Checkpoint '{}' already exists.", name);
+        }
+        let _ = std::fs::create_dir_all(&cp_dir);
+        let mut count = 0;
+        for entry in walkdir::WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.components().any(|c| c.as_os_str() == ".git" || c.as_os_str() == "target" || c.as_os_str() == "node_modules" || c.as_os_str() == "zy_checkpoints") {
+                continue;
+            }
+            if path.is_file() {
+                let rel = path.strip_prefix(".").unwrap_or(path);
+                let target = cp_dir.join(rel);
+                if let Some(p) = target.parent() {
+                    let _ = std::fs::create_dir_all(p);
+                }
+                if std::fs::copy(path, target).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        format!("Checkpoint '{}' created with {} files.", name, count)
+    }
+
+    fn restore_checkpoint(name: &str) -> String {
+        let cp_dir = std::path::Path::new("zy_checkpoints").join(name);
+        if !cp_dir.exists() {
+            return format!("Checkpoint '{}' does not exist.", name);
+        }
+        let mut count = 0;
+        for entry in walkdir::WalkDir::new(&cp_dir).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_file() {
+                let rel = path.strip_prefix(&cp_dir).unwrap_or(path);
+                let target = std::path::Path::new(".").join(rel);
+                if let Some(p) = target.parent() {
+                    let _ = std::fs::create_dir_all(p);
+                }
+                if std::fs::copy(path, target).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        format!("Checkpoint '{}' restored with {} files.", name, count)
+    }
+
+    fn list_checkpoints() -> String {
+        let cp_dir = std::path::Path::new("zy_checkpoints");
+        if !cp_dir.exists() {
+            return "No checkpoints found.".to_string();
+        }
+        let mut cps = vec![];
+        if let Ok(entries) = std::fs::read_dir(cp_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                if entry.path().is_dir() {
+                    cps.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        if cps.is_empty() {
+            "No checkpoints found.".to_string()
+        } else {
+            format!("Available checkpoints: {}", cps.join(", "))
+        }
+    }
+
+    fn get_agent_tools() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_command",
+                    "description": "Execute a bash command on the local system",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": { "type": "string", "description": "The command to run" }
+                        },
+                        "required": ["command"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read the contents of a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Path to the file" }
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write or overwrite a file with content",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "content": { "type": "string" }
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_checkpoint",
+                    "description": "Take a snapshot of the current workspace before making risky changes",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "A unique name for the checkpoint (e.g. 'before_refactor')" }
+                        },
+                        "required": ["name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "restore_checkpoint",
+                    "description": "Restore the workspace to a previously taken snapshot",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "The name of the checkpoint to restore" }
+                        },
+                        "required": ["name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_checkpoints",
+                    "description": "List all available checkpoints",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+            }
+        ])
+    }
+
+    async fn handle_events_sse(stream: &mut tokio::net::TcpStream, tx: tokio::sync::broadcast::Sender<String>) {
+        use tokio::io::AsyncWriteExt;
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+        if stream.write_all(headers.as_bytes()).await.is_err() { return; }
+
+        let mut rx = tx.subscribe();
+        while let Ok(msg) = rx.recv().await {
+            if stream.write_all(format!("data: {}\n\n", msg).as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    async fn handle_dag_execute(req_str: String, tx: tokio::sync::broadcast::Sender<String>, cancel_token: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim_matches('\0');
+        let mut target = "Refactor".to_string();
+        let mut subtasks = vec![];
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
+            if let Some(goal) = json.get("goal").and_then(|v| v.as_str()) {
+                if !goal.is_empty() { target = goal.to_string(); }
+            }
+            if let Some(tasks) = json.get("subtasks").and_then(|v| v.as_array()) {
+                for t in tasks {
+                    if let Some(t_str) = t.as_str() { subtasks.push(t_str.to_string()); }
+                }
+            }
+        }
+        
+        let _ = tx.send(serde_json::json!({ "type": "status", "msg": format!("Orchestrating {} parallel agents...", subtasks.len()) }).to_string());
+
+        let mut handles = vec![];
+        for (i, task) in subtasks.into_iter().enumerate() {
+            let tx_clone = tx.clone();
+            let cancel_clone = cancel_token.clone();
+            let handle = tokio::spawn(async move {
+                if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) { return format!("Agent {} cancelled.", i+1); }
+                let _ = tx_clone.send(serde_json::json!({ "type": "thought", "msg": format!("Agent {} started: {}", i+1, task) }).to_string());
+                
+                let mut tuning_options = crate::OllamaOptions::default();
+                tuning_options.num_thread = Some(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).max(1));
+                tuning_options.num_ctx = Some(4096);
+                tuning_options.num_predict = Some(1024);
+                let req = crate::ChatRequest {
+                    model: "qwen2.5-coder:1.5b".to_string(),
+                    messages: vec![crate::Message { 
+                        role: "user".to_string(), 
+                        content: format!("You are an agent assigned a subtask.\nSubtask: {}\nExecute it and return your result.", task), 
+                        tool_calls: None, images: None 
+                    }],
+                    stream: false, tools: None, format: None, options: Some(tuning_options), keep_alive: None,
+                };
+                let client = reqwest::Client::new();
+                if let Ok(res) = client.post(format!("{}/api/chat", crate::OLLAMA_URL)).json(&req).send().await {
+                    if let Ok(chat_res) = res.json::<crate::ChatResponse>().await {
+                        if let Some(msg) = chat_res.message {
+                            let _ = tx_clone.send(serde_json::json!({ "type": "tool_result", "name": format!("Agent {}", i+1), "result": msg.content.clone() }).to_string());
+                            return format!("Agent {} ({}):\n{}", i+1, task, msg.content);
+                        }
+                    }
+                }
+                format!("Agent {} ({}) failed.", i+1, task)
+            });
+            handles.push(handle);
+        }
+
+        let mut all_results = vec![];
+        for handle in handles {
+            if let Ok(res) = handle.await {
+                all_results.push(res);
+            }
+        }
+
+        let final_report = format!("# Swarm Execution Complete\n\n## Goal: {}\n\n{}", target, all_results.join("\n\n---\n\n"));
+        let _ = tx.send(serde_json::json!({ "type": "done", "msg": final_report }).to_string());
+    }
+
+    fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot / (norm_a * norm_b) }
+    }
+
+    async fn handle_rag_index(req_str: String, tx: tokio::sync::broadcast::Sender<String>, _cancel_token: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let _ = tx.send(serde_json::json!({ "type": "status", "msg": "Starting Codebase Indexing for Local Auto-RAG...".to_string() }).to_string());
+        
+        let mut selected_model = "qwen2.5-coder:1.5b".to_string();
+        let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim_matches('\0');
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
+            if let Some(m) = json.get("model").and_then(|v| v.as_str()) {
+                selected_model = m.to_string();
+            }
+        }
+        let mut chunks = vec![];
+        let client = reqwest::Client::new();
+        
+        let extensions = vec!["rs", "md", "js", "html", "css", "toml", "json"];
+        let mut count = 0;
+        
+        for entry in walkdir::WalkDir::new(".") {
+            let entry = match entry { Ok(e) => e, Err(_) => continue };
+            if entry.file_type().is_dir() { continue; }
+            let path = entry.path();
+            let path_str = path.to_string_lossy().to_string();
+            
+            if path_str.contains("/target/") || path_str.contains("/.git/") || path_str.contains("node_modules") { continue; }
+            
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !extensions.contains(&ext) { continue; }
+            
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let lines: Vec<&str> = content.lines().collect();
+                for (i, chunk_lines) in lines.chunks(100).enumerate() {
+                    let text = chunk_lines.join("\n");
+                    if text.trim().is_empty() { continue; }
+                    
+                    let mut tuning_options = crate::OllamaOptions::default();
+                    tuning_options.num_thread = Some(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).max(1));
+                    let embed_req = crate::EmbedRequest {
+                        model: selected_model.clone(),
+                        prompt: text.clone(),
+                        keep_alive: None,
+                        options: Some(tuning_options),
+                    };
+                    
+                    if let Ok(res) = client.post(format!("{}/api/embeddings", crate::OLLAMA_URL)).json(&embed_req).send().await {
+                        if let Ok(embed_res) = res.json::<crate::EmbedResponse>().await {
+                            chunks.push(crate::RagChunk {
+                                file: format!("{} (Part {})", path_str, i+1),
+                                text,
+                                vector: embed_res.embedding,
+                            });
+                        }
+                    }
+                }
+                count += 1;
+                if count % 10 == 0 {
+                    let _ = tx.send(serde_json::json!({ "type": "status", "msg": format!("Indexed {} files...", count) }).to_string());
+                }
+            }
+        }
+        
+        if let Ok(json) = serde_json::to_string(&chunks) {
+            let _ = std::fs::write(".zy_index.json", json);
+            let _ = tx.send(serde_json::json!({ "type": "done", "msg": format!("Successfully generated local RAG vector index with {} chunks from {} files using model `{}`.", chunks.len(), count, selected_model) }).to_string());
+        } else {
+            let _ = tx.send(serde_json::json!({ "type": "done", "msg": "Failed to serialize RAG index.".to_string() }).to_string());
+        }
+    }
+
+    async fn handle_chat_async(req_str: String, tx: tokio::sync::broadcast::Sender<String>, cancel_token: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim_matches('\0');
+        let mut messages = vec![
+            crate::Message { 
+                role: "system".to_string(), 
+                content: "You are an autonomous AI coding agent. You can execute bash commands and read/write files to solve user requests. Once you have solved the request, output your final response in Markdown without using any tools.".to_string(), 
+                tool_calls: None, 
+                images: None 
+            }
+        ];
+        
+        let mut has_user_prompt = false;
+        let mut context_files: Vec<String> = Vec::new();
+        let mut context_images: Vec<String> = Vec::new();
+        let mut selected_model = "qwen2.5-coder:1.5b".to_string();
+        
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
+            if let Some(m) = json.get("model").and_then(|v| v.as_str()) {
+                selected_model = m.to_string();
+            }
+            if let Some(files) = json.get("context_files").and_then(|v| v.as_array()) {
+                for f in files {
+                    if let Some(f_str) = f.as_str() { context_files.push(f_str.to_string()); }
+                }
+            }
+            if let Some(images) = json.get("context_images").and_then(|v| v.as_array()) {
+                for i in images {
+                    if let Some(i_str) = i.as_str() { context_images.push(i_str.to_string()); }
+                }
+            }
+
+            if let Some(msgs) = json.get("messages").and_then(|v| v.as_array()) {
+                for (idx, m) in msgs.iter().enumerate() {
+                    if let (Some(role), Some(content)) = (m.get("role").and_then(|v| v.as_str()), m.get("content").and_then(|v| v.as_str())) {
+                        let mut final_content = content.to_string();
+                        let mut final_images = None;
+                        
+                        // Inject context into the very last user message
+                        if idx == msgs.len() - 1 && role == "user" {
+                            if !context_files.is_empty() {
+                                final_content.push_str("\n\n### Attached Files Context ###\n");
+                                for path in &context_files {
+                                    if let Ok(file_content) = std::fs::read_to_string(path) {
+                                        final_content.push_str(&format!("--- {} ---\n{}\n\n", path, file_content));
+                                    }
+                                }
+                            }
+                            if !context_images.is_empty() {
+                                final_images = Some(context_images.clone());
+                            }
+                        }
+
+                        messages.push(crate::Message {
+                            role: role.to_string(),
+                            content: final_content,
+                            tool_calls: None,
+                            images: final_images
+                        });
+                        has_user_prompt = true;
+                    }
+                }
+            } else if let Some(p) = json.get("prompt").and_then(|v| v.as_str()) {
+                messages.push(crate::Message { 
+                    role: "user".to_string(), 
+                    content: p.to_string(), 
+                    tool_calls: None, 
+                    images: None 
+                });
+                has_user_prompt = true;
+            }
+        }
+        
+        if !has_user_prompt { return; }
+
+        // Local Auto-RAG Retrieval
+        if let Ok(index_json) = std::fs::read_to_string(".zy_index.json") {
+            if let Ok(chunks) = serde_json::from_str::<Vec<crate::RagChunk>>(&index_json) {
+                // Find the latest user message
+                let last_user_msg = messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.clone()).unwrap_or_default();
+                
+                let client = reqwest::Client::new();
+                let mut tuning_options = crate::OllamaOptions::default();
+                tuning_options.num_thread = Some(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).max(1));
+                let embed_req = crate::EmbedRequest {
+                    model: selected_model.clone(),
+                    prompt: last_user_msg,
+                    keep_alive: None,
+                    options: Some(tuning_options),
+                };
+                
+                if let Ok(res) = client.post(format!("{}/api/embeddings", crate::OLLAMA_URL)).json(&embed_req).send().await {
+                    if let Ok(embed_res) = res.json::<crate::EmbedResponse>().await {
+                        let query_vec = embed_res.embedding;
+                        let mut scored_chunks: Vec<(&crate::RagChunk, f32)> = chunks.iter().map(|c| {
+                            (c, Self::cosine_similarity(&query_vec, &c.vector))
+                        }).collect();
+                        
+                        scored_chunks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                        
+                        let top_k = 3;
+                        let mut rag_context = String::new();
+                        for (chunk, score) in scored_chunks.into_iter().take(top_k) {
+                            if score > 0.5 { // relevance threshold
+                                rag_context.push_str(&format!("--- Auto-Retrieved Context from {} (Score: {:.2}) ---\n{}\n\n", chunk.file, score, chunk.text));
+                            }
+                        }
+                        
+                        if !rag_context.is_empty() {
+                            let _ = tx.send(serde_json::json!({ "type": "status", "msg": format!("Auto-RAG: Injected context from {} files.", top_k) }).to_string());
+                            messages[0].content.push_str("\n\nYou have automatically retrieved codebase context:\n");
+                            messages[0].content.push_str(&rag_context);
+                        }
+                    }
+                }
+            }
+        }
+
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let mut previous_tool_call = String::new();
+            let mut loop_count = 0;
+
+        loop {
+            if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            if loop_count > 10 {
+                let limit_msg = "*Agent paused after 10 autonomous steps to prevent infinite loop. Please provide further instructions.*".to_string();
+                let sse_msg = serde_json::json!({ "type": "done", "msg": limit_msg }).to_string();
+                let _ = tx.send(sse_msg);
+                break;
+            }
+            loop_count += 1;
+
+            let mut tuning_options = crate::OllamaOptions::default();
+            tuning_options.num_thread = Some(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).max(1));
+            tuning_options.num_ctx = Some(4096);
+            tuning_options.num_predict = Some(1024);
+            let req = crate::ChatRequest {
+                model: selected_model.clone(),
+                messages: messages.clone(),
+                stream: true,
+                tools: Some(Self::get_agent_tools()),
+                format: None, options: Some(tuning_options), keep_alive: None,
+            };
+
+            let res = match client.post(format!("{}/api/chat", crate::OLLAMA_URL)).json(&req).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err_json = serde_json::json!({ "type": "done", "msg": format!("Error connecting to Ollama: {}", e) }).to_string();
+                    let _ = tx.send(err_json);
+                    break;
+                }
+            };
+
+            use futures_util::StreamExt;
+            let mut stream = res.bytes_stream();
+            let mut full_content = String::new();
+            let mut full_tool_calls = vec![];
+            
+            while let Some(item) = stream.next().await {
+                if let Ok(bytes) = item {
+                    let chunk_str = String::from_utf8_lossy(&bytes);
+                    for line in chunk_str.lines() {
+                        if line.trim().is_empty() { continue; }
+                        if let Ok(chat_res) = serde_json::from_str::<crate::ChatResponse>(line) {
+                            if let Some(msg) = chat_res.message {
+                                if !msg.content.is_empty() {
+                                    full_content.push_str(&msg.content);
+                                    let _ = tx.send(serde_json::json!({ "type": "chunk", "msg": msg.content }).to_string());
+                                }
+                                if let Some(mut tc) = msg.tool_calls {
+                                    full_tool_calls.append(&mut tc);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if true {
+                if true {
+                    let msg = crate::Message {
+                        role: "assistant".to_string(),
+                        content: full_content.clone(),
+                        tool_calls: if full_tool_calls.is_empty() { None } else { Some(full_tool_calls) },
+                        images: None,
+                    };
+
+                    println!("\n=== LOOP {} ===", loop_count);
+                    println!("LLM Output: {:#?}", msg);
+                    
+                    messages.push(msg.clone());
+                    
+                    let mut executed_tools = false;
+                    let mut tool_calls = msg.tool_calls.clone().unwrap_or_default();
+                    
+                    if tool_calls.is_empty() && !msg.content.is_empty() {
+                        let clean_content = msg.content
+                            .trim_start_matches("```json")
+                            .trim_start_matches("```")
+                            .trim_end_matches("```")
+                            .trim();
+                        if let Ok(tc) = serde_json::from_str::<crate::ToolCallFunction>(clean_content) {
+                            tool_calls.push(crate::ToolCall { function: tc });
+                        } else if let Ok(tcs) = serde_json::from_str::<Vec<crate::ToolCallFunction>>(clean_content) {
+                            for tc in tcs {
+                                tool_calls.push(crate::ToolCall { function: tc });
+                            }
+                        }
+                    }
+
+                    if !msg.content.is_empty() {
+                        let sse_msg = serde_json::json!({ "type": "thought", "msg": msg.content.clone() }).to_string();
+                        let _ = tx.send(sse_msg);
+                    }
+
+                    if !tool_calls.is_empty() {
+                        executed_tools = true;
+                        for tc in tool_calls {
+                            let fname = tc.function.name;
+                            let args = tc.function.arguments;
+                            
+                            let sse_msg = serde_json::json!({ "type": "status", "msg": format!("Executing {}...", fname) }).to_string();
+                            let _ = tx.send(sse_msg);
+                            
+                            let sse_call = serde_json::json!({ "type": "tool_call", "name": fname, "args": args.clone() }).to_string();
+                            let _ = tx.send(sse_call);
+                            
+                            let mut output = match fname.as_str() {
+                                "run_command" => {
+                                    if let Some(cmd) = args.get("command").and_then(|c| c.as_str()) {
+                                        // Check if Docker is available
+                                        if let Ok(docker_check) = std::process::Command::new("docker").arg("--version").output() {
+                                            if docker_check.status.success() {
+                                                // Execute securely in Docker
+                                                let cwd = std::env::current_dir().unwrap_or_default().display().to_string();
+                                                let out = std::process::Command::new("docker")
+                                                    .arg("run")
+                                                    .arg("--rm")
+                                                    .arg("-v")
+                                                    .arg(format!("{}:/workspace", cwd))
+                                                    .arg("-w")
+                                                    .arg("/workspace")
+                                                    .arg("ubuntu:latest") // or rust:latest
+                                                    .arg("bash")
+                                                    .arg("-c")
+                                                    .arg(cmd)
+                                                    .output();
+                                                    
+                                                match out {
+                                                    Ok(o) => String::from_utf8_lossy(&o.stdout).to_string() + "\n" + &String::from_utf8_lossy(&o.stderr),
+                                                    Err(e) => format!("Error executing docker container: {}", e),
+                                                }
+                                            } else {
+                                                "Error: Docker is not running or available. Execution sandboxing failed. Please start Docker.".to_string()
+                                            }
+                                        } else {
+                                            "Error: Docker is not installed or available. Execution sandboxing failed. Please install Docker.".to_string()
+                                        }
+                                    } else { "Error: Missing command argument".to_string() }
+                                },
+                                "read_file" => {
+                                    if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
+                                        std::fs::read_to_string(path).unwrap_or_else(|e| e.to_string())
+                                    } else { "Error: Missing path".to_string() }
+                                },
+                                "write_file" => {
+                                    if let (Some(path), Some(content)) = (args.get("path").and_then(|p| p.as_str()), args.get("content").and_then(|c| c.as_str())) {
+                                        std::fs::write(path, content).map(|_| format!("Successfully wrote to {}", path)).unwrap_or_else(|e| e.to_string())
+                                    } else { "Error: Missing path or content".to_string() }
+                                },
+                                "create_checkpoint" => {
+                                    if let Some(name) = args.get("name").and_then(|n| n.as_str()) {
+                                        Self::create_checkpoint(name)
+                                    } else { "Error: Missing name parameter".to_string() }
+                                },
+                                "restore_checkpoint" => {
+                                    if let Some(name) = args.get("name").and_then(|n| n.as_str()) {
+                                        Self::restore_checkpoint(name)
+                                    } else { "Error: Missing name parameter".to_string() }
+                                },
+                                "list_checkpoints" => {
+                                    Self::list_checkpoints()
+                                },
+                                _ => "Error: Unknown tool".to_string()
+                            };
+                            
+                            let current_call_str = format!("{}:{:?}", fname, args);
+                            if current_call_str == previous_tool_call {
+                                output = format!("Error: You just ran {} with the exact same arguments. DO NOT repeat the same tool call. Analyze the output and move on to the next step, or give your final response.", fname);
+                            } else {
+                                previous_tool_call = current_call_str.clone();
+                            }
+                            
+                            let truncated_output = if output.len() > 3000 {
+                                output[..3000].to_string() + "\n...[truncated]"
+                            } else {
+                                output
+                            };
+                            
+                            let sse_result = serde_json::json!({ "type": "tool_result", "name": fname, "result": truncated_output.clone() }).to_string();
+                            let _ = tx.send(sse_result);
+                            
+                            let role = if msg.tool_calls.is_some() { "tool" } else { "user" };
+                            let formatted_content = if role == "user" {
+                                format!("Tool execution result for {}:\n{}\n\n(System: If you have completed the user's request, output your final response in Markdown. Do NOT output a tool call if you are done.)", fname, truncated_output)
+                            } else {
+                                truncated_output
+                            };
+                            
+                            println!("Tool Output: {}", formatted_content);
+                            
+                            messages.push(crate::Message {
+                                role: role.to_string(),
+                                content: formatted_content,
+                                tool_calls: None, images: None
+                            });
+                        }
+                    }
+
+                    if !executed_tools {
+                        let sse_msg = serde_json::json!({ "type": "done", "msg": msg.content }).to_string();
+                        let _ = tx.send(sse_msg);
+                        break;
+                    }
+                } else { break; }
+            } else { break; }
+        }
+        });
+    }
     pub fn generate_dashboard_html() -> String {
+        let mut default_model = "qwen2.5-coder:1.5b".to_string();
+        if let Ok(home) = std::env::var("HOME") {
+            if let Ok(m) = std::fs::read_to_string(std::path::PathBuf::from(home).join(".zy_model")) {
+                let trimmed = m.trim();
+                if !trimmed.is_empty() { default_model = trimmed.to_string(); }
+            }
+        }
+
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -894,6 +1539,8 @@ impl EmbeddedWebDashboard {
     header { background: var(--card-bg); border-bottom: 1px solid var(--border); padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
     .logo { font-size: 1.5rem; font-weight: 800; color: var(--accent); display: flex; align-items: center; gap: 0.5rem; }
     .badge { background: var(--border); color: var(--accent); padding: 0.25rem 0.6rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
+    .model-select { background: var(--card-bg); color: var(--accent); border: 1px solid var(--border); border-radius: 9999px; padding: 0.25rem 0.6rem; font-size: 0.75rem; font-weight: 600; outline: none; cursor: pointer; }
+    .model-select option { background: var(--card-bg); color: var(--text); }
     .container { display: grid; grid-template-columns: 320px 1fr 340px; gap: 1.5rem; padding: 1.5rem; flex: 1; }
     .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem; display: flex; flex-direction: column; gap: 1rem; box-shadow: 0 4px 20px rgba(0,0,0,0.3); min-height: 0; }
     .card h3 { font-size: 0.95rem; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.05em; flex-shrink: 0; }
@@ -908,9 +1555,15 @@ impl EmbeddedWebDashboard {
     .send-btn:hover { opacity: 0.9; transform: translateY(-1px); }
     .send-btn svg { width: 20px; height: 20px; fill: currentColor; }
     .autocomplete { position: absolute; bottom: 100%; left: 0; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 0.5rem; width: 300px; max-height: 200px; overflow-y: auto; box-shadow: 0 4px 12px rgba(0,0,0,0.5); z-index: 50; display: none; }
-    .ac-item { padding: 0.75rem 1rem; cursor: pointer; color: var(--text); font-size: 0.9rem; border-bottom: 1px solid var(--border); }
+    .ac-item { padding: 0.75rem 1rem; cursor: pointer; color: var(--text); font-size: 0.9rem; border-bottom: 1px solid var(--border); word-break: break-all; }
     .ac-item:last-child { border-bottom: none; }
     .ac-item:hover, .ac-item.active { background: #1e293b; color: var(--accent); }
+    .context-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.5rem; }
+    .chip { background: #1e293b; border: 1px solid var(--accent); border-radius: 4px; padding: 0.25rem 0.5rem; font-size: 0.8rem; display: flex; align-items: center; gap: 0.5rem; color: #fff; }
+    .chip-remove { cursor: pointer; color: var(--danger); font-weight: bold; }
+    .input-wrapper { display: flex; flex-direction: column; flex: 1; position: relative; }
+    .attach-btn { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 1.5rem; display: flex; align-items: center; padding: 0 0.5rem; transition: color 0.2s; height: 48px; }
+    .attach-btn:hover { color: var(--accent); }
     
     .typing-dots { display: inline-flex; align-items: center; gap: 4px; height: 1.5rem; vertical-align: middle; }
     .typing-dots span { width: 6px; height: 6px; background-color: var(--accent); border-radius: 50%; animation: typing 1.4s infinite ease-in-out both; }
@@ -933,6 +1586,11 @@ impl EmbeddedWebDashboard {
   <header>
     <div class="logo">⚡ zy <span class="badge">v0.1.0 • 100% LOCAL</span></div>
     <div style="display: flex; gap: 1rem; align-items: center;">
+      <button onclick="indexCodebase()" style="background: none; border: 1px solid var(--warning); color: var(--warning); border-radius: 4px; padding: 0.2rem 0.5rem; cursor: pointer; font-size: 0.8rem;">🔄 Index Codebase</button>
+      <button onclick="toggleEventTrail()" style="background: none; border: 1px solid var(--accent); color: var(--accent); border-radius: 4px; padding: 0.2rem 0.5rem; cursor: pointer; font-size: 0.8rem;">👁️ Event Trail</button>
+      <select id="model-select" class="model-select" onchange="updateGlobalModel()">
+        <option value="{default_model}">{default_model}</option>
+      </select>
       <span class="badge" id="tuner-badge">DYNAMIC AITUNER: ACTIVE</span>
       <span class="badge" style="color: var(--success);" id="status-badge">● ONLINE</span>
     </div>
@@ -953,17 +1611,22 @@ impl EmbeddedWebDashboard {
       <button onclick="sendQuick('/dag')">🔀 Swarm DAG Flow</button>
       <button onclick="sendQuick('/models')">🧠 Ollama Model List</button>
       <button onclick="sendQuick('/clear')">🧹 Clear Session</button>
+      <button id="btn-voice-mode" onclick="toggleVoiceMode()" style="border-color: var(--accent); color: var(--accent);">🎙️ Enable Voice Mode</button>
     </div>
 
     <!-- Center Column: Agent Chat & REPL -->
     <div class="card">
       <h3>🤖 Autonomous Agent REPL</h3>
       <div class="chat-box" id="chat-box">
-        <div class="msg agent">⚡ <b>zy agent ready.</b> 100% local, air-gapped, zero-latency pair programmer online. How can I assist you today?</div>
       </div>
       <div class="input-row">
-        <div id="autocomplete-box" class="autocomplete"></div>
-        <textarea id="user-input" rows="1" placeholder="Type prompt or /command... (Shift+Enter for new line)"></textarea>
+        <button class="attach-btn" onclick="document.getElementById('file-upload').click()" title="Attach Image">📎</button>
+        <input type="file" id="file-upload" accept="image/*" style="display:none;" onchange="handleImageUpload(event)">
+        <div class="input-wrapper">
+          <div id="context-bar" class="context-bar"></div>
+          <div id="autocomplete-box" class="autocomplete"></div>
+          <textarea id="user-input" rows="1" placeholder="Type prompt, @file, or /command... (Shift+Enter for new line)"></textarea>
+        </div>
         <button class="send-btn" onclick="sendPrompt()" title="Send">
           <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
         </button>
@@ -979,6 +1642,16 @@ impl EmbeddedWebDashboard {
       <h3 style="margin-top: 1rem;">🛡️ Safety Permissions</h3>
       <div class="metric-row"><span>Agent Force Mode:</span><span class="metric-val" style="color: var(--warning);">Prompt (Safe)</span></div>
       <div class="metric-row"><span>Sandbox Worktrees:</span><span class="metric-val" style="color: var(--success);">Enabled</span></div>
+      
+      <div id="event-trail-container" style="display: block;">
+          <h3 style="margin-top: 1rem; display: flex; justify-content: space-between; align-items: center;">
+            👁️ Event Trail
+            <button onclick="document.getElementById('event-trail').innerHTML=''" style="background: none; border: 1px solid var(--border); color: var(--text-muted); border-radius: 4px; padding: 2px 5px; cursor: pointer; font-size: 0.7rem;">Clear</button>
+          </h3>
+          <div id="event-trail" style="background: #000; border-radius: 8px; border: 1px solid var(--border); padding: 1rem; height: 350px; overflow-y: auto; font-family: monospace; font-size: 0.8rem; margin-top: 0.5rem; white-space: pre-wrap; word-break: break-all;">
+            <div style="color: var(--text-muted)">Waiting for agent events...</div>
+          </div>
+      </div>
     </div>
   </div>
 
@@ -989,26 +1662,102 @@ impl EmbeddedWebDashboard {
       { cmd: '/radar', desc: 'Code Health Radar' },
       { cmd: '/dag', desc: 'Swarm DAG Flow' },
       { cmd: '/models', desc: 'Ollama Model List' },
-      { cmd: '/clear', desc: 'Clear Session' }
+      { cmd: '/clear', desc: 'Clear Session' },
+      { cmd: '/stop', desc: 'Stop Agent Execution' }
     ];
     let currentVisMode = null;
+    let contextFiles = [];
+    let contextImages = [];
+    let allFilesCache = [];
+    let isFetchingFiles = false;
 
-    inp.addEventListener('input', function() {
+    function renderContextBar() {
+      const bar = document.getElementById('context-bar');
+      bar.innerHTML = '';
+      contextFiles.forEach((f, i) => {
+        bar.innerHTML += `<div class="chip">📄 ${f} <span class="chip-remove" onclick="removeFile(${i})">×</span></div>`;
+      });
+      contextImages.forEach((img, i) => {
+        bar.innerHTML += `<div class="chip">🖼️ Image ${i+1} <span class="chip-remove" onclick="removeImage(${i})">×</span></div>`;
+      });
+    }
+
+    function removeFile(idx) { contextFiles.splice(idx, 1); renderContextBar(); }
+    function removeImage(idx) { contextImages.splice(idx, 1); renderContextBar(); }
+
+    function handleImageUpload(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(ev) {
+        const base64 = ev.target.result.split(',')[1];
+        contextImages.push(base64);
+        renderContextBar();
+      };
+      reader.readAsDataURL(file);
+      e.target.value = '';
+    }
+
+    inp.addEventListener('input', async function() {
       this.style.height = '48px';
       this.style.height = (this.scrollHeight) + 'px';
       
       const val = this.value;
-      if (val.startsWith('/')) {
-        const matches = commands.filter(c => c.cmd.startsWith(val));
-        if (matches.length > 0 && val.length < 10) {
+      const cursor = this.selectionStart;
+      const textBeforeCursor = val.substring(0, cursor);
+      const lastWordMatch = textBeforeCursor.match(/[\w/@.-]+$/);
+      const lastWord = lastWordMatch ? lastWordMatch[0] : "";
+
+      if (lastWord.startsWith('/')) {
+        const matches = commands.filter(c => c.cmd.startsWith(lastWord));
+        if (matches.length > 0) {
           acBox.innerHTML = matches.map(m => `<div class="ac-item" onclick="selectCmd('${m.cmd}')"><b>${m.cmd}</b> - ${m.desc}</div>`).join('');
           acBox.style.display = 'block';
         } else { acBox.style.display = 'none'; }
-      } else { acBox.style.display = 'none'; }
+      } else if (lastWord.startsWith('@')) {
+        if (allFilesCache.length === 0 && !isFetchingFiles) {
+          isFetchingFiles = true;
+          try {
+            const res = await fetch('/api/files');
+            const data = await res.json();
+            allFilesCache = data.files || [];
+          } catch (e) { console.error(e); }
+        }
+        const search = lastWord.substring(1).toLowerCase();
+        let matches = allFilesCache;
+        if (search) {
+          matches = allFilesCache.filter(f => f.toLowerCase().includes(search));
+        }
+        matches = matches.slice(0, 10); // limit 10
+        if (matches.length > 0) {
+          acBox.innerHTML = matches.map(m => `<div class="ac-item" onclick="selectFile('${m}')">📄 ${m}</div>`).join('');
+          acBox.style.display = 'block';
+        } else { acBox.style.display = 'none'; }
+      } else { 
+        acBox.style.display = 'none'; 
+      }
     });
 
     function selectCmd(cmd) {
-      inp.value = cmd + ' ';
+      const val = inp.value;
+      const lastWordMatch = val.match(/[\w/@.-]+$/);
+      if (lastWordMatch) {
+         inp.value = val.substring(0, val.length - lastWordMatch[0].length) + cmd + ' ';
+      }
+      inp.focus();
+      acBox.style.display = 'none';
+    }
+
+    function selectFile(file) {
+      if (!contextFiles.includes(file)) {
+        contextFiles.push(file);
+        renderContextBar();
+      }
+      const val = inp.value;
+      const lastWordMatch = val.match(/[\w/@.-]+$/);
+      if (lastWordMatch) {
+         inp.value = val.substring(0, val.length - lastWordMatch[0].length);
+      }
       inp.focus();
       acBox.style.display = 'none';
     }
@@ -1021,23 +1770,201 @@ impl EmbeddedWebDashboard {
       }
     });
 
-    marked.setOptions({
-      highlight: function(code, lang) {
-        if (lang && hljs.getLanguage(lang)) {
-          return hljs.highlight(code, { language: lang }).value;
+    if (typeof marked !== 'undefined') {
+      marked.setOptions({
+        highlight: function(code, lang) {
+          if (typeof hljs !== 'undefined') {
+            if (lang && hljs.getLanguage(lang)) {
+              return hljs.highlight(code, { language: lang }).value;
+            }
+            return hljs.highlightAuto(code).value;
+          }
+          return code;
         }
-        return hljs.highlightAuto(code).value;
+      });
+    }
+
+    let chatHistory = [];
+    try {
+      const stored = localStorage.getItem('zy_chat');
+      if (stored) {
+        chatHistory = JSON.parse(stored);
       }
-    });
+    } catch (e) {
+      console.error('Failed to load chat history', e);
+    }
 
     const typingHtml = `<div class="typing-dots"><span></span><span></span><span></span></div>`;
+
+    function renderHistory() {
+      const chat = document.getElementById('chat-box');
+      if (chatHistory.length === 0) {
+        chat.innerHTML = `<div class="msg agent">⚡ <b>zy agent ready.</b> 100% local, air-gapped, zero-latency pair programmer online. How can I assist you today?</div>`;
+        return;
+      }
+      chat.innerHTML = '';
+      chatHistory.forEach(msg => {
+        if (msg.role === 'user') {
+          chat.insertAdjacentHTML('beforeend', `<div class="msg user">${msg.content.replace(/\\n/g, '<br/>')}</div>`);
+        } else {
+          let formattedHtml = msg.content;
+          try { formattedHtml = typeof marked !== 'undefined' ? marked.parse(msg.content) : msg.content; } catch(e) {}
+          chat.insertAdjacentHTML('beforeend', `<div class="msg agent">⚡ <b>zy:</b><br/>${formattedHtml}</div>`);
+        }
+      });
+      window.scrollTo(0, document.body.scrollHeight);
+    }
+    
+    async function loadModels() {
+      try {
+        const res = await fetch('/api/models');
+        const data = await res.json();
+        const select = document.getElementById('model-select');
+        const currentSelected = select.value;
+        if (data.models && data.models.length > 0) {
+          select.innerHTML = '';
+          data.models.forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = m.name;
+            opt.textContent = m.name;
+            if (m.name === currentSelected || m.name.includes(currentSelected)) {
+              opt.selected = true;
+            }
+            select.appendChild(opt);
+          });
+        }
+      } catch (e) {
+        console.error("Failed to load models for dropdown", e);
+      }
+    }
+    
+    async function updateGlobalModel() {
+        const model = document.getElementById('model-select').value;
+        try {
+            await fetch('/api/config/model', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model })
+            });
+        } catch (e) { console.error(e); }
+    }
+    
+    loadModels();
+    
+    // Render on load
+    renderHistory();
+
+    const evtSource = new EventSource('/api/events');
+    evtSource.onmessage = function(e) {
+      try {
+        const data = JSON.parse(e.data);
+        const chat = document.getElementById('chat-box');
+        const trail = document.getElementById('event-trail');
+        
+        if (data.type === 'thought') {
+            const pMsg = document.getElementById('processing-msg');
+            if (pMsg) {
+                pMsg.innerHTML = `<span style="color:var(--accent);">[Thinking]</span> ... ${typingHtml}`;
+            }
+            if (trail && trail.parentElement.style.display !== 'none') {
+                const el = document.createElement('div');
+                el.style.color = 'var(--text-muted)';
+                el.innerText = `🤔 Thought: ${data.msg}`;
+                trail.appendChild(el);
+                trail.scrollTop = trail.scrollHeight;
+            }
+        } else if (data.type === 'tool_call') {
+            if (trail && trail.parentElement.style.display !== 'none') {
+                const el = document.createElement('div');
+                el.style.color = 'var(--warning)';
+                el.innerText = `🛠️ Tool Call: ${data.name}\n${JSON.stringify(data.args, null, 2)}`;
+                trail.appendChild(el);
+                trail.scrollTop = trail.scrollHeight;
+            }
+        } else if (data.type === 'tool_result') {
+            if (trail && trail.parentElement.style.display !== 'none') {
+                const el = document.createElement('div');
+                el.style.color = '#66d9ef';
+                el.innerText = data.result;
+                trail.appendChild(el);
+                trail.scrollTop = trail.scrollHeight;
+            }
+        } else if (data.type === 'chunk') {
+            const pMsg = document.getElementById('processing-msg');
+            if (pMsg) {
+                pMsg.id = 'agent-msg';
+                pMsg.innerHTML = '⚡ <b>zy:</b><br/>';
+            }
+            let currentMsg = document.getElementById('agent-msg');
+            if (!currentMsg) {
+                chat.insertAdjacentHTML('beforeend', `<div class="msg agent" id="agent-msg">⚡ <b>zy:</b><br/></div>`);
+                currentMsg = document.getElementById('agent-msg');
+            }
+            const safeText = data.msg.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, '<br/>');
+            currentMsg.innerHTML += safeText;
+            chat.scrollTop = chat.scrollHeight;
+        } else if (data.type === 'status') {
+           const pMsg = document.getElementById('processing-msg');
+           if (pMsg) {
+             pMsg.innerHTML = `<span style="color:var(--accent);">[Agent Action]</span> ${data.msg} ... ${typingHtml}`;
+           }
+        } else if (data.type === 'done') {
+           const pMsg = document.getElementById('processing-msg');
+           if (pMsg) { pMsg.remove(); }
+           const aMsg = document.getElementById('agent-msg');
+           if (aMsg) { aMsg.remove(); }
+           
+           if (data.msg && data.msg.trim() !== '') {
+               chatHistory.push({ role: 'assistant', content: data.msg });
+               localStorage.setItem('zy_chat', JSON.stringify(chatHistory));
+               
+               let formattedHtml = data.msg;
+               try { formattedHtml = typeof marked !== 'undefined' ? marked.parse(data.msg) : data.msg; } catch(e) {}
+               chat.insertAdjacentHTML('beforeend', `<div class="msg agent">⚡ <b>zy:</b><br/>${formattedHtml}</div>`);
+               chat.scrollTop = chat.scrollHeight;
+               
+               if (isVoiceModeEnabled) {
+                   // Strip markdown for TTS
+                   const cleanText = data.msg
+                       .replace(/\\*\\*/g, '')
+                       .replace(/`/g, '')
+                       .replace(/#/g, '')
+                       .replace(/\\[.*?\\]\\(.*?\\)/g, '')
+                       .replace(/<[^>]*>/g, '');
+                   speakText(cleanText);
+               }
+           }
+        }
+      } catch (err) {
+        console.error("SSE parse error", err);
+      }
+    };
+
+    async function indexCodebase() {
+      const chat = document.getElementById('chat-box');
+      chat.insertAdjacentHTML('beforeend', `<div class="msg agent" id="processing-msg">Initializing Codebase Index for Local Auto-RAG... ${typingHtml}</div>`);
+      chat.scrollTop = chat.scrollHeight;
+      
+      try {
+        await fetch('/api/rag/index', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: document.getElementById('model-select').value })
+        });
+      } catch (e) {
+        console.error('RAG Index error', e);
+      }
+    }
 
     async function sendPrompt() {
       const text = inp.value.trim();
       if (!text) return;
 
+      chatHistory.push({ role: 'user', content: text });
+      localStorage.setItem('zy_chat', JSON.stringify(chatHistory));
+
       const chat = document.getElementById('chat-box');
-      chat.innerHTML += `<div class="msg user">${text.replace(/\\n/g, '<br/>')}</div>`;
+      chat.insertAdjacentHTML('beforeend', `<div class="msg user">${text.replace(/\\n/g, '<br/>')}</div>`);
       inp.value = '';
       inp.style.height = '48px';
       chat.scrollTop = chat.scrollHeight;
@@ -1050,22 +1977,40 @@ impl EmbeddedWebDashboard {
         const pMsg = document.getElementById('processing-msg');
         if (pMsg) { pMsg.remove(); }
         document.getElementById('visual-container').innerHTML = svg;
-        chat.innerHTML += `<div class="msg agent">Rendered Codebase Health & Architecture Radar Chart. Polling activated.</div>`;
+        const msgHtml = "Rendered Codebase Health & Architecture Radar Chart. Polling activated.";
+        chatHistory.push({ role: 'assistant', content: msgHtml });
+        localStorage.setItem('zy_chat', JSON.stringify(chatHistory));
+        chat.innerHTML += `<div class="msg agent">⚡ <b>zy:</b><br/>${msgHtml}</div>`;
       } else if (text.startsWith('/dag')) {
         currentVisMode = 'dag';
         chat.innerHTML += `<div class="msg agent" id="processing-msg">Planning swarm tasks via LLM... ${typingHtml}</div>`;
         let prompt = text.replace('/dag', '').trim();
         if (!prompt) prompt = "Refactor and optimize zy codebase";
+        
+        // 1. Get the SVG + subtasks array
         const res = await fetch('/api/dag/svg', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ goal: prompt })
         });
-        const svg = await res.text();
+        const data = await res.json();
         const pMsg = document.getElementById('processing-msg');
         if (pMsg) { pMsg.remove(); }
-        document.getElementById('visual-container').innerHTML = svg;
-        chat.innerHTML += `<div class="msg agent">Rendered Swarm Workflow Topological DAG for "${prompt}".</div>`;
+        document.getElementById('visual-container').innerHTML = data.svg;
+        
+        // 2. Trigger the true execution (which streams via SSE)
+        chat.innerHTML += `<div class="msg agent" id="processing-msg">Executing DAG with multiple parallel agents... ${typingHtml}</div>`;
+        chat.scrollTop = chat.scrollHeight;
+        
+        try {
+            await fetch('/api/dag/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ goal: prompt, subtasks: data.subtasks })
+            });
+        } catch (e) {
+            console.error('DAG execute error', e);
+        }
       } else if (text.startsWith('/models')) {
         chat.innerHTML += `<div class="msg agent" id="processing-msg">Fetching local models... ${typingHtml}</div>`;
         const res = await fetch('/api/models');
@@ -1079,27 +2024,44 @@ impl EmbeddedWebDashboard {
           }
         } else { html += "<li>No models found or Ollama is offline.</li>"; }
         html += "</ul>";
-        chat.innerHTML += `<div class="msg agent">${html}</div>`;
+        chatHistory.push({ role: 'assistant', content: html });
+        localStorage.setItem('zy_chat', JSON.stringify(chatHistory));
+        chat.insertAdjacentHTML('beforeend', `<div class="msg agent">⚡ <b>zy:</b><br/>${html}</div>`);
       } else if (text.startsWith('/clear')) {
+        chatHistory = [];
+        localStorage.removeItem('zy_chat');
         chat.innerHTML = '<div class="msg agent">⚡ <b>zy agent ready.</b> Session cleared.</div>';
+      } else if (text.startsWith('/stop')) {
+        chat.innerHTML += `<div class="msg agent" id="processing-msg">Stopping agent... ${typingHtml}</div>`;
+        const res = await fetch('/api/stop');
+        const pMsg = document.getElementById('processing-msg');
+        if (pMsg) { pMsg.remove(); }
       } else {
-        chat.innerHTML += `<div class="msg agent" id="processing-msg">Processing request: "${text}" with local LLM engine... ${typingHtml}</div>`;
+        chat.innerHTML += `<div class="msg agent" id="processing-msg">Processing request with local LLM engine... ${typingHtml}</div>`;
         chat.scrollTop = chat.scrollHeight;
         
         try {
+          const payload = { 
+            model: document.getElementById('model-select').value,
+            messages: chatHistory,
+            context_files: contextFiles,
+            context_images: contextImages
+          };
+          
+          contextFiles = [];
+          contextImages = [];
+          renderContextBar();
+
           const res = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt: text })
+            body: JSON.stringify(payload)
           });
-          const data = await res.json();
-          const pMsg = document.getElementById('processing-msg');
-          if (pMsg) { pMsg.remove(); }
-          
-          let responseText = data.reply || "Error generating response.";
-          const formattedHtml = marked.parse(responseText);
-          chat.innerHTML += `<div class="msg agent">⚡ <b>zy:</b><br/>${formattedHtml}</div>`;
+          if (!res.ok) {
+            throw new Error(`HTTP error! status: ${res.status}`);
+          }
         } catch (e) {
+          console.error('Chat error', e);
           const pMsg = document.getElementById('processing-msg');
           if (pMsg) { pMsg.remove(); }
           chat.innerHTML += `<div class="msg agent" style="border-left-color:var(--danger)">⚡ <b>zy error:</b><br/>${e.message}</div>`;
@@ -1125,19 +2087,112 @@ impl EmbeddedWebDashboard {
       document.getElementById('user-input').value = cmd;
       sendPrompt();
     }
+    
+    function toggleEventTrail() {
+        const container = document.getElementById('event-trail-container');
+        if (container.style.display === 'none') {
+            container.style.display = 'block';
+        } else {
+            container.style.display = 'none';
+        }
+    }
+    
+    // Voice Mode Implementation
+    let isVoiceModeEnabled = false;
+    let recognition = null;
+    let isRecognizing = false;
+
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        recognition = new SpeechRecognition();
+        recognition.continuous = false; // We will restart on end for better VAD chunking
+        recognition.interimResults = false;
+        recognition.lang = 'en-US';
+
+        recognition.onstart = function() {
+            isRecognizing = true;
+        };
+
+        recognition.onresult = function(event) {
+            const transcript = event.results[0][0].transcript;
+            if (transcript.trim() !== '') {
+                document.getElementById('user-input').value = transcript;
+                sendPrompt(); // Auto submit!
+            }
+        };
+
+        recognition.onerror = function(event) {
+            console.error('Speech recognition error', event.error);
+        };
+
+        recognition.onend = function() {
+            isRecognizing = false;
+            // Restart if voice mode is still enabled and we are not currently speaking
+            if (isVoiceModeEnabled && !window.speechSynthesis.speaking) {
+                try { recognition.start(); } catch(e) {}
+            }
+        };
+    }
+
+    function toggleVoiceMode() {
+        const btn = document.getElementById('btn-voice-mode');
+        isVoiceModeEnabled = !isVoiceModeEnabled;
+        
+        if (isVoiceModeEnabled) {
+            btn.innerHTML = '🛑 Disable Voice Mode';
+            btn.style.backgroundColor = 'var(--danger)';
+            btn.style.color = '#fff';
+            if (recognition && !isRecognizing) {
+                try { recognition.start(); } catch(e) {}
+            }
+        } else {
+            btn.innerHTML = '🎙️ Enable Voice Mode';
+            btn.style.backgroundColor = 'transparent';
+            btn.style.color = 'var(--accent)';
+            window.speechSynthesis.cancel(); // Stop talking
+            if (recognition && isRecognizing) {
+                recognition.stop();
+            }
+        }
+    }
+    
+    function speakText(text) {
+        if (!('speechSynthesis' in window)) return;
+        
+        // Stop listening while speaking so it doesn't hear itself
+        if (recognition && isRecognizing) {
+            recognition.stop();
+        }
+        
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.rate = 1.05;
+        
+        utterance.onend = function() {
+            // Resume listening after speaking finishes
+            if (isVoiceModeEnabled && recognition && !isRecognizing) {
+                try { recognition.start(); } catch(e) {}
+            }
+        };
+        
+        window.speechSynthesis.speak(utterance);
+    }
   </script>
 </body>
-</html>"#
-        .to_string()
+</html>"#.to_string().replace("{default_model}", &default_model)
     }
 
     pub async fn start(port: u16) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
         println!("{}", format!("⚡ zy Embedded Web Dashboard listening at http://127.0.0.1:{}", port).green().bold());
 
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(100);
+        let cancel_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let handle = tokio::spawn(async move {
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
+                    let tx = tx.clone();
+                    let cancel_token = cancel_token.clone();
                     tokio::spawn(async move {
                         let mut buf = [0u8; 4096];
                         if let Ok(n) = stream.read(&mut buf).await {
@@ -1146,6 +2201,64 @@ impl EmbeddedWebDashboard {
                             let first_line = req_str.lines().next().unwrap_or_default();
                             let parts: Vec<&str> = first_line.split_whitespace().collect();
                             let path = if parts.len() > 1 { parts[1] } else { "/" };
+
+                            if path == "/api/events" {
+                                Self::handle_events_sse(&mut stream, tx).await;
+                                return;
+                            }
+
+                            if path == "/api/stop" {
+                                cancel_token.store(true, std::sync::atomic::Ordering::Relaxed);
+                                let sse_msg = serde_json::json!({ "type": "done", "msg": "❌ Agent execution forcefully aborted by user." }).to_string();
+                                let _ = tx.send(sse_msg);
+                                use tokio::io::AsyncWriteExt;
+                                let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}";
+                                let _ = stream.write_all(headers.as_bytes()).await;
+                                return;
+                            }
+
+                            if path == "/api/chat" {
+                                cancel_token.store(false, std::sync::atomic::Ordering::Relaxed);
+                                Self::handle_chat_async(req_str.to_string(), tx, cancel_token.clone()).await;
+                                use tokio::io::AsyncWriteExt;
+                                let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}";
+                                let _ = stream.write_all(headers.as_bytes()).await;
+                                return;
+                            }
+                            
+                            if path == "/api/dag/execute" {
+                                cancel_token.store(false, std::sync::atomic::Ordering::Relaxed);
+                                Self::handle_dag_execute(req_str.to_string(), tx, cancel_token.clone()).await;
+                                use tokio::io::AsyncWriteExt;
+                                let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}";
+                                let _ = stream.write_all(headers.as_bytes()).await;
+                                return;
+                            }
+                            
+                            if path == "/api/rag/index" {
+                                cancel_token.store(false, std::sync::atomic::Ordering::Relaxed);
+                                Self::handle_rag_index(req_str.to_string(), tx, cancel_token.clone()).await;
+                                use tokio::io::AsyncWriteExt;
+                                let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}";
+                                let _ = stream.write_all(headers.as_bytes()).await;
+                                return;
+                            }
+                            
+                            if path == "/api/config/model" {
+                                let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim_matches('\0');
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
+                                    if let Some(model) = json.get("model").and_then(|v| v.as_str()) {
+                                        if let Ok(home) = std::env::var("HOME") {
+                                            let _ = std::fs::write(std::path::PathBuf::from(home).join(".zy_model"), model);
+                                        }
+                                    }
+                                }
+                                use tokio::io::AsyncWriteExt;
+                                let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{\"status\":\"ok\"}";
+                                let _ = stream.write_all(headers.as_bytes()).await;
+                                return;
+                            }
+
 
                             let (status, content_type, body) = match path {
                                 "/" | "/index.html" => ("200 OK".to_string(), "text/html; charset=utf-8".to_string(), Self::generate_dashboard_html()),
@@ -1157,6 +2270,19 @@ impl EmbeddedWebDashboard {
                                         "local": true,
                                         "tuner": "active"
                                     }).to_string();
+                                    ("200 OK".to_string(), "application/json".to_string(), json)
+                                }
+                                "/api/files" => {
+                                    let mut files = Vec::new();
+                                    for entry in walkdir::WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
+                                        if entry.file_type().is_file() {
+                                            let path_str = entry.path().display().to_string();
+                                            if !path_str.contains("/.git/") && !path_str.contains("/target/") {
+                                                files.push(path_str.trim_start_matches("./").to_string());
+                                            }
+                                        }
+                                    }
+                                    let json = serde_json::json!({ "files": files }).to_string();
                                     ("200 OK".to_string(), "application/json".to_string(), json)
                                 }
                                 "/api/radar/svg" => {
@@ -1188,7 +2314,11 @@ impl EmbeddedWebDashboard {
                                         }
                                     }
                                     let dag = DagLayout::build_swarm_workflow_dag(&target, &subtasks);
-                                    ("200 OK".to_string(), "image/svg+xml".to_string(), dag.to_svg())
+                                    let json_resp = serde_json::json!({
+                                        "svg": dag.to_svg(),
+                                        "subtasks": subtasks
+                                    });
+                                    ("200 OK".to_string(), "application/json".to_string(), json_resp.to_string())
                                 }
                                 "/api/dag/json" => {
                                     let dag = DagLayout::build_swarm_workflow_dag("Refactor and optimize zy codebase", &[
@@ -1207,38 +2337,6 @@ impl EmbeddedWebDashboard {
                                         }
                                     }
                                     ("200 OK".to_string(), "application/json".to_string(), reply)
-                                }
-                                "/api/chat" => {
-                                    let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim_matches('\0');
-                                    println!("HTTP BODY: {:?}", body_str);
-                                    let mut reply = "I didn't receive a prompt.".to_string();
-                                    
-                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
-                                        if let Some(prompt) = json.get("prompt").and_then(|v| v.as_str()) {
-                                            let req = crate::ChatRequest {
-                                                model: "qwen2.5-coder:1.5b".to_string(),
-                                                messages: vec![crate::Message { role: "user".to_string(), content: prompt.to_string(), tool_calls: None, images: None }],
-                                                stream: false,
-                                                tools: None,
-                                                format: None,
-                                                options: None,
-                                                keep_alive: None,
-                                            };
-                                            let client = reqwest::Client::new();
-                                            if let Ok(res) = client.post(format!("{}/api/chat", crate::OLLAMA_URL)).json(&req).send().await {
-                                                if let Ok(chat_res) = res.json::<crate::ChatResponse>().await {
-                                                    if let Some(msg) = chat_res.message {
-                                                        reply = msg.content;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    
-                                    let json_res = serde_json::json!({
-                                        "reply": reply,
-                                    }).to_string();
-                                    ("200 OK".to_string(), "application/json".to_string(), json_res)
                                 }
                                 _ => ("404 NOT FOUND".to_string(), "text/plain".to_string(), "Not Found".to_string()),
                             };

@@ -16,7 +16,16 @@ async fn main() {
 }
 
 async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if let Ok(home) = std::env::var("HOME") {
+        if let Ok(model_str) = std::fs::read_to_string(std::path::PathBuf::from(home).join(".zy_model")) {
+            let trimmed = model_str.trim();
+            if !trimmed.is_empty() {
+                cli.model = trimmed.to_string();
+            }
+        }
+    }
+    
     let client = create_optimized_ollama_client();
 
     if cli.daemon {

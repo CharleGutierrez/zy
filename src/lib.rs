@@ -789,6 +789,8 @@ pub struct EmbedRequest {
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_alive: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<OllamaOptions>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -2278,6 +2280,7 @@ pub async fn embed_text(client: &Client, text: &str) -> Result<Vec<f32>, Box<dyn
         model: "nomic-embed-text".to_string(),
         prompt: text.to_string(),
         keep_alive: Some(-1),
+        options: None,
     };
     let res = client.post(format!("{}/api/embeddings", OLLAMA_URL)).json(&req).send().await?;
     if res.status().is_success() {
